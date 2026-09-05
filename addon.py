@@ -37,11 +37,11 @@ import random
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs, urlencode, quote
+from urllib.parse import urlparse, parse_qs, urlencode, quote, unquote
 
 import requests
 
-VERSION = "1.1.5"
+VERSION = "1.1.6"
 BRAND = "MOVIE BOX"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -1081,7 +1081,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _route(self):
         u = urlparse(self.path)
-        path, q = u.path, parse_qs(u.query)
+        # Some Stremio clients percent-encode the ':' in series ids
+        # (tt123:1:1 -> tt123%3A1%3A1) — decode before routing, otherwise
+        # EVERY series stream request 404s while movies work fine.
+        path, q = unquote(u.path), parse_qs(u.query)
 
         if path == "/health":
             return self._send(200, json.dumps({

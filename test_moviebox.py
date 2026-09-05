@@ -612,6 +612,25 @@ def test_lazy_hls_route_404_when_no_stream():
     assert c["code"] == 404
     addon._PLAY_CACHE.clear()
 
+def test_stream_route_accepts_encoded_colons():
+    # many Stremio clients send series ids percent-encoded: tt...%3A1%3A1
+    addon._STREAM_CACHE.clear(); addon._PLAY_CACHE.clear(); addon._DUB_CACHE.clear(); addon._SEARCH_CACHE.clear()
+    with mock.patch.object(addon, "cinemeta",
+                           return_value={"name": "Squid Game", "year": "2021"}), \
+         mock.patch.object(addon, "search_subjects",
+                           return_value=[SUBJ_SQUID_ORIG]), \
+         mock.patch.object(addon, "subject_dubs", return_value=[]), \
+         mock.patch.object(addon, "play_info", return_value=PLAY_INFO_FIX), \
+         mock.patch.object(addon, "_safe_build"), \
+         mock.patch.object(addon.requests, "get"):
+        for p in ["/stream/series/tt10919420%3A1%3A1.json",
+                  "/stream/series/tt10919420%3a2%3a7.json",
+                  "/stream/series/tt10919420:1:1.json"]:
+            c = _http_get(p)
+            assert c["code"] == 200, p
+            assert len(json.loads(c["body"])["streams"]) >= 1, p
+    addon._STREAM_CACHE.clear(); addon._PLAY_CACHE.clear()
+
 def test_build_streams_no_match():
     addon._STREAM_CACHE.clear(); addon._PLAY_CACHE.clear(); addon._DUB_CACHE.clear(); addon._SEARCH_CACHE.clear()
     with mock.patch.object(addon, "cinemeta",
