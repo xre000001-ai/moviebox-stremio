@@ -41,7 +41,7 @@ from urllib.parse import urlparse, parse_qs, urlencode, quote, unquote
 
 import requests
 
-VERSION = "1.1.9"
+VERSION = "1.2.0"
 BRAND = "MOVIE BOX"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -51,7 +51,9 @@ UA_APP = ("com.community.oneroom/50020042 (Linux; U; Android 13; en_US; Redmi; "
           "Build/TQ2A.230405.003; Cronet/135.0.7012.3)")
 SECRET_KEY = "76iRl07s0xSN9jqmEWAt79EBJZulIQIsV64FZr2O"
 API_HOSTS = ["https://api6.aoneroom.com", "https://api5.aoneroom.com",
-             "https://api4.aoneroom.com", "https://api3.aoneroom.com"]
+             "https://api4.aoneroom.com", "https://api3.aoneroom.com",
+             "https://api4sg.aoneroom.com", "https://api6sg.aoneroom.com",
+             "https://api.inprovider.com"]
 CINEMETA = "https://v3-cinemeta.strem.io"
 IMDB_SUGGEST = "https://v2.sg.media-imdb.com/suggestion"
 SITES = {
@@ -817,6 +819,132 @@ def _cached_play(sid, se, ep):
     _cache_put(_PLAY_CACHE, key, val, 600)
     return val
 
+# --------------------------------------------------------------------------
+# web API (netnaija.film / h5api-bff): subtitles
+# The site's play endpoint is IP-gated against servers, but its caption
+# endpoint is not — it serves signed subtitle URLs (~7-day CloudFront
+# wildcard policy on cacdn.hakunaymatata.com/subtitle/*) for every dub.
+# --------------------------------------------------------------------------
+_WEB_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+_WEB_JWT = None
+_WEB_JWT_TS = 0.0
+_SUB_CACHE = {}   # (sid, stream_id) -> captions list (1h)
+_VTT_CACHE = {}   # (sid, se, ep, lan) -> vtt body (6h)
+_LANG3 = {"ar": "ara", "en": "eng", "es": "spa", "fil": "fil", "fr": "fra",
+          "in_id": "ind", "id": "ind", "ms": "msa", "pt": "por", "ru": "rus",
+          "bn": "ben", "hi": "hin", "ur": "urd", "pa": "pan", "zh": "zho",
+          "ko": "kor", "ja": "jpn", "th": "tha", "vi": "vie", "tr": "tur",
+          "de": "deu", "it": "ita"}
+
+def _web_jwt():
+    """Anonymous web JWT via the site's search-suggest (x-user response
+    header). Ungated — works from datacenter IPs, unlike subject/play."""
+    global _WEB_JWT, _WEB_JWT_TS
+    if _WEB_JWT and time.time() - _WEB_JWT_TS < 6 * 3600:
+        return _WEB_JWT
+    try:
+        r = requests.post("https://netnaija.film/wefeed-h5api-bff/subject/search-suggest",
+                          json={"keyword": "a", "perPage": 1},
+                          headers={"Accept": "application/json",
+                                   "Content-Type": "application/json",
+                                   "X-Client-Info": json.dumps({"timezone": "Asia/Dhaka"}),
+                                   "X-Request-Lang": "en", "User-Agent": _WEB_UA,
+                                   "Origin": "https://netnaija.film",
+                                   "Referer": "https://netnaija.film/"},
+                          timeout=8)
+        xu = r.headers.get("x-user") or ""
+        if xu:
+            try:
+                tok = json.loads(xu).get("token") or ""
+                if tok:
+                    _WEB_JWT, _WEB_JWT_TS = tok, time.time()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return _WEB_JWT
+
+def web_captions(sid, stream_id):
+    """Subtitle tracks for one stream via the site's caption endpoint
+    (the same API the netnaija.film web player uses). Returns a list of
+    {id, lan, lanName, url}; empty on any failure (streams unaffected)."""
+    if not stream_id:
+        return []
+    key = (str(sid), str(stream_id))
+    hit, val = _cache_get(_SUB_CACHE, key)
+    if hit:
+        return val
+    caps = []
+    for attempt in (1, 2):
+        tok = _web_jwt()
+        if not tok:
+            return []
+        try:
+            r = requests.get("https://netnaija.film/wefeed-h5api-bff/subject/caption"
+                             "?format=HLS&id=%s&subjectId=%s" % (stream_id, sid),
+                             headers={"Accept": "application/json",
+                                      "X-Client-Info": json.dumps({"timezone": "Asia/Dhaka"}),
+                                      "X-Request-Lang": "en",
+                                      "Authorization": "Bearer " + tok,
+                                      "User-Agent": _WEB_UA,
+                                      "Referer": "https://netnaija.film/"},
+                             timeout=6)
+        except requests.RequestException:
+            return []
+        if r.status_code in (401, 403):
+            global _WEB_JWT_TS
+            _WEB_JWT_TS = 0.0          # force a fresh token, retry once
+            continue
+        try:
+            caps = ((r.json().get("data") or {}).get("captions")) or []
+        except Exception:
+            caps = []
+        break
+    _cache_put(_SUB_CACHE, key, caps, 3600)
+    return caps
+
+def _srt_to_vtt(srt):
+    """Minimal SRT -> WebVTT conversion (comma -> dot milliseconds, drop
+    standalone cue numbers, WEBVTT header). Stremio's web player wants VTT."""
+    s = (srt or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = s.split("\n")
+    out, i, n = ["WEBVTT", ""], 0, len(lines)
+    while i < n:
+        if lines[i].strip().isdigit() and i + 1 < n and "-->" in lines[i + 1]:
+            i += 1
+            continue
+        out.append(lines[i])
+        i += 1
+    body = "\n".join(out).strip() + "\n"
+    return re.sub(r"(\d{2}:\d{2}:\d{2}),(\d{3})", r"\1.\2", body)
+
+def _lazy_sub(sid, se, ep, lan):
+    """Stateless VTT subtitle for one (sid, se, ep, lan) — mirrors _lazy_hls."""
+    key = (str(sid), se, ep, lan)
+    hit, val = _cache_get(_VTT_CACHE, key)
+    if hit:
+        return val
+    pi = _cached_play(sid, se or None, ep or None)
+    pl = (pi.get("streams") or [None])[0] if pi else None
+    if not pl or not pl.get("id"):
+        return None
+    caps = web_captions(sid, pl["id"])
+    c = next((x for x in caps if x.get("lan") == lan), None)
+    if not c or not c.get("url"):
+        return None
+    try:
+        r = requests.get(c["url"], headers={"User-Agent": _WEB_UA}, timeout=10)
+        if r.status_code != 200 or not r.text.strip():
+            return None
+        vtt = _srt_to_vtt(r.text)
+    except requests.RequestException:
+        return None
+    if len(_VTT_CACHE) > 240:
+        _VTT_CACHE.clear()
+    _cache_put(_VTT_CACHE, key, vtt, 6 * 3600)
+    return vtt
+
 _LABEL_PRETTY = {"esla": "Spanish", "ptbr": "Portuguese (BR)", "pt": "Portuguese",
                  "es": "Spanish", "id": "Indonesian"}
 
@@ -856,7 +984,7 @@ def _resolve_entry(pair, se, ep, ctype, title, year):
         desc += " ▣ S%02dE%02d" % (se, ep)
     desc += " ◀ MBCLOUD"
     use_se, use_ep = (se, ep) if ctype == "series" else (0, 0)
-    return {
+    card = {
         "name": "𖤍 %s 𖤍" % res,
         "description": desc,
         "url": "/hls/%s/%d/%d/master.m3u8" % (sid, use_se, use_ep),
@@ -864,6 +992,20 @@ def _resolve_entry(pair, se, ep, ctype, title, year):
         "bingeGroup": "mbx|%s:%s:%s|%s|%s" % (title, se if ctype == "series" else "",
                                               ep if ctype == "series" else "", label, res),
     }
+    # subtitles from the site's web API (caption endpoint; ungated)
+    try:
+        caps = web_captions(sid, pl.get("id"))
+        if caps:
+            card["subtitles"] = [
+                {"url": "/sub/%s/%d/%d/%s.vtt" % (sid, use_se, use_ep, c.get("lan")),
+                 "lang": _LANG3.get(c.get("lan"), c.get("lan")),
+                 "id": "mbx-%s" % c.get("lan")}
+                for c in caps if c.get("lan")]
+            if len(card["subtitles"]) > 1:
+                card["description"] += " ▣ %d SUB" % len(card["subtitles"])
+    except Exception:
+        pass
+    return card
 
 def _lazy_hls(sid, se, ep, file):
     """Stateless HLS: derive playlists from (sid, se, ep) via cached
@@ -1203,7 +1345,19 @@ class Handler(BaseHTTPRequestHandler):
             for s in res.get("streams", []):
                 if s.get("url", "").startswith("/hls/"):
                     s["url"] = self._host_base() + s["url"]
+                for sub in s.get("subtitles") or []:
+                    if sub.get("url", "").startswith("/sub/"):
+                        sub["url"] = self._host_base() + sub["url"]
             return self._send(200, json.dumps(res))
+
+        m = re.match(r"^/sub/(\d{5,25})/(\d{1,3})/(\d{1,5})/([a-z0-9_]+)\.vtt$", path)
+        if m:
+            sid, use_se, use_ep, lan = m.group(1), int(m.group(2)), int(m.group(3)), m.group(4)
+            body = _lazy_sub(sid, use_se, use_ep, lan)
+            if body is None:
+                return self._send(404, "WEBVTT\n\n# no subtitle for this entry\n",
+                                  "text/vtt; charset=utf-8")
+            return self._send(200, body, "text/vtt; charset=utf-8")
 
         m = re.match(r"^/hls/(\d{5,25})/(\d{1,3})/(\d{1,5})/(master|v\d+|a\d+)\.m3u8$", path)
         if m:

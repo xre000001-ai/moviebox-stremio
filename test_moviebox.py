@@ -559,6 +559,7 @@ def test_build_streams_series_happy_path():
                            return_value=[SUBJ_SQUID_ORIG, SUBJ_SQUID_HI]), \
          mock.patch.object(addon, "subject_dubs", return_value=dubs), \
          mock.patch.object(addon, "play_info", return_value=PLAY_INFO_FIX), \
+         mock.patch.object(addon, "web_captions", return_value=[]), \
          mock.patch.object(addon, "_safe_build"), \
          mock.patch.object(addon, "_spawn_warm"), \
          mock.patch.object(addon.requests, "get") as g:
@@ -586,6 +587,7 @@ def test_build_streams_movie_no_dubs():
                            return_value=[SUBJ_INCEPTION]), \
          mock.patch.object(addon, "subject_dubs", return_value=[]), \
          mock.patch.object(addon, "play_info", return_value=PLAY_INFO_FIX), \
+         mock.patch.object(addon, "web_captions", return_value=[]), \
          mock.patch.object(addon, "_spawn_warm"), \
          mock.patch.object(addon.requests, "get") as g:
         r = mock.Mock(status_code=200, content=b"<MPD" + b"x" * 50)
@@ -610,6 +612,7 @@ def test_build_streams_result_cached():
          mock.patch.object(addon, "search_subjects", side_effect=counting_search), \
          mock.patch.object(addon, "subject_dubs", return_value=[]), \
          mock.patch.object(addon, "play_info", return_value=PLAY_INFO_FIX), \
+         mock.patch.object(addon, "web_captions", return_value=[]), \
          mock.patch.object(addon.requests, "get") as g:
         r = mock.Mock(status_code=200, content=b"<MPD" + b"x" * 50)
         r.text = MPD_FIX
@@ -634,6 +637,7 @@ def test_cached_play_dedupes():
 def test_lazy_hls_route_master_and_variant():
     addon._PLAY_CACHE.clear(); addon._MPD_CACHE.clear(); addon._TAIL_CACHE.clear()
     with mock.patch.object(addon, "play_info", return_value=PLAY_INFO_FIX), \
+         mock.patch.object(addon, "web_captions", return_value=[]), \
          mock.patch.object(addon, "_seg_exists", return_value=True), \
          mock.patch.object(addon.requests, "get") as g:
         r = mock.Mock(status_code=200, content=b"<MPD" + b"x" * 50)
@@ -665,6 +669,7 @@ def test_stream_route_accepts_encoded_colons():
                            return_value=[SUBJ_SQUID_ORIG]), \
          mock.patch.object(addon, "subject_dubs", return_value=[]), \
          mock.patch.object(addon, "play_info", return_value=PLAY_INFO_FIX), \
+         mock.patch.object(addon, "web_captions", return_value=[]), \
          mock.patch.object(addon, "_safe_build"), \
          mock.patch.object(addon, "_spawn_warm"), \
          mock.patch.object(addon.requests, "get"):
@@ -878,6 +883,98 @@ def test_http_stream_bad_id():
 def test_http_not_found():
     c = _http_get("/nope")
     assert c["code"] == 404
+
+def test_srt_to_vtt():
+    srt = "1\n00:00:01,000 --> 00:00:02,500\nHello\n\n2\n00:00:03,000 --> 00:00:04,000\nWorld\r\n"
+    vtt = addon._srt_to_vtt(srt)
+    assert vtt.startswith("WEBVTT\n")
+    assert "00:00:01.000 --> 00:00:02.500" in vtt
+    assert "00:00:03.000 --> 00:00:04.000" in vtt
+    lines = [l for l in vtt.split("\n") if l.strip()]
+    assert not any(l.strip() == "1" for l in lines)   # cue numbers dropped
+    assert "Hello" in vtt and "World" in vtt
+
+def test_web_captions_parse_and_cache():
+    addon._SUB_CACHE.clear()
+    caps_fix = [{"id": "1", "lan": "en", "lanName": "English",
+                 "url": "https://cacdn.hakunaymatata.com/subtitle/x.srt?Policy=P"}]
+    class R:
+        status_code = 200
+        def json(self):
+            return {"code": 0, "data": {"captions": caps_fix}}
+    with mock.patch.object(addon, "_web_jwt", return_value="tok"), \
+         mock.patch.object(addon.requests, "get", return_value=R()) as g:
+        c1 = addon.web_captions("123", "456")
+        c2 = addon.web_captions("123", "456")
+    assert c1 == caps_fix and c2 == caps_fix
+    assert g.call_count == 1        # cached second time
+    addon._SUB_CACHE.clear()
+
+def test_web_captions_no_jwt():
+    addon._SUB_CACHE.clear()
+    with mock.patch.object(addon, "_web_jwt", return_value=None), \
+         mock.patch.object(addon.requests, "get") as g:
+        assert addon.web_captions("123", "456") == []
+    assert g.call_count == 0
+
+def test_web_captions_auth_retry():
+    addon._SUB_CACHE.clear()
+    class R403:
+        status_code = 403
+        def json(self): return {}
+    class R200:
+        status_code = 200
+        def json(self):
+            return {"code": 0, "data": {"captions": [{"lan": "bn", "url": "u"}]}}
+    with mock.patch.object(addon, "_web_jwt", return_value="tok"), \
+         mock.patch.object(addon.requests, "get", side_effect=[R403(), R200()]):
+        caps = addon.web_captions("999", "777")
+    assert caps == [{"lan": "bn", "url": "u"}]
+    addon._SUB_CACHE.clear()
+
+def test_resolve_entry_attaches_subtitles():
+    pi = {"streams": [{"id": "42", "signCookie": FAKE_COOKIE,
+                       "url": "https://macdn.aoneroom.com/other/notice.mp4",
+                       "resolutions": "1080,720,480", "size": "1", "duration": 1,
+                       "codecName": "hevc", "format": "MP4", "idType": ""}]}
+    caps = [{"lan": "en", "url": "https://c/s.srt?P=1"}, {"lan": "bn", "url": "https://c/b.srt?P=1"}]
+    with mock.patch.object(addon, "_cached_play", return_value=pi), \
+         mock.patch.object(addon, "web_captions", return_value=caps):
+        card = addon._resolve_entry(("111", "Hindi"), 1, 5, "series", "Our Sticky Love", "2026")
+    assert card and card.get("subtitles")
+    langs = [s["lang"] for s in card["subtitles"]]
+    assert "eng" in langs and "ben" in langs
+    assert card["subtitles"][0]["url"].startswith("/sub/111/1/5/")
+    assert card["subtitles"][0]["url"].endswith(".vtt")
+    assert "2 SUB" in card["description"]
+
+def test_sub_route_serves_vtt():
+    addon._PLAY_CACHE.clear(); addon._SUB_CACHE.clear(); addon._VTT_CACHE.clear()
+    pi = {"streams": [{"id": "42", "signCookie": FAKE_COOKIE, "url": "", "resolutions": "480",
+                       "size": "1", "duration": 1, "codecName": "hevc", "format": "MP4", "idType": ""}]}
+    caps = [{"lan": "en", "url": "https://cacdn/x.srt?Policy=1"}]
+    class RS:
+        status_code = 200
+        text = "1\n00:00:01,000 --> 00:00:02,000\nHi\n\n"
+    with mock.patch.object(addon, "play_info", return_value=pi), \
+         mock.patch.object(addon, "web_captions", return_value=caps), \
+         mock.patch.object(addon.requests, "get", return_value=RS()):
+        c = _http_get("/sub/3089349649006742360/1/1/en.vtt")
+    assert c["code"] == 200
+    body = c["body"].decode()
+    assert body.startswith("WEBVTT")
+    assert "00:00:01.000 --> 00:00:02.000" in body
+    addon._PLAY_CACHE.clear(); addon._SUB_CACHE.clear(); addon._VTT_CACHE.clear()
+
+def test_sub_route_404_unknown_lang():
+    addon._PLAY_CACHE.clear(); addon._SUB_CACHE.clear()
+    pi = {"streams": [{"id": "42", "signCookie": FAKE_COOKIE, "url": "", "resolutions": "480",
+                       "size": "1", "duration": 1, "codecName": "hevc", "format": "MP4", "idType": ""}]}
+    with mock.patch.object(addon, "play_info", return_value=pi), \
+         mock.patch.object(addon, "web_captions", return_value=[]):
+        c = _http_get("/sub/3089349649006742360/1/1/zz.vtt")
+    assert c["code"] == 404
+    addon._PLAY_CACHE.clear(); addon._SUB_CACHE.clear()
 
 def main():
     global PASS, FAIL
