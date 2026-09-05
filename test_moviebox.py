@@ -180,6 +180,52 @@ def test_match_multiple_wrong_year_rejected():
             "releaseDate": "2003-01-01"}
     assert addon.match_subjects([odd1, odd2], "Inception", "2010", 1) == []
 
+def test_match_alias_subset_mugen_train():
+    # imdb: "Demon Slayer: Kimetsu no Yaiba - The Movie: Mugen Train"
+    # platform title is shortened -> every platform token inside imdb title
+    want = "Demon Slayer: Kimetsu no Yaiba - The Movie: Mugen Train"
+    subs = [
+        {"subjectId": "m1", "subjectType": 1,
+         "title": "Demon Slayer the Movie: Mugen Train", "releaseDate": "2021-06-01"},
+        {"subjectId": "m2", "subjectType": 1,
+         "title": "Demon Slayer the Movie: Mugen Train [English]",
+         "releaseDate": "2021-06-01", "corner": "English"},
+        {"subjectId": "bt", "subjectType": 1, "title": "Bullet Train",
+         "releaseDate": "2022-08-01"},  # shares "train" only -> rejected
+    ]
+    got = addon.match_subjects(subs, want, "2020", 1)
+    ids = [s["subjectId"] for s, _ in got]
+    assert "m1" in ids and "m2" in ids and "bt" not in ids
+
+def test_match_alias_rejects_two_token_subset():
+    # a 2-token platform title must not fuzzy-match a longer different movie
+    subs = [{"subjectId": "sm", "subjectType": 1, "title": "Spider-Man",
+             "releaseDate": "2002-05-01"}]
+    got = addon.match_subjects(subs, "Spider-Man: No Way Home", "2021", 1)
+    assert got == []
+
+def test_match_alias_prefers_longer_candidate():
+    want = "Demon Slayer: Kimetsu no Yaiba - The Movie: Mugen Train"
+    subs = [
+        {"subjectId": "short", "subjectType": 1, "title": "Demon Slayer Mugen Train",
+         "releaseDate": "2021-01-01"},
+        {"subjectId": "long", "subjectType": 1,
+         "title": "Demon Slayer the Movie Mugen Train", "releaseDate": "2021-01-01"},
+    ]
+    got = addon.match_subjects(subs, want, "2020", 1)
+    assert got[0][0]["subjectId"] == "long"
+
+def test_imdb_suggest_id_fallback():
+    with mock.patch.object(addon.requests, "get") as g:
+        g.return_value.status_code = 200
+        g.return_value.json.return_value = {"d": [
+            {"id": "tt11032374", "l": "Demon Slayer: Kimetsu no Yaiba - The Movie: Mugen Train", "y": 2020},
+            {"id": "tt9999999", "l": "other", "y": 1999},
+        ]}
+        val = addon._imdb_suggest_id("tt11032374")
+    assert val == {"name": "Demon Slayer: Kimetsu no Yaiba - The Movie: Mugen Train",
+                   "year": "2020"}
+
 def test_match_series_season():
     subs = [SUBJ_SQUID_ORIG, SUBJ_SQUID_HI, SUBJ_SQUID_S3]
     got = addon.match_subjects(subs, "Squid Game", "", 2, season=3)
@@ -696,6 +742,22 @@ def test_http_manifest():
     m = json.loads(c["body"])
     assert m["id"] == "com.movbox.stremio"
     assert m["logo"].endswith("/logo.png")
+
+def test_manifest_catalogs_use_official_extra_key():
+    # official stremio protocol: catalogs declare "extra" (NOT "extraSupported")
+    for cat in addon.MANIFEST["catalogs"]:
+        assert "extra" in cat, cat["id"]
+        names = {e["name"] for e in cat["extra"]}
+        assert {"search", "skip"} <= names, cat["id"]
+        assert "extraSupported" not in cat
+
+def test_http_landing_page():
+    c = _http_get("/")
+    assert c["code"] == 200
+    assert c["headers"]["Content-Type"].startswith("text/html")
+    body = c["body"].decode()
+    assert "MOVIE" in body and "Install in Stremio" in body
+    assert "manifest.json" in body and addon.VERSION in body
 
 def test_http_hls_404_bad_token():
     c = _http_get("/hls/definitelybadtoken00/master.m3u8")

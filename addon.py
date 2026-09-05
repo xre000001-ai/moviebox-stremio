@@ -41,7 +41,7 @@ from urllib.parse import urlparse, parse_qs, urlencode, quote
 
 import requests
 
-VERSION = "1.1.3"
+VERSION = "1.1.4"
 BRAND = "MOVIE BOX"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -301,37 +301,55 @@ def _year_of(s):
     m = re.match(r"(\d{4})", str(s or ""))
     return m.group(1) if m else ""
 
+def _title_tokens(t):
+    """Normalized token set for alias matching (×→x, punctuation stripped)."""
+    t = clean_title(t or "").lower()
+    t = t.replace("×", "x").replace("–", " ").replace("—", " ")
+    t = re.sub(r"[^\w\s]", " ", t, flags=re.UNICODE)
+    return set(w for w in t.split() if len(w) > 1)
+
 def match_subjects(subjects, title, year, subject_type, season=None):
     """Return [(subject, lang_label)] matching cinemeta title/year.
-    Year tolerance: ±1 for movies; if every exact-title candidate fails the
-    year check but exactly ONE candidate exists, trust it (platform upload
-    dates are often wrong)."""
+    1) exact cleaned-title match; if none, 2) alias match: every token of the
+    platform title (>=3 tokens) is contained in the imdb title — covers
+    shortened platform names like "Demon Slayer the Movie: Mugen Train" for
+    imdb's "Demon Slayer: Kimetsu no Yaiba - The Movie: Mugen Train".
+    Year tolerance: ±1 for movies; if every candidate fails the year check
+    but exactly ONE candidate exists, trust it (platform dates are often
+    wrong)."""
     want = clean_title(title).lower()
     want_se = "%s s%d" % (want, season) if season else None
-    exact = []
+    want_stripped = re.sub(r"\s*part\s*\d+$", "", want)
+    exact, fuzzy = [], []
+    want_toks = _title_tokens(title)
     for s in subjects:
         if int(s.get("subjectType") or 0) != subject_type:
             continue
         st = clean_title(s.get("title") or "").lower()
-        if st == want or (want_se and st == want_se) \
-                or st == re.sub(r"\s*part\s*\d+$", "", want):
+        if st == want or (want_se and st == want_se) or st == want_stripped:
             exact.append(s)
-    if not exact:
+        elif exact == [] and len(want_toks) >= 4:
+            ctoks = _title_tokens(s.get("title"))
+            if len(ctoks) >= 3 and ctoks <= want_toks:
+                fuzzy.append((len(ctoks), ctoks, s))
+    pool = exact or [s for _, _, s in
+                     sorted(fuzzy, key=lambda x: -x[0])]
+    if not pool:
         return []
     if subject_type == 1 and year:
         in_year = []
-        for s in exact:
+        for s in pool:
             sy = _year_of(s.get("releaseDate"))
             if not sy or abs(int(sy) - int(year)) <= 1:
                 in_year.append(s)
         if in_year:
-            exact = in_year
-        elif len(exact) == 1:
+            pool = in_year
+        elif len(pool) == 1:
             pass  # single exact-title match with odd upload year: trust it
         else:
             return []
     out = []
-    for s in exact[:4]:
+    for s in pool[:4]:
         label = (s.get("corner") or "").strip() or "Original"
         out.append((s, label))
     return out
@@ -364,6 +382,26 @@ def cinemeta(ctype, imdb):
     except requests.RequestException:
         return None
     return None
+
+def _imdb_suggest_id(imdb):
+    """Keyless id→{name,year} via the IMDb suggestion API (accepts an id as
+    query). Fallback when Cinemeta has no meta for an id."""
+    hit, val = _cache_get(_IMDB_CACHE, ("byid", imdb))
+    if hit:
+        return val
+    try:
+        u = "%s/%s/%s.json" % (IMDB_SUGGEST, quote(imdb[:1]), quote(imdb))
+        r = requests.get(u, timeout=8)
+        if r.status_code == 200:
+            for e in (r.json().get("d") or []):
+                if e.get("id") == imdb and e.get("l"):
+                    val = {"name": e.get("l"),
+                           "year": str(e.get("y") or "")}
+                    break
+        _cache_put(_IMDB_CACHE, ("byid", imdb), val, 12 * 3600)
+        return val
+    except Exception:
+        return None
 
 def _imdb_suggest(title, year, ctype):
     try:
@@ -754,7 +792,7 @@ def build_streams(ctype, imdb, se, ep):
     hit, val = _cache_get(_STREAM_CACHE, key)
     if hit:
         return {"streams": val}
-    meta = cinemeta(ctype, imdb)
+    meta = cinemeta(ctype, imdb) or _imdb_suggest_id(imdb)
     if not meta:
         return {"streams": [], "message": "no metadata"}
     title, year = meta["name"], meta["year"]
@@ -813,32 +851,120 @@ MANIFEST = {
     "behaviorHints": {"configurable": False},
     "catalogs": [
         {"type": "movie", "id": "netnaija-movies", "name": "Netnaija • Movies",
-         "extraSupported": [{"name": "search", "isRequired": False},
+         "extra": [{"name": "search", "isRequired": False},
                             {"name": "skip", "isRequired": False}]},
         {"type": "movie", "id": "moviebox-movies", "name": "MovieBox • Movies",
-         "extraSupported": [{"name": "search", "isRequired": False},
+         "extra": [{"name": "search", "isRequired": False},
                             {"name": "skip", "isRequired": False}]},
         {"type": "movie", "id": "netnaija-animated", "name": "Netnaija • Animation",
-         "extraSupported": [{"name": "search", "isRequired": False},
+         "extra": [{"name": "search", "isRequired": False},
                             {"name": "skip", "isRequired": False}]},
         {"type": "movie", "id": "moviebox-animated", "name": "MovieBox • Animation",
-         "extraSupported": [{"name": "search", "isRequired": False},
+         "extra": [{"name": "search", "isRequired": False},
                             {"name": "skip", "isRequired": False}]},
         {"type": "series", "id": "netnaija-series", "name": "Netnaija • Series",
-         "extraSupported": [{"name": "search", "isRequired": False},
+         "extra": [{"name": "search", "isRequired": False},
                             {"name": "skip", "isRequired": False}]},
         {"type": "series", "id": "moviebox-series", "name": "MovieBox • Series",
-         "extraSupported": [{"name": "search", "isRequired": False},
+         "extra": [{"name": "search", "isRequired": False},
                             {"name": "skip", "isRequired": False}]},
         {"type": "series", "id": "netnaija-animated", "name": "Netnaija • Animation",
-         "extraSupported": [{"name": "search", "isRequired": False},
+         "extra": [{"name": "search", "isRequired": False},
                             {"name": "skip", "isRequired": False}]},
         {"type": "series", "id": "moviebox-animated", "name": "MovieBox • Animation",
-         "extraSupported": [{"name": "search", "isRequired": False},
+         "extra": [{"name": "search", "isRequired": False},
                             {"name": "skip", "isRequired": False}]},
     ],
     "resources": ["stream", "catalog"],
 }
+
+_LANDING_HTML = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MOVIE BOX — Stremio Addon</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:'Segoe UI',system-ui,-apple-system,Roboto,Arial,sans-serif;
+       background:#0b0e14;color:#e8eaf0;min-height:100vh}
+  .wrap{max-width:880px;margin:0 auto;padding:48px 20px 64px}
+  header{text-align:center;margin-bottom:36px}
+  .logo{width:96px;height:96px;border-radius:22px;box-shadow:0 8px 32px rgba(255,60,90,.35)}
+  h1{font-size:34px;letter-spacing:4px;margin-top:16px;font-weight:800}
+  h1 span{background:linear-gradient(90deg,#ff3c5a,#ff9a3c);-webkit-background-clip:text;
+          background-clip:text;color:transparent}
+  .tag{color:#9aa3b2;margin-top:8px;font-size:15px}
+  .install{display:inline-block;margin-top:26px;padding:15px 42px;border-radius:12px;
+           background:linear-gradient(90deg,#7b2ff7,#ff3c5a);color:#fff;font-size:18px;
+           font-weight:700;text-decoration:none;box-shadow:0 6px 24px rgba(123,47,247,.45);
+           transition:transform .15s}
+  .install:hover{transform:translateY(-2px)}
+  .note{color:#7c8596;font-size:13px;margin-top:12px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px;margin-top:40px}
+  .card{background:#141925;border:1px solid #232b3d;border-radius:14px;padding:20px}
+  .card h3{font-size:16px;margin-bottom:8px;color:#ffb03c}
+  .card p{font-size:14px;color:#aab3c2;line-height:1.55}
+  .b{color:#5dd3ff;font-weight:600}
+  .steps{margin-top:40px;background:#141925;border:1px solid #232b3d;border-radius:14px;padding:24px}
+  .steps h2{font-size:18px;margin-bottom:14px}
+  .steps ol{margin-left:20px;color:#aab3c2;font-size:14px;line-height:2}
+  .warn{margin-top:18px;padding:12px 16px;border-left:3px solid #ffb03c;background:#1a1f2e;
+        border-radius:0 8px 8px 0;font-size:13px;color:#c8b48a}
+  footer{margin-top:44px;text-align:center;color:#5c6675;font-size:13px;line-height:2}
+  footer a{color:#5dd3ff;text-decoration:none}
+</style></head><body><div class="wrap">
+<header>
+  <img class="logo" src="/logo.png" alt="MOVIE BOX"
+       onerror="this.style.display='none'">
+  <h1>MOVIE <span>BOX</span></h1>
+  <div class="tag">netnaija.film + movieboxonline.net &mdash; movies, series &amp; anime<br>
+  in up to <b style="color:#fff">1080p</b> with multi-language dubs (Hindi, English, Tamil, Telugu, Bengali&hellip;)</div>
+  <a class="install" id="install" href="#">⬇ Install in Stremio</a>
+  <div class="note">works on Stremio desktop, Android, Android TV &amp; Firestick</div>
+</header>
+
+<div class="grid">
+  <div class="card"><h3>🎞 8 Catalogs</h3>
+    <p>Netnaija &amp; MovieBox &mdash; each with <span class="b">Movies</span>,
+    <span class="b">Series</span> and <span class="b">Animation</span> shelves,
+    searchable straight from Stremio's Discover.</p></div>
+  <div class="card"><h3>🗣 Multi-Dub</h3>
+    <p>Every title shows one card per language track. Hindi, Original, English,
+    Tamil, Telugu, Bengali, Spanish, Portuguese&hellip; whatever the platform hosts.</p></div>
+  <div class="card"><h3>⚡ CDN-Direct, Zero Proxy</h3>
+    <p>This server only serves tiny text (JSON + m3u8). All video segments stream
+    <span class="b">straight from the CDN to your player</span> &mdash; fast and private.</p></div>
+  <div class="card"><h3>📅 Always Fresh</h3>
+    <p>Catalogs refresh every 6 hours and results are cached 10 minutes,
+    so playback starts instantly on repeat.</p></div>
+</div>
+
+<div class="steps">
+  <h2>How to install</h2>
+  <ol>
+    <li>Click the <b style="color:#fff">Install in Stremio</b> button above.</li>
+    <li>Stremio opens &rarr; press <b style="color:#fff">Install</b>.</li>
+    <li>Find any movie/series &mdash; MOVIE BOX streams appear with a
+        <b style="color:#fff">▣ MOVIE BOX</b> tag and language name.</li>
+  </ol>
+  <div class="warn">⚠ Streams are <b>HEVC / H.265</b>. Plays perfectly on Stremio
+  desktop, Android &amp; Android TV — but some browsers (e.g. Firefox) can't decode HEVC.</div>
+</div>
+
+<footer>
+  v__VERSION__ &middot; <a href="/manifest.json">manifest.json</a> &middot;
+  <a href="/health">health</a> &middot; video never proxies through this server
+  <br>Made for personal use. All content belongs to the original platform.
+</footer>
+</div>
+<script>
+  (function(){
+    var h = location.host;
+    var a = document.getElementById('install');
+    a.href = 'stremio://' + (h || 'moviebox-f3hf.onrender.com') + '/manifest.json';
+  })();
+</script>
+</body></html>"""
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -895,6 +1021,10 @@ class Handler(BaseHTTPRequestHandler):
                 "video_proxy": False,
                 "segment_routing": "cdn-direct (sacdn CloudFront, query-signed)",
             }))
+
+        if path == "/":
+            html = _LANDING_HTML.replace("__VERSION__", VERSION)
+            return self._send(200, html, "text/html; charset=utf-8")
 
         if path == "/manifest.json":
             m = dict(MANIFEST)
