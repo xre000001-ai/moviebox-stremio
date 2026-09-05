@@ -1172,6 +1172,33 @@ def test_cross_dub_subtitle_rescue():
     assert "NO SUB" not in hindi["description"]
     addon._STREAM_CACHE.clear()
 
+def test_captions_fetched_once_per_title():
+    addon._MPD_CACHE.clear(); addon._STREAM_CACHE.clear(); addon._PLAY_CACHE.clear()
+    addon._DUB_CACHE.clear(); addon._SEARCH_CACHE.clear()
+    calls = {"caps": 0}
+    nine = [{"lan": "en%d" % i, "url": "https://c/%d.srt" % i} for i in range(9)]
+    def counting_caps(sid, stream_id):
+        calls["caps"] += 1
+        return nine
+    dubs = [{"subjectId": "973041525783496480", "lanName": "Hindi dub"},
+            {"subjectId": "1111111111111111111", "lanName": "Tamil dub"}]
+    with mock.patch.object(addon, "cinemeta",
+                           return_value={"name": "Inception", "year": "2010"}), \
+         mock.patch.object(addon, "search_subjects", return_value=[SUBJ_INCEPTION]), \
+         mock.patch.object(addon, "subject_dubs", return_value=dubs), \
+         mock.patch.object(addon, "play_info", return_value=PLAY_INFO_FIX), \
+         mock.patch.object(addon, "fetch_captions", side_effect=counting_caps), \
+         mock.patch.object(addon, "_spawn_warm"), \
+         mock.patch.object(addon.requests, "get"):
+        res = addon.build_streams("movie", "tt1375666", 1, 1)
+    assert len(res["streams"]) == 3                       # 3 dubs
+    assert calls["caps"] == 1                             # ONE caption fetch, not 3
+    for s in res["streams"]:                              # every card shares it
+        assert len(s.get("subtitles") or []) == 9
+        assert "▣ 9 SUB" in s["description"]
+        assert s["subtitles"][0]["url"].startswith("/sub/6391474290696802080/")
+    addon._STREAM_CACHE.clear()
+
 def test_gzip_response():
     import gzip as gz
     captured, buf = {}, __import__("io").BytesIO()

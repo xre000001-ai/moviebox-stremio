@@ -49,7 +49,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 BRAND = "MOVIE BOX"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -970,7 +970,7 @@ def _res_label(heights):
     return "MULTI" if len(hs) > 1 else str(hs[0])
 
 _STREAM_CACHE = {}       # (ctype, imdb, se, ep) -> (card list, expiry)
-_STREAM_CACHE_TTL = 600  # results cached 10 min; replays are instant
+_STREAM_CACHE_TTL = 10800  # 3h: a prewarmed next-episode outlives the current one
 _PLAY_CACHE = {}         # (sid, se, ep) -> play-info payload (10 min)
 _DUB_CACHE = {}          # sid -> dub list (30 min)
 _SEARCH_CACHE = {}       # (kw, subject_type) -> subjects (10 min)
@@ -998,7 +998,7 @@ def _cached_play(sid, se, ep):
     if hit:
         return val
     val = play_info(sid, se, ep)
-    _cache_put(_PLAY_CACHE, key, val, 600)
+    _cache_put(_PLAY_CACHE, key, val, 3600)
     return val
 
 # --------------------------------------------------------------------------
@@ -1228,7 +1228,7 @@ def _res_from_pi(pi, pl):
         heights = []
     return _res_label(heights) if heights else "MULTI"
 
-def _resolve_entry(pair, se, ep, ctype, title, year):
+def _resolve_entry(pair, se, ep, ctype, title, year, caps=None):
     """Stream card for one dub entry. Only play-info is fetched here (cached);
     the MPD + HLS playlists are resolved lazily on first /hls request — this
     keeps card building fast enough for Stremio's ~20s timeout."""
@@ -1259,16 +1259,17 @@ def _resolve_entry(pair, se, ep, ctype, title, year):
         l2 = "▣ S%02dE%02d ▣ %s" % (se, ep, BRAND)
     else:
         l2 = ("▣ %s ▣ " % year if year else "▣ ") + BRAND
-    # line 3: subtitle tracks from the platform's caption endpoints
-    subs = []
-    try:
-        caps = fetch_captions(sid, pl.get("id"))
-        subs = [{"url": "/sub/%s/%d/%d/%s.vtt" % (sid, use_se, use_ep, c.get("lan")),
-                 "lang": _LANG3.get(c.get("lan"), c.get("lan")),
-                 "id": "mbx-%s" % c.get("lan")}
-                for c in caps if c.get("lan")]
-    except Exception:
-        pass
+    # line 3: subtitle tracks. build_streams passes the title-wide caption
+    # set (fetched once, concurrently); a standalone call fetches its own.
+    if caps is None:
+        try:
+            caps = fetch_captions(sid, pl.get("id")) or []
+        except Exception:
+            caps = []
+    subs = [{"url": "/sub/%s/%d/%d/%s.vtt" % (sid, use_se, use_ep, c.get("lan")),
+             "lang": _LANG3.get(c.get("lan"), c.get("lan")),
+             "id": "mbx-%s" % c.get("lan")}
+            for c in (caps or []) if c.get("lan")]
     card = {
         "name": "𖤍 %s (%s)" % (title, label),
         "description": l1 + "\n" + l2 + "\n" + _sub_line(subs),
@@ -1350,20 +1351,49 @@ def build_streams(ctype, imdb, se, ep, _prewarm_next=True):
                 seen_labels.add(nm)
                 entries.append((dsid, nm))
     entries = entries[:8]
-    # resolve every dub in parallel (play-info + MPD each)
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        results = list(ex.map(lambda p: _resolve_entry(p, se, ep, ctype, title, year),
+
+    def _title_caps():
+        """ONE caption fetch for the whole title (dubs share the same set;
+        sub URLs embed the source sid and resolve on /sub/). Tries at most
+        two sids. Runs concurrently with play-info resolution below."""
+        caps, src_sid = [], None
+        for sid, _ in entries[:2]:
+            pi = _cached_play(sid, se if ctype == "series" else None,
+                              ep if ctype == "series" else None)
+            pl = (pi.get("streams") or [None])[0] if pi else None
+            if not pl or not pl.get("id"):
+                continue
+            try:
+                caps = fetch_captions(sid, pl["id"]) or []
+            except Exception:
+                caps = []
+            if caps:
+                src_sid = sid
+            if len(caps) >= 2:
+                break
+        return src_sid, caps
+
+    # resolve every dub in parallel (play-info only — no per-dub caption
+    # round trips any more), while the shared captions are fetched once
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        cap_fut = ex.submit(_title_caps)
+        results = list(ex.map(lambda p: _resolve_entry(p, se, ep, ctype, title, year,
+                                                       caps=[]),
                               entries))
+        cap_sid, caps = cap_fut.result()
     streams = [c for r in results if r for c in r]
-    # a dub whose caption lookup failed (or came back suspiciously thin)
-    # reuses the richest subtitle set of this title — sub URLs embed the
-    # SOURCE sid, so they resolve fine on the /sub/ route
-    best = max((s.get("subtitles") or [] for s in streams), key=len) if streams else []
-    if len(best) >= 2:
-        for s in streams:
-            if len(s.get("subtitles") or []) < 2:
-                s["subtitles"] = best
-                s["description"] = s["description"].rsplit("\n", 1)[0] + "\n" + _sub_line(best)
+    # attach the shared subtitle set to every card (URLs carry the SOURCE
+    # sid, so they resolve fine on the /sub/ route)
+    if caps and cap_sid:
+        use_se, use_ep = (se, ep) if ctype == "series" else (0, 0)
+        shared = [{"url": "/sub/%s/%d/%d/%s.vtt" % (cap_sid, use_se, use_ep, c.get("lan")),
+                   "lang": _LANG3.get(c.get("lan"), c.get("lan")),
+                   "id": "mbx-%s" % c.get("lan")}
+                  for c in caps if c.get("lan")]
+        if shared:
+            for s in streams:
+                s["subtitles"] = shared
+                s["description"] = s["description"].rsplit("\n", 1)[0] + "\n" + _sub_line(shared)
     if streams:
         _cache_put(_STREAM_CACHE, key, streams, _STREAM_CACHE_TTL)
         if _prewarm_next and ctype == "series":
