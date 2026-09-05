@@ -1,29 +1,34 @@
-#!/usr/bin/env python3
 """
-MOVIE BOX — Stremio addon for netnaija.film + movieboxonline.net
-================================================================
-Both sites run on the same "oneroom / wefeed" platform (aoneroom.com).
-This addon:
+MOVIE BOX — a Stremio addon for a wefeed-based streaming platform.
 
-  * catalogs  : scrapes the sites' SSR listing pages (movies / tv-series /
-                animated-series), resolves titles to IMDb ids
-                (IMDb suggestion API, TMDB fallback)
-  * streams   : Stremio imdb id -> Cinemeta title/year -> platform
-                subject-api search (signed mobile API) -> dub list ->
-                play-info/v2 -> CloudFront-signed DASH -> repackaged as
-                local HLS master/media playlists whose segment URLs are
-                CloudFront *query-signed* (Policy/Signature/Key-Pair-Id as
-                query params) pointing straight at the CDN (no proxying,
-                CORS *, Range supported).
+ZERO-MEDIA-BYTES RULE
+    This server (Render free tier) only ever emits SMALL TEXT: addon JSON,
+    HLS playlists (.m3u8), DASH manifests (.mpd) and WebVTT subtitles —
+    every response is KB-scale and gzip-compressed when the client allows.
+    Video/audio segments are NEVER proxied: players fetch them straight
+    from the platform's CloudFront CDN with per-URL signed queries that
+    this addon derives from the platform's own CloudFront cookies.
 
-Env:
-  PORT             server port (default 7000)
-  MB_PUBLIC_URL    public url; enables anti-sleep keep-alive self-ping
-  TMDB_API_KEY     fallback imdb resolver (defaults to shared key)
+SECTIONS
+    1. config            constants, branding, hosts
+    2. utilities         TTL caches, formatting helpers
+    3. platform api      token bootstrap + signed mobile api_call + search
+    4. metadata          cinemeta / imdb / tmdb title matching
+    5. catalogs          scraped pools -> catalog & search metas
+    6. cdn / dash        CloudFront cookie parsing, MPD parsing, trimming,
+                         rewritten DASH manifests (signed absolute URLs)
+    7. hls               stateless playlists built from the MPD timeline
+    8. subtitles         mobile caption endpoint + web fallback, SRT->VTT
+    9. stream cards      per-dub card building, caching, pre-warming
+   10. landing page      install / usage html
+   11. http server       routes, gzip, CORS, cache headers
+   12. keep-alive        anti-sleep pinger
 """
 
 import base64
+import gzip
 import hashlib
+import io
 import hmac
 import json
 import math
@@ -41,7 +46,10 @@ from urllib.parse import urlparse, parse_qs, urlencode, quote, unquote
 
 import requests
 
-VERSION = "1.3.1"
+# --------------------------------------------------------------------------
+# 1. config — branding, hosts, tuning
+# --------------------------------------------------------------------------
+VERSION = "1.4.0"
 BRAND = "MOVIE BOX"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -78,6 +86,9 @@ START = time.time()
 # tiny per-entry TTL cache with definitive/transient distinction
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# 2. utilities — TTL caches
+# --------------------------------------------------------------------------
 def _cache_put(store, key, val, ttl):
     store[key] = (val, time.time() + ttl)
 
@@ -139,6 +150,9 @@ def _client_info():
         "sp_code": "40401", "X-Play-Mode": "2",
     })
 
+# --------------------------------------------------------------------------
+# 3. platform api — token bootstrap, signed api_call, search
+# --------------------------------------------------------------------------
 _AUTH_TOKEN = None
 _AUTH_LOCK = threading.RLock()
 
@@ -291,6 +305,9 @@ def play_info(sid, se=None, ep=None):
 # title matching helpers
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# 4. metadata — title matching + imdb/tmdb resolution
+# --------------------------------------------------------------------------
 _TAG = re.compile(r"\[(.*?)\]|\((.*?)\)")
 
 def clean_title(t):
@@ -476,6 +493,9 @@ _IMDB_CACHE = {}
 # catalog scraping (SSR Nuxt payload decode)
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# 5. catalogs — scraped pools -> catalog & search metas
+# --------------------------------------------------------------------------
 _SCRAPED = {}      # (site, kind, page) -> (subjects, expiry)
 
 def _deref_all(payload):
@@ -610,10 +630,11 @@ def search_catalog(ctype, query):
 # DASH -> HLS bridge
 # --------------------------------------------------------------------------
 
-_HLS_SESSIONS = {}
-_SESS_LOCK = threading.Lock()
 _MPD_CACHE = {}     # dash_base -> {reps, audio, dur, seg_dur, exp}
 
+# --------------------------------------------------------------------------
+# 6. cdn / dash — CloudFront cookies, MPD parsing, DASH manifests
+# --------------------------------------------------------------------------
 def _cf_parts(sign_cookie):
     try:
         parts = {}
@@ -731,7 +752,8 @@ def get_mpd_raw(dash_base, cookie):
         r = requests.get(dash_base + "/index.mpd",
                          headers={"Cookie": cookie, "User-Agent": "ExoPlayerLib/2.18.7"},
                          timeout=15)
-        if r.status_code == 200 and b"<MPD" in r.content[:600]:
+        if (r.status_code == 200 and b"<MPD" in r.content[:600]
+                and len(r.content) < 1_500_000):        # egress guard: text only
             _cache_put(_MPD_RAW_CACHE, dash_base, r.text, 30 * 60)
             return r.text
     except requests.RequestException:
@@ -818,16 +840,10 @@ def dash_manifest(sid, se, ep):
         xml = re.sub(r'maxSegmentDuration="[^"]+"', 'maxSegmentDuration="PT6.5S"', xml, count=1)
     return xml
 
-def new_hls_session(dash_base, cf, mpd):
-    tok = secrets.token_urlsafe(12)
-    with _SESS_LOCK:
-        now = time.time()
-        for k in [k for k, v in _HLS_SESSIONS.items() if v["exp"] < now]:
-            _HLS_SESSIONS.pop(k, None)
-        _HLS_SESSIONS[tok] = {"dash": dash_base, "cf": cf, "mpd": mpd,
-                              "exp": now + HLS_SESSION_TTL}
-    return tok
 
+# --------------------------------------------------------------------------
+# 7. hls — stateless playlists from the MPD timeline
+# --------------------------------------------------------------------------
 def hls_master(sess):
     mpd = sess["mpd"]
     lines = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-INDEPENDENT-SEGMENTS"]
@@ -958,6 +974,9 @@ def _cached_play(sid, se, ep):
 # endpoint is not — it serves signed subtitle URLs (~7-day CloudFront
 # wildcard policy on cacdn.hakunaymatata.com/subtitle/*) for every dub.
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# 8. subtitles — caption endpoints, SRT->VTT
+# --------------------------------------------------------------------------
 _WEB_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 _WEB_JWT = None
@@ -1010,14 +1029,21 @@ def fetch_captions(sid, stream_id):
     hit, val = _cache_get(_SUB_CACHE, key)
     if hit:
         return val
-    caps = []
-    d = api_call("GET", "/wefeed-mobile-bff/subject-api/get-stream-captions"
-                 "?subjectId=%s&streamId=%s" % (sid, stream_id))
-    if d and "__error__" not in d:
-        caps = d.get("extCaptions") or []
-    if not caps:
-        caps = _web_captions(sid, stream_id)
-    _cache_put(_SUB_CACHE, key, caps, 3600)
+    def _mobile():
+        d = api_call("GET", "/wefeed-mobile-bff/subject-api/get-stream-captions"
+                     "?subjectId=%s&streamId=%s" % (sid, stream_id))
+        return (d.get("extCaptions") or []) if (d and "__error__" not in d) else []
+    caps = _mobile()
+    if len(caps) < 2:            # flaky endpoint — one quick retry
+        time.sleep(0.4)
+        retry = _mobile()
+        if len(retry) > len(caps):
+            caps = retry
+    if len(caps) < 2:            # still thin — try the web endpoint, keep the longer list
+        web = _web_captions(sid, stream_id)
+        if len(web) > len(caps):
+            caps = web
+    _cache_put(_SUB_CACHE, key, caps, 3600 if caps else 180)
     return caps
 
 def _web_captions(sid, stream_id):
@@ -1079,8 +1105,8 @@ def _lazy_sub(sid, se, ep, lan):
         return None
     try:
         r = requests.get(c["url"], headers={"User-Agent": _WEB_UA}, timeout=10)
-        if r.status_code != 200 or not r.text.strip():
-            return None
+        if r.status_code != 200 or not r.text.strip() or len(r.text) > 2_500_000:
+            return None                                          # egress guard
         vtt = _srt_to_vtt(r.text)
     except requests.RequestException:
         return None
@@ -1088,6 +1114,59 @@ def _lazy_sub(sid, se, ep, lan):
         _VTT_CACHE.clear()
     _cache_put(_VTT_CACHE, key, vtt, 6 * 3600)
     return vtt
+
+# --------------------------------------------------------------------------
+# 9. stream cards — per-dub cards, caching, pre-warm
+# --------------------------------------------------------------------------
+_CODEC_LABEL = {"hevc": "HEVC", "h265": "HEVC", "h264": "H.264", "avc": "H.264",
+                "av1": "AV1"}
+_SUB_DISP = {"in_id": "id"}          # nicer code shown in the card sub line
+
+def _fmt_size(n):
+    """Bytes -> human readable; blank for junk values."""
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return ""
+    if n < 10 * 1024 * 1024:         # < 10 MB is not worth a card slot
+        return ""
+    for unit in ("KB", "MB", "GB", "TB"):
+        n /= 1024.0
+        if n < 1024 or unit == "TB":
+            return "%.1f %s" % (n, unit)
+    return ""
+
+def _fmt_dur(secs):
+    try:
+        secs = int(secs)
+    except (TypeError, ValueError):
+        return ""
+    if secs < 60:
+        return ""
+    if secs >= 3600:
+        return "%dh%02dm" % (secs // 3600, (secs % 3600) // 60)
+    return "%d min" % (secs // 60)
+
+def _res_range(pi, pl):
+    """'480p-1080p' style label from play-info resolutions."""
+    raw = pi.get("displayResolutions") or (pl or {}).get("resolutions") or ""
+    try:
+        heights = sorted({int(x) for x in re.findall(r"\d{3,4}", str(raw))})
+    except Exception:
+        heights = []
+    if not heights:
+        return "MULTI"
+    if len(heights) == 1:
+        return "%dp" % heights[0]
+    return "%dp–%dp" % (heights[0], heights[-1])
+
+def _sub_line(subs):
+    """Third card line: subtitle count + languages."""
+    if not subs:
+        return "▣ NO SUB"
+    codes = [_SUB_DISP.get(s["id"][4:], s["id"][4:]) for s in subs]
+    more = " +%d" % (len(codes) - 3) if len(codes) > 3 else ""
+    return "▣ %d SUB · %s%s" % (len(subs), ", ".join(codes[:3]), more)
 
 _LABEL_PRETTY = {"esla": "Spanish", "ptbr": "Portuguese (BR)", "pt": "Portuguese",
                  "es": "Spanish", "id": "Indonesian"}
@@ -1123,35 +1202,39 @@ def _resolve_entry(pair, se, ep, ctype, title, year):
     if not _dash_base(cf["CloudFront-Policy"]):
         return None
     res = _res_from_pi(pi, pl)
-    desc = "%s (%s) (%s) ▣ %s" % (title, year or "----", label, BRAND)
-    if ctype == "series":
-        desc += " ▣ S%02dE%02d" % (se, ep)
-    desc += " ◀ MBCLOUD"
     use_se, use_ep = (se, ep) if ctype == "series" else (0, 0)
+    # --- card layout: bold name line + multi-line description ---
+    # line 1 (gray): quality / codec / size / runtime
+    l1 = "▣ %s" % _res_range(pi, pl)
+    codec = _CODEC_LABEL.get(str(pl.get("codecName") or "").lower())
+    for part in (codec, _fmt_size(pl.get("size")), _fmt_dur(pl.get("duration"))):
+        if part:
+            l1 += " ▣ " + part
+    # line 2: episode (series) or year (movie) + brand
+    if ctype == "series":
+        l2 = "▣ S%02dE%02d ▣ %s" % (se, ep, BRAND)
+    else:
+        l2 = ("▣ %s ▣ " % year if year else "▣ ") + BRAND
+    # line 3: subtitle tracks from the platform's caption endpoints
+    subs = []
+    try:
+        caps = fetch_captions(sid, pl.get("id"))
+        subs = [{"url": "/sub/%s/%d/%d/%s.vtt" % (sid, use_se, use_ep, c.get("lan")),
+                 "lang": _LANG3.get(c.get("lan"), c.get("lan")),
+                 "id": "mbx-%s" % c.get("lan")}
+                for c in caps if c.get("lan")]
+    except Exception:
+        pass
     card = {
-        "name": "𖤍 %s 𖤍" % res,
-        "description": desc,
+        "name": "𖤍 %s (%s)" % (title, label),
+        "description": l1 + "\n" + l2 + "\n" + _sub_line(subs),
         "url": "/hls/%s/%d/%d/master.m3u8" % (sid, use_se, use_ep),
         "behaviorHints": {"notWebReady": False, "isBingeable": True},
         "bingeGroup": "mbx|%s:%s:%s|%s|%s" % (title, se if ctype == "series" else "",
                                               ep if ctype == "series" else "", label, res),
+        "subtitles": subs,
     }
-    cards = [card]
-    # subtitles from the platform's caption endpoints; attached to every card
-    try:
-        caps = fetch_captions(sid, pl.get("id"))
-        if caps:
-            subs = [{"url": "/sub/%s/%d/%d/%s.vtt" % (sid, use_se, use_ep, c.get("lan")),
-                     "lang": _LANG3.get(c.get("lan"), c.get("lan")),
-                     "id": "mbx-%s" % c.get("lan")}
-                    for c in caps if c.get("lan")]
-            for c in cards:
-                c["subtitles"] = subs
-                if len(subs) > 1:
-                    c["description"] += " ▣ %d SUB" % len(subs)
-    except Exception:
-        pass
-    return cards
+    return [card]
 
 def _lazy_hls(sid, se, ep, file):
     """Stateless HLS: derive playlists from (sid, se, ep) via cached
@@ -1222,6 +1305,15 @@ def build_streams(ctype, imdb, se, ep, _prewarm_next=True):
         results = list(ex.map(lambda p: _resolve_entry(p, se, ep, ctype, title, year),
                               entries))
     streams = [c for r in results if r for c in r]
+    # a dub whose caption lookup failed (or came back suspiciously thin)
+    # reuses the richest subtitle set of this title — sub URLs embed the
+    # SOURCE sid, so they resolve fine on the /sub/ route
+    best = max((s.get("subtitles") or [] for s in streams), key=len) if streams else []
+    if len(best) >= 2:
+        for s in streams:
+            if len(s.get("subtitles") or []) < 2:
+                s["subtitles"] = best
+                s["description"] = s["description"].rsplit("\n", 1)[0] + "\n" + _sub_line(best)
     if streams:
         _cache_put(_STREAM_CACHE, key, streams, _STREAM_CACHE_TTL)
         if _prewarm_next and ctype == "series":
@@ -1306,6 +1398,9 @@ MANIFEST = {
     "resources": ["stream", "catalog"],
 }
 
+# --------------------------------------------------------------------------
+# 10. landing page — install / usage
+# --------------------------------------------------------------------------
 _LANDING_HTML = """<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
@@ -1394,6 +1489,9 @@ _LANDING_HTML = """<!doctype html>
 </script>
 </body></html>"""
 
+# --------------------------------------------------------------------------
+# 11. http server — routes, gzip, CORS, cache headers
+# --------------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "MovieBox/" + VERSION
@@ -1402,13 +1500,31 @@ class Handler(BaseHTTPRequestHandler):
         print("[%s] %s" % (time.strftime("%H:%M:%S"), fmt % args), flush=True)
 
     def _send(self, code, body, ctype="application/json", extra=None):
+        """Text-only responses; gzip when the client allows (keeps Render's
+        free-plan egress tiny: playlists/subs/manifests shrink ~5-10x)."""
         if isinstance(body, str):
             body = body.encode()
+        if len(body) > 512 and "gzip" in (self.headers.get("Accept-Encoding") or ""):
+            buf = io.BytesIO()
+            with gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as gz:
+                gz.write(body)
+            packed = buf.getvalue()
+            if len(packed) < len(body):
+                body = packed
+                extra = dict(extra or {})
+                extra["Content-Encoding"] = "gzip"
+                extra["Vary"] = "Accept-Encoding"
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Cache-Control", "no-store" if ctype == "application/json" else "public, max-age=300")
+        if ctype.startswith("text/vtt"):
+            cache = "public, max-age=3600"          # subs are immutable
+        elif ctype == "application/json":
+            cache = "no-store"                      # fresh stream results
+        else:
+            cache = "public, max-age=300"           # playlists / manifests
+        self.send_header("Cache-Control", cache)
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
@@ -1449,7 +1565,7 @@ class Handler(BaseHTTPRequestHandler):
                 "keepalive": bool(PUBLIC_URL or _KEEPALIVE_URL),
                 "keepalive_url": PUBLIC_URL or _KEEPALIVE_URL,
                 "auth_token": bool(_AUTH_TOKEN),
-                "video_proxy": False,
+                "video_proxy": False, "egress": "text-only (json/playlists/manifests/subtitles, gzip)",
                 "segment_routing": "cdn-direct (sacdn CloudFront, query-signed)",
             }))
 
@@ -1519,23 +1635,6 @@ class Handler(BaseHTTPRequestHandler):
             if body is None:
                 return self._send(404, "#EXTM3U\n#error no stream for this entry\n",
                                   "application/vnd.apple.mpegurl")
-            return self._send(200, body, "application/vnd.apple.mpegurl")
-
-        m = re.match(r"^/hls/([A-Za-z0-9_-]{6,64})/(master|v\d+|a\d+)\.m3u8$", path)
-        if m:
-            with _SESS_LOCK:
-                sess = _HLS_SESSIONS.get(m.group(1))
-            if not sess or sess["exp"] < time.time():
-                return self._send(404, "#EXTM3U\n#error session expired\n",
-                                  "application/vnd.apple.mpegurl")
-            if m.group(2) == "master":
-                body = hls_master(sess)
-            else:
-                kind, idx = m.group(2)[0], int(m.group(2)[1:])
-                reps = sess["mpd"]["audio"] if kind == "a" else sess["mpd"]["video"]
-                if idx >= len(reps):
-                    return self._send(404, "bad rep", "text/plain")
-                body = hls_media(sess, reps[idx]["id"], kind)
             return self._send(200, body, "application/vnd.apple.mpegurl")
 
         return self._send(404, json.dumps({"error": "not found"}))

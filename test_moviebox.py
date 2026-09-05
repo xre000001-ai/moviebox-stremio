@@ -569,9 +569,13 @@ def test_build_streams_series_happy_path():
         res = addon.build_streams("series", "tt10919420", 1, 1)
     assert len(res["streams"]) >= 2
     s0 = res["streams"][0]
-    assert s0["name"] == "𖤍 MULTI 𖤍"
-    assert "Squid Game (2021)" in s0["description"]
+    # multi-line card: bold "title (dub)" name + 3 description lines
+    assert s0["name"].startswith("𖤍 Squid Game (")
+    assert s0["description"].count("\n") == 2
+    assert "480p–1080p" in s0["description"]      # real resolution range
+    assert "HEVC" in s0["description"] and "863.7 MB" in s0["description"]
     assert "▣ S01E01" in s0["description"] and "▣ MOVIE BOX" in s0["description"]
+    assert "NO SUB" in s0["description"]          # captions mocked empty
     assert "DASH" not in s0["description"]
     # lazy HLS: url carries sid/se/ep (stateless), not a session token
     assert re.match(r"^/hls/\d+/1/1/master\.m3u8$", s0["url"]), s0["url"]
@@ -596,7 +600,9 @@ def test_build_streams_movie_no_dubs():
         g.return_value = r
         res = addon.build_streams("movie", "tt1375666", 1, 1)
     assert len(res["streams"]) == 1
-    assert "(Original)" in res["streams"][0]["description"]
+    assert "(Original)" in res["streams"][0]["name"]
+    assert res["streams"][0]["description"].count("\n") == 2
+    assert "▣ 2010 ▣ MOVIE BOX" in res["streams"][0]["description"]
     assert "S01E01" not in res["streams"][0]["description"]
     assert re.match(r"^/hls/\d+/0/0/master\.m3u8$", res["streams"][0]["url"])
     assert g.call_count == 0  # MPD deferred to first /hls request
@@ -701,13 +707,6 @@ def test_build_streams_play_info_transparent_on_none():
         res = addon.build_streams("movie", "tt1375666", 1, 1)
     assert res["streams"] == []
 
-def test_hls_session_roundtrip():
-    mpd = addon._parse_mpd(MPD_FIX)
-    tok = addon.new_hls_session("https://x", addon._cf_parts(FAKE_COOKIE), mpd)
-    with addon._SESS_LOCK:
-        sess = addon._HLS_SESSIONS[tok]
-    assert sess["mpd"]["dur"] > 3600
-    del addon._HLS_SESSIONS[tok]
 
 def test_search_catalog_uses_platform_search():
     with mock.patch.object(addon, "search_subjects", return_value=[SUBJ_INCEPTION]), \
@@ -898,7 +897,9 @@ def test_srt_to_vtt():
 def test_fetch_captions_mobile_and_cache():
     addon._SUB_CACHE.clear()
     caps_fix = [{"id": "1", "lan": "en", "lanName": "English",
-                 "url": "https://cacdn.hakunaymatata.com/subtitle/x.srt?Policy=P"}]
+                 "url": "https://cacdn.hakunaymatata.com/subtitle/x.srt?Policy=P"},
+                {"id": "2", "lan": "bn", "lanName": "Bangla",
+                 "url": "https://cacdn.hakunaymatata.com/subtitle/y.srt?Policy=P"}]
     calls = {"n": 0}
     def fake_api(method, path, body=None, timeout=10):
         calls["n"] += 1
@@ -945,6 +946,7 @@ def test_resolve_entry_attaches_subtitles():
          mock.patch.object(addon, "fetch_captions", return_value=caps):
         cards = addon._resolve_entry(("111", "Hindi"), 1, 5, "series", "Our Sticky Love", "2026")
     assert isinstance(cards, list) and len(cards) == 1
+    assert cards[0]["name"] == "𖤍 Our Sticky Love (Hindi)"
     assert cards[0]["url"].startswith("/hls/111/1/5/master.m3u8")
     assert "/dash/" not in cards[0]["url"]
     for card in cards:
@@ -953,7 +955,7 @@ def test_resolve_entry_attaches_subtitles():
         assert "eng" in langs and "ben" in langs
         assert card["subtitles"][0]["url"].startswith("/sub/111/1/5/")
         assert card["subtitles"][0]["url"].endswith(".vtt")
-        assert "2 SUB" in card["description"]
+        assert "▣ 2 SUB · en, bn" in card["description"]
 
 
 def test_sub_route_serves_vtt():
@@ -1088,6 +1090,72 @@ def test_dash_route_serves_mpd():
     body = c["body"].decode()
     assert body.startswith("<?xml") and "<MPD" in body and "Policy=" in body
     addon._PLAY_CACHE.clear(); addon._MPD_RAW_CACHE.clear(); addon._TAIL_CACHE.clear()
+
+def test_fetch_captions_retry_and_fallback():
+    addon._SUB_CACHE.clear()
+    cap = lambda i: {"lan": "en%d" % i, "url": "https://c/%d.srt" % i}
+    nine = [cap(i) for i in range(9)]
+    # case A: flaky mobile returns 1 cap, retry returns 9 -> keep 9
+    with mock.patch.object(addon, "api_call",
+                           side_effect=[{"extCaptions": [cap(0)]}, {"extCaptions": nine}]):
+        got = addon.fetch_captions("900", "st1")
+    assert len(got) == 9
+    # case B: mobile stuck at 1 cap, web fallback has 3 -> keep web's 3
+    addon._SUB_CACHE.clear()
+    with mock.patch.object(addon, "api_call", return_value={"extCaptions": [cap(0)]}), \
+         mock.patch.object(addon, "_web_captions", return_value=[cap(1), cap(2), cap(3)]):
+        got = addon.fetch_captions("901", "st2")
+    assert len(got) == 3
+    addon._SUB_CACHE.clear()
+
+def test_cross_dub_subtitle_rescue():
+    addon._MPD_CACHE.clear(); addon._STREAM_CACHE.clear(); addon._PLAY_CACHE.clear()
+    addon._DUB_CACHE.clear(); addon._SEARCH_CACHE.clear()
+    caps = [{"lan": "en", "url": "https://c/e.srt"}, {"lan": "bn", "url": "https://c/b.srt"}]
+    def caps_by_sid(sid, stream_id):
+        return caps if sid == "6391474290696802080" else [{"lan": "ar", "url": "https://c/a.srt"}]
+    dubs = [{"subjectId": "973041525783496480", "lanName": "Hindi dub"}]
+    with mock.patch.object(addon, "cinemeta",
+                           return_value={"name": "Inception", "year": "2010"}), \
+         mock.patch.object(addon, "search_subjects", return_value=[SUBJ_INCEPTION]), \
+         mock.patch.object(addon, "subject_dubs", return_value=dubs), \
+         mock.patch.object(addon, "play_info", return_value=PLAY_INFO_FIX), \
+         mock.patch.object(addon, "fetch_captions", side_effect=caps_by_sid), \
+         mock.patch.object(addon, "_spawn_warm"), \
+         mock.patch.object(addon.requests, "get"):
+        res = addon.build_streams("movie", "tt1375666", 1, 1)
+    assert len(res["streams"]) == 2               # Original + Hindi dub
+    orig, hindi = res["streams"]
+    assert len(orig.get("subtitles") or []) == 2  # its own captions
+    assert len(hindi.get("subtitles") or []) == 2 # thin (1-cap) dub rescued by the sibling
+    assert hindi["subtitles"][0]["url"].startswith("/sub/6391474290696802080/")
+    assert "▣ 2 SUB" in hindi["description"]
+    assert "NO SUB" not in hindi["description"]
+    addon._STREAM_CACHE.clear()
+
+def test_gzip_response():
+    import gzip as gz
+    captured, buf = {}, __import__("io").BytesIO()
+    class H(addon.Handler):
+        def __init__(self):
+            self.headers = {"Host": "127.0.0.1:7000", "Accept-Encoding": "gzip"}
+            self.command = "GET"
+            self.wfile = buf
+        def send_response(self, code):
+            captured["code"] = code
+        def send_header(self, k, v):
+            captured.setdefault("headers", {})[k] = v
+        def end_headers(self):
+            pass
+        @property
+        def path(self):
+            return "/"
+    H()._route()
+    assert captured["code"] == 200
+    assert captured["headers"].get("Content-Encoding") == "gzip"
+    body = gz.decompress(buf.getvalue()).decode()
+    assert "MOVIE BOX" in body
+    assert len(buf.getvalue()) < len(body.encode())   # actually compressed
 
 def main():
     global PASS, FAIL
