@@ -971,6 +971,11 @@ def _res_label(heights):
 
 _STREAM_CACHE = {}       # (ctype, imdb, se, ep) -> (card list, expiry)
 _STREAM_CACHE_TTL = 10800  # 3h: a prewarmed next-episode outlives the current one
+_STREAM_STALE = {}        # key -> (expiry, streams): served instantly while a
+                          # background rebuild refreshes the fresh cache
+_STREAM_STALE_TTL = 24 * 3600
+_STREAM_REFRESHING = set()
+_REFRESH_LOCK = threading.Lock()
 _PLAY_CACHE = {}         # (sid, se, ep) -> play-info payload (10 min)
 _DUB_CACHE = {}          # sid -> dub list (30 min)
 _SEARCH_CACHE = {}       # (kw, subject_type) -> subjects (10 min)
@@ -1318,6 +1323,17 @@ def build_streams(ctype, imdb, se, ep, _prewarm_next=True):
     hit, val = _cache_get(_STREAM_CACHE, key)
     if hit:
         return {"streams": val}
+    if not _prewarm_next:          # background rebuild (SWR / prewarm path)
+        _STREAM_STALE.pop(key, None)
+    else:                          # stale-while-revalidate: instant answer,
+        stale = _STREAM_STALE.get(key)     # refreshed behind the curtain
+        if stale and stale[0] > time.time() and stale[1]:
+            with _REFRESH_LOCK:
+                if key not in _STREAM_REFRESHING:
+                    _STREAM_REFRESHING.add(key)
+                    threading.Thread(target=_bg_refresh, daemon=True,
+                                     args=(ctype, imdb, se, ep, key)).start()
+            return {"streams": stale[1]}
     meta = cinemeta(ctype, imdb) or _imdb_suggest_id(imdb)
     if not meta:
         return {"streams": [], "message": "no metadata"}
@@ -1328,6 +1344,7 @@ def build_streams(ctype, imdb, se, ep, _prewarm_next=True):
         return {"streams": []}
     matched = match_subjects(subs, title, year, stype, season=se)
     if not matched:
+        _cache_put(_STREAM_CACHE, key, [], 600)
         return {"streams": []}
     # dub lists for the top matches, fetched in parallel
     with ThreadPoolExecutor(max_workers=2) as ex:
@@ -1396,6 +1413,7 @@ def build_streams(ctype, imdb, se, ep, _prewarm_next=True):
                 s["description"] = s["description"].rsplit("\n", 1)[0] + "\n" + _sub_line(shared)
     if streams:
         _cache_put(_STREAM_CACHE, key, streams, _STREAM_CACHE_TTL)
+        _STREAM_STALE[key] = (time.time() + _STREAM_STALE_TTL, streams)
         if _prewarm_next and ctype == "series":
             # background-warm the next episode so binge navigation is instant
             threading.Thread(target=_safe_build, daemon=True,
@@ -1433,6 +1451,14 @@ def _safe_build(ctype, imdb, se, ep):
         build_streams(ctype, imdb, se, ep, _prewarm_next=False)
     except Exception:
         pass
+
+def _bg_refresh(ctype, imdb, se, ep, key):
+    """Background SWR rebuild; always releases the in-flight marker."""
+    try:
+        _safe_build(ctype, imdb, se, ep)
+    finally:
+        with _REFRESH_LOCK:
+            _STREAM_REFRESHING.discard(key)
 
 # --------------------------------------------------------------------------
 # HTTP server

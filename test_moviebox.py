@@ -550,7 +550,7 @@ def test_get_catalog_bad_id():
 
 def test_build_streams_series_happy_path():
     addon._MPD_CACHE.clear()
-    addon._STREAM_CACHE.clear(); addon._PLAY_CACHE.clear(); addon._DUB_CACHE.clear(); addon._SEARCH_CACHE.clear()
+    addon._STREAM_CACHE.clear(); addon._STREAM_STALE.clear(); addon._PLAY_CACHE.clear(); addon._DUB_CACHE.clear(); addon._SEARCH_CACHE.clear()
     dubs = [{"subjectId": "973041525783496480", "lanName": "Hindi dub"},
             {"subjectId": "3089349649006742360", "lanName": "Original"}]
     with mock.patch.object(addon, "cinemeta",
@@ -585,7 +585,7 @@ def test_build_streams_series_happy_path():
 
 def test_build_streams_movie_no_dubs():
     addon._MPD_CACHE.clear()
-    addon._STREAM_CACHE.clear(); addon._PLAY_CACHE.clear(); addon._DUB_CACHE.clear(); addon._SEARCH_CACHE.clear()
+    addon._STREAM_CACHE.clear(); addon._STREAM_STALE.clear(); addon._PLAY_CACHE.clear(); addon._DUB_CACHE.clear(); addon._SEARCH_CACHE.clear()
     with mock.patch.object(addon, "cinemeta",
                            return_value={"name": "Inception", "year": "2010"}), \
          mock.patch.object(addon, "search_subjects",
@@ -609,7 +609,7 @@ def test_build_streams_movie_no_dubs():
 
 def test_build_streams_result_cached():
     addon._MPD_CACHE.clear()
-    addon._STREAM_CACHE.clear(); addon._PLAY_CACHE.clear(); addon._DUB_CACHE.clear(); addon._SEARCH_CACHE.clear()
+    addon._STREAM_CACHE.clear(); addon._STREAM_STALE.clear(); addon._PLAY_CACHE.clear(); addon._DUB_CACHE.clear(); addon._SEARCH_CACHE.clear()
     calls = {"search": 0}
     def counting_search(kw, st):
         calls["search"] += 1
@@ -702,7 +702,7 @@ def test_lazy_hls_route_404_when_no_stream():
 
 def test_stream_route_accepts_encoded_colons():
     # many Stremio clients send series ids percent-encoded: tt...%3A1%3A1
-    addon._STREAM_CACHE.clear(); addon._PLAY_CACHE.clear(); addon._DUB_CACHE.clear(); addon._SEARCH_CACHE.clear()
+    addon._STREAM_CACHE.clear(); addon._STREAM_STALE.clear(); addon._PLAY_CACHE.clear(); addon._DUB_CACHE.clear(); addon._SEARCH_CACHE.clear()
     with mock.patch.object(addon, "cinemeta",
                            return_value={"name": "Squid Game", "year": "2021"}), \
          mock.patch.object(addon, "search_subjects",
@@ -719,10 +719,10 @@ def test_stream_route_accepts_encoded_colons():
             c = _http_get(p)
             assert c["code"] == 200, p
             assert len(json.loads(c["body"])["streams"]) >= 1, p
-    addon._STREAM_CACHE.clear(); addon._PLAY_CACHE.clear()
+    addon._STREAM_CACHE.clear(); addon._STREAM_STALE.clear(); addon._PLAY_CACHE.clear()
 
 def test_build_streams_no_match():
-    addon._STREAM_CACHE.clear(); addon._PLAY_CACHE.clear(); addon._DUB_CACHE.clear(); addon._SEARCH_CACHE.clear()
+    addon._STREAM_CACHE.clear(); addon._STREAM_STALE.clear(); addon._PLAY_CACHE.clear(); addon._DUB_CACHE.clear(); addon._SEARCH_CACHE.clear()
     with mock.patch.object(addon, "cinemeta",
                            return_value={"name": "Zzz Nothing", "year": "1990"}), \
          mock.patch.object(addon, "search_subjects", return_value=[SUBJ_INCEPTION]):
@@ -730,7 +730,7 @@ def test_build_streams_no_match():
     assert res["streams"] == []
 
 def test_build_streams_play_info_transparent_on_none():
-    addon._STREAM_CACHE.clear(); addon._PLAY_CACHE.clear(); addon._DUB_CACHE.clear(); addon._SEARCH_CACHE.clear()
+    addon._STREAM_CACHE.clear(); addon._STREAM_STALE.clear(); addon._PLAY_CACHE.clear(); addon._DUB_CACHE.clear(); addon._SEARCH_CACHE.clear()
     addon._MPD_CACHE.clear()
     with mock.patch.object(addon, "cinemeta",
                            return_value={"name": "Inception", "year": "2010"}), \
@@ -1148,7 +1148,7 @@ def test_fetch_captions_retry_and_fallback():
     addon._SUB_CACHE.clear()
 
 def test_cross_dub_subtitle_rescue():
-    addon._MPD_CACHE.clear(); addon._STREAM_CACHE.clear(); addon._PLAY_CACHE.clear()
+    addon._MPD_CACHE.clear(); addon._STREAM_CACHE.clear(); addon._STREAM_STALE.clear(); addon._PLAY_CACHE.clear()
     addon._DUB_CACHE.clear(); addon._SEARCH_CACHE.clear()
     caps = [{"lan": "en", "url": "https://c/e.srt"}, {"lan": "bn", "url": "https://c/b.srt"}]
     def caps_by_sid(sid, stream_id):
@@ -1170,10 +1170,10 @@ def test_cross_dub_subtitle_rescue():
     assert hindi["subtitles"][0]["url"].startswith("/sub/6391474290696802080/")
     assert "▣ 2 SUB" in hindi["description"]
     assert "NO SUB" not in hindi["description"]
-    addon._STREAM_CACHE.clear()
+    addon._STREAM_CACHE.clear(); addon._STREAM_STALE.clear()
 
 def test_captions_fetched_once_per_title():
-    addon._MPD_CACHE.clear(); addon._STREAM_CACHE.clear(); addon._PLAY_CACHE.clear()
+    addon._MPD_CACHE.clear(); addon._STREAM_CACHE.clear(); addon._STREAM_STALE.clear(); addon._PLAY_CACHE.clear()
     addon._DUB_CACHE.clear(); addon._SEARCH_CACHE.clear()
     calls = {"caps": 0}
     nine = [{"lan": "en%d" % i, "url": "https://c/%d.srt" % i} for i in range(9)]
@@ -1197,7 +1197,33 @@ def test_captions_fetched_once_per_title():
         assert len(s.get("subtitles") or []) == 9
         assert "▣ 9 SUB" in s["description"]
         assert s["subtitles"][0]["url"].startswith("/sub/6391474290696802080/")
-    addon._STREAM_CACHE.clear()
+    addon._STREAM_CACHE.clear(); addon._STREAM_STALE.clear()
+
+def test_stream_stale_while_revalidate():
+    addon._MPD_CACHE.clear(); addon._STREAM_CACHE.clear(); addon._STREAM_STALE.clear()
+    addon._PLAY_CACHE.clear(); addon._DUB_CACHE.clear(); addon._SEARCH_CACHE.clear()
+    with mock.patch.object(addon, "cinemeta",
+                           return_value={"name": "Inception", "year": "2010"}), \
+         mock.patch.object(addon, "search_subjects", return_value=[SUBJ_INCEPTION]), \
+         mock.patch.object(addon, "subject_dubs", return_value=[]), \
+         mock.patch.object(addon, "play_info", return_value=PLAY_INFO_FIX), \
+         mock.patch.object(addon, "fetch_captions", return_value=[]), \
+         mock.patch.object(addon, "_spawn_warm"), \
+         mock.patch.object(addon.requests, "get"):
+        r1 = addon.build_streams("movie", "tt1375666", 1, 1)
+    assert len(r1["streams"]) == 1
+    addon._STREAM_CACHE.clear()               # simulate the 3h fresh TTL expiring
+    class FakeThread:                         # no background refresh in the test
+        def __init__(self, *a, **k): pass
+        def start(self): pass
+    import time as _t
+    with mock.patch.object(addon.threading, "Thread", FakeThread):
+        t0 = _t.time()
+        r2 = addon.build_streams("movie", "tt1375666", 1, 1)
+    assert _t.time() - t0 < 0.5               # instant: stale list served
+    assert r2 == {"streams": r1["streams"]}
+    addon._STREAM_CACHE.clear(); addon._STREAM_STALE.clear()
+    addon._STREAM_REFRESHING.clear()
 
 def test_gzip_response():
     import gzip as gz
