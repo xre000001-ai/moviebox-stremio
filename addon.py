@@ -41,7 +41,7 @@ from urllib.parse import urlparse, parse_qs, urlencode, quote, unquote
 
 import requests
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 BRAND = "MOVIE BOX"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -1128,18 +1128,15 @@ def _resolve_entry(pair, se, ep, ctype, title, year):
         desc += " ▣ S%02dE%02d" % (se, ep)
     desc += " ◀ MBCLOUD"
     use_se, use_ep = (se, ep) if ctype == "series" else (0, 0)
-    def _mk(fmt, dash_mode):
-        b = "mbx%s" % ("d" if dash_mode else "")
-        return {
-            "name": "𖤍 %s 𖤍" % res,
-            "description": desc + (" ▣ DASH" if dash_mode else ""),
-            "url": ("/dash/%s/%d/%d/manifest.mpd" if dash_mode
-                    else "/hls/%s/%d/%d/master.m3u8") % (sid, use_se, use_ep),
-            "behaviorHints": {"notWebReady": False, "isBingeable": True},
-            "bingeGroup": "%s|%s:%s:%s|%s|%s" % (b, title, se if ctype == "series" else "",
-                                                 ep if ctype == "series" else "", label, res),
-        }
-    cards = [_mk("dash", True), _mk("hls", False)]
+    card = {
+        "name": "𖤍 %s 𖤍" % res,
+        "description": desc,
+        "url": "/hls/%s/%d/%d/master.m3u8" % (sid, use_se, use_ep),
+        "behaviorHints": {"notWebReady": False, "isBingeable": True},
+        "bingeGroup": "mbx|%s:%s:%s|%s|%s" % (title, se if ctype == "series" else "",
+                                              ep if ctype == "series" else "", label, res),
+    }
+    cards = [card]
     # subtitles from the platform's caption endpoints; attached to every card
     try:
         caps = fetch_captions(sid, pl.get("id"))

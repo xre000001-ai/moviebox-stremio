@@ -567,18 +567,15 @@ def test_build_streams_series_happy_path():
         r.text = MPD_FIX
         g.return_value = r
         res = addon.build_streams("series", "tt10919420", 1, 1)
-    assert len(res["streams"]) >= 4          # DASH + HLS per entry
+    assert len(res["streams"]) >= 2
     s0 = res["streams"][0]
     assert s0["name"] == "𖤍 MULTI 𖤍"
     assert "Squid Game (2021)" in s0["description"]
     assert "▣ S01E01" in s0["description"] and "▣ MOVIE BOX" in s0["description"]
-    assert "▣ DASH" in s0["description"]
+    assert "DASH" not in s0["description"]
     # lazy HLS: url carries sid/se/ep (stateless), not a session token
-    assert re.match(r"^/dash/\d+/1/1/manifest\.mpd$", s0["url"]), s0["url"]
-    s1 = res["streams"][1]
-    assert re.match(r"^/hls/\d+/1/1/master\.m3u8$", s1["url"]), s1["url"]
-    assert s0["bingeGroup"].startswith("mbxd|Squid Game")
-    assert s1["bingeGroup"].startswith("mbx|Squid Game")
+    assert re.match(r"^/hls/\d+/1/1/master\.m3u8$", s0["url"]), s0["url"]
+    assert s0["bingeGroup"].startswith("mbx|Squid Game")
     # MPD is NOT fetched at card time (deferred to first /hls request)
     assert g.call_count == 0
 
@@ -598,11 +595,10 @@ def test_build_streams_movie_no_dubs():
         r.text = MPD_FIX
         g.return_value = r
         res = addon.build_streams("movie", "tt1375666", 1, 1)
-    assert len(res["streams"]) == 2           # DASH + HLS
+    assert len(res["streams"]) == 1
     assert "(Original)" in res["streams"][0]["description"]
     assert "S01E01" not in res["streams"][0]["description"]
-    assert re.match(r"^/dash/\d+/0/0/manifest\.mpd$", res["streams"][0]["url"])
-    assert re.match(r"^/hls/\d+/0/0/master\.m3u8$", res["streams"][1]["url"])
+    assert re.match(r"^/hls/\d+/0/0/master\.m3u8$", res["streams"][0]["url"])
     assert g.call_count == 0  # MPD deferred to first /hls request
 
 def test_build_streams_result_cached():
@@ -624,7 +620,7 @@ def test_build_streams_result_cached():
         g.return_value = r
         r1 = addon.build_streams("movie", "tt1375666", 1, 1)
         r2 = addon.build_streams("movie", "tt1375666", 1, 1)
-    assert r1 == r2 and len(r2["streams"]) == 2
+    assert r1 == r2 and len(r2["streams"]) == 1
     assert calls["search"] == 1  # second call served from cache
 
 def test_cached_play_dedupes():
@@ -948,9 +944,9 @@ def test_resolve_entry_attaches_subtitles():
     with mock.patch.object(addon, "_cached_play", return_value=pi), \
          mock.patch.object(addon, "fetch_captions", return_value=caps):
         cards = addon._resolve_entry(("111", "Hindi"), 1, 5, "series", "Our Sticky Love", "2026")
-    assert isinstance(cards, list) and len(cards) == 2
-    assert cards[0]["url"].startswith("/dash/111/1/5/manifest.mpd")
-    assert cards[1]["url"].startswith("/hls/111/1/5/master.m3u8")
+    assert isinstance(cards, list) and len(cards) == 1
+    assert cards[0]["url"].startswith("/hls/111/1/5/master.m3u8")
+    assert "/dash/" not in cards[0]["url"]
     for card in cards:
         assert card.get("subtitles")
         langs = [s["lang"] for s in card["subtitles"]]
@@ -958,7 +954,7 @@ def test_resolve_entry_attaches_subtitles():
         assert card["subtitles"][0]["url"].startswith("/sub/111/1/5/")
         assert card["subtitles"][0]["url"].endswith(".vtt")
         assert "2 SUB" in card["description"]
-    assert "▣ DASH" in cards[0]["description"] and "▣ DASH" not in cards[1]["description"]
+
 
 def test_sub_route_serves_vtt():
     addon._PLAY_CACHE.clear(); addon._SUB_CACHE.clear(); addon._VTT_CACHE.clear()
