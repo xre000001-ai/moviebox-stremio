@@ -94,6 +94,15 @@ NUXT_PAYLOAD = [
     "https://pbcdnw.aoneroom.com/image/x.jpg", "6.6", "Action,Thriller"
 ]
 
+# cover stored as an INDEX to a nested dict (real netnaija payload shape)
+NUXT_PAYLOAD_IDX_COVER = [
+    "app", 1,
+    {"subjectId": 3, "title": 4, "subjectType": 5, "releaseDate": 6, "cover": 7},
+    "1111774575987245152", "Mayday", 1, "2026-01-15",
+    {"url": 8, "width": 9, "height": 10},
+    "https://pbcdnw.aoneroom.com/image/cover.jpg", 535, 755
+]
+
 # ------------------------------------------------------------------ tests
 
 def test_x_client_token():
@@ -125,6 +134,10 @@ def test_clean_title():
     assert addon.clean_title("Squid Game [Hindi] S3") == "Squid Game"
     assert addon.clean_title("Movie (2019) (Hindi)") == "Movie"
     assert addon.clean_title("  Plain   Title  ") == "Plain Title"
+    assert addon.clean_title("Attack on Titan S1-S4") == "Attack on Titan"
+    assert addon.clean_title("Attack on Titan [Hindi] S1-S6") == "Attack on Titan"
+    assert addon.clean_title("Some Show Season 2") == "Some Show"
+    assert addon.clean_title("Lucifer S1 - S5") == "Lucifer"
 
 def test_year_of():
     assert addon._year_of("2021-09-17") == "2021"
@@ -150,6 +163,15 @@ def test_match_excludes_other_titles():
     subs = [SUBJ_INCEPTION, {"subjectId": "1", "subjectType": 1, "title": "Shutter Island", "releaseDate": "2010-02-19"}]
     got = addon.match_subjects(subs, "Inception", "2010", 1)
     assert all("Inception" in s["title"] for s, _ in got)
+
+def test_match_rejects_wrong_subject_type():
+    # a MOVIE subject named like the series must not match a series request
+    movie_named_same = {"subjectId": "9", "subjectType": 1, "title": "Attack on Titan",
+                        "releaseDate": "2023-01-02"}
+    subs = [movie_named_same, {"subjectId": "8", "subjectType": 2,
+                               "title": "Attack on Titan S1-S4", "releaseDate": "2013-09-28"}]
+    got = addon.match_subjects(subs, "Attack on Titan", "2013", 2, season=1)
+    assert [s["subjectId"] for s, _ in got] == ["8"]
 
 def test_cf_parts():
     cf = addon._cf_parts(FAKE_COOKIE)
@@ -238,6 +260,82 @@ def test_nuxt_deref():
     assert s["title"] == "Mayday"
     assert s["cover"]["url"].startswith("https://pbcdnw")
     assert s["imdbRatingValue"] == "6.6"
+
+def test_nuxt_deref_index_cover():
+    # real payload: cover is an int index pointing to a nested dict
+    subs = addon._deref_all(NUXT_PAYLOAD_IDX_COVER)
+    assert len(subs) == 1
+    s = subs[0]
+    assert s["cover"]["url"] == "https://pbcdnw.aoneroom.com/image/cover.jpg"
+    assert s["cover"]["width"] == 535 and s["cover"]["height"] == 755
+    assert s["subjectId"] == "1111774575987245152"
+
+def test_search_subjects_v2_primary():
+    with mock.patch.object(addon, "api_call") as ac:
+        ac.return_value = {"results": [{"subjects": [SUBJ_INCEPTION]}]}
+        subs = addon.search_subjects("Inception", 1)
+    assert subs == [SUBJ_INCEPTION]
+    assert ac.call_count == 1
+    assert "search/v2" in ac.call_args[0][1]
+
+def test_search_subjects_v1_fallback():
+    with mock.patch.object(addon, "api_call") as ac:
+        ac.side_effect = [
+            {"results": []},                      # v2 empty
+            {"items": [SUBJ_INCEPTION, SUBJ_3IDIOTS]},  # v1 works
+        ]
+        subs = addon.search_subjects("john wick", 1)
+    assert subs == [SUBJ_INCEPTION, SUBJ_3IDIOTS]
+    assert ac.call_args_list[1][0][1].endswith("/subject-api/search")
+
+def test_search_subjects_single_word_last_resort():
+    with mock.patch.object(addon, "api_call") as ac:
+        ac.side_effect = [
+            {"results": []},                  # v2 empty
+            {"items": []},                    # v1 empty
+            {"items": [SUBJ_INCEPTION]},      # v1 single word
+        ]
+        subs = addon.search_subjects("john wick", 1)
+    assert subs == [SUBJ_INCEPTION]
+    body = json.loads(ac.call_args_list[2][0][2])
+    assert body["keyword"] == "john"  # longest word
+
+def test_search_subjects_filters_junk_types():
+    junk = {"subjectId": "9", "subjectType": 6, "title": "MIXTAPE 2024", "releaseDate": "2024-01-01"}
+    with mock.patch.object(addon, "api_call") as ac:
+        ac.return_value = {"results": [{"subjects": [junk, SUBJ_INCEPTION]}]}
+        subs = addon.search_subjects("Inception", 1)
+    assert subs == [SUBJ_INCEPTION]
+
+def test_get_catalog_dedupes_imdb():
+    m1 = {"subjectId": "a", "subjectType": 1, "title": "John Wick", "releaseDate": "2014-10-24",
+          "cover": {"url": "https://x/1.jpg"}}
+    m2 = {"subjectId": "b", "subjectType": 1, "title": "John Wick [Hindi]", "releaseDate": "2014-11-01",
+          "cover": {"url": "https://x/2.jpg"}}
+    m3 = {"subjectId": "c", "subjectType": 1, "title": "Nowhere", "releaseDate": "2023-09-11",
+          "cover": {"url": "https://x/3.jpg"}}
+    with mock.patch.object(addon, "scrape_subjects", return_value=[m1, m2, m3]), \
+         mock.patch.object(addon, "resolve_imdb",
+                           side_effect=lambda t, y, c: {"John Wick": "tt2911666", "Nowhere": "tt23178568"}.get(t)):
+        res = addon.get_catalog("movie", "netnaija-movies", 0)
+    assert [m["id"] for m in res["metas"]] == ["tt2911666", "tt23178568"]
+
+def test_search_catalog_dedupes_imdb():
+    with mock.patch.object(addon, "search_subjects",
+                           return_value=[SUBJ_INCEPTION, SUBJ_3IDIOTS, SUBJ_SQUID_ORIG]), \
+         mock.patch.object(addon, "resolve_imdb",
+                           side_effect=lambda t, y, c: {"Inception": "tt1375666", "Squid Game": "tt10919420"}.get(t)):
+        res = addon.search_catalog("movie", "inception")
+    ids = [m["id"] for m in res["metas"]]
+    assert ids == ["tt1375666", "tt10919420"] and len(ids) == len(set(ids))
+
+def test_catalog_poster_from_cover():
+    s = {"subjectId": "1", "subjectType": 1, "title": "The Old Guard",
+         "releaseDate": "2020-07-10",
+         "cover": {"url": "https://pbcdnw.aoneroom.com/p.jpg"}}
+    with mock.patch.object(addon, "resolve_imdb", return_value="tt3675440"):
+        m = addon.subject_to_meta(s, "movie")
+    assert m["poster"] == "https://pbcdnw.aoneroom.com/p.jpg"
 
 def test_imdb_suggest_match():
     with mock.patch("requests.get") as g:

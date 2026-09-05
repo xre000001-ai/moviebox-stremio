@@ -228,15 +228,33 @@ def api_call(method, path, body=None, timeout=15):
 # --------------------------------------------------------------------------
 
 def search_subjects(kw, subject_type):
-    """subject_type: 1=movie 2=series. Returns list of subject dicts."""
-    body = json.dumps({"keyword": kw, "page": 1, "perPage": 20,
-                       "subjectType": subject_type, "tabId": "All"})
-    d = api_call("POST", "/wefeed-mobile-bff/subject-api/search/v2", body)
-    if d is None or "__error__" in d:
-        return []
-    res = d.get("results") or []
-    subs = res[0].get("subjects", []) if res else []
-    return [s for s in subs if s.get("subjectType") in (1, 2)]
+    """subject_type: 1=movie 2=series. Returns list of subject dicts.
+    v2 search index is flaky for some multi-word queries ("john wick" -> 0);
+    falls back to the v1 endpoint which handles them."""
+    base = {"keyword": kw, "page": 1, "perPage": 20, "subjectType": subject_type}
+    d = api_call("POST", "/wefeed-mobile-bff/subject-api/search/v2",
+                 json.dumps(dict(base, tabId="All")))
+    if d and "__error__" not in d:
+        res = d.get("results") or []
+        subs = res[0].get("subjects", []) if res else []
+        subs = [s for s in subs if s.get("subjectType") in (1, 2)]
+        if subs:
+            return subs
+    # v1 fallback (no tabId; returns data.items[])
+    d = api_call("POST", "/wefeed-mobile-bff/subject-api/search", json.dumps(base))
+    if d and "__error__" not in d:
+        subs = [s for s in (d.get("items") or []) if s.get("subjectType") in (1, 2)]
+        if subs:
+            return subs
+    # last resort: single longest word via v1
+    words = [w for w in re.split(r"\W+", kw) if len(w) > 1]
+    if len(words) > 1:
+        w = max(words, key=len)
+        d = api_call("POST", "/wefeed-mobile-bff/subject-api/search",
+                     json.dumps(dict(base, keyword=w)))
+        if d and "__error__" not in d:
+            return [s for s in (d.get("items") or []) if s.get("subjectType") in (1, 2)]
+    return []
 
 def subject_dubs(sid):
     d = api_call("GET", "/wefeed-mobile-bff/subject-api/get?subjectId=%s&update=0&status=0" % sid)
@@ -261,7 +279,9 @@ _TAG = re.compile(r"\[(.*?)\]|\((.*?)\)")
 
 def clean_title(t):
     t = _TAG.sub(" ", t or "")
-    t = re.sub(r"\s+[Ss]\d{1,2}\s*$", "", t)
+    t = re.sub(r"\s+[Ss]\d{1,2}\s*-\s*[Ss]?\d{1,2}\s*$", "", t)  # S1-S4 ranges
+    t = re.sub(r"\s+[Ss]\d{1,2}\s*$", "", t)                     # single S3
+    t = re.sub(r"\s+[Ss]eason\s*\d{1,2}\s*$", "", t, flags=re.I)  # "Season 2"
     return re.sub(r"\s+", " ", t).strip()
 
 def _year_of(s):
@@ -274,6 +294,8 @@ def match_subjects(subjects, title, year, subject_type, season=None):
     want_se = "%s s%d" % (want, season) if season else None
     out = []
     for s in subjects:
+        if int(s.get("subjectType") or 0) != subject_type:
+            continue
         st = clean_title(s.get("title") or "").lower()
         ok = (st == want or (want_se and st == want_se)
               or st == re.sub(r"\s*part\s*\d+$", "", want))
@@ -392,12 +414,15 @@ def _deref_all(payload):
     d = payload
 
     def deref(v, depth=0):
-        if depth > 6:
+        if depth > 8:
             return v
         if isinstance(v, int) and not isinstance(v, bool) and 0 <= v < len(d):
             item = d[v]
             if isinstance(item, (str, float)) or (isinstance(item, int) and not isinstance(item, bool)):
-                return deref(item, depth + 1)
+                return item          # terminal scalar
+            if isinstance(item, (dict, list)):
+                return deref(item, depth + 1)   # nested structure reference
+            return v
         if isinstance(v, dict):
             return {k: deref(x, depth + 1) for k, x in v.items()}
         if isinstance(v, list):
@@ -494,20 +519,22 @@ def get_catalog(ctype, cat_id, skip):
     site, kind = parts
     want_type = 1 if ctype == "movie" else 2
     pool = catalog_pool(site, kind, want_type)
-    metas = []
+    metas, seen = [], set()
     with ThreadPoolExecutor(max_workers=10) as ex:
         for m in ex.map(lambda s: subject_to_meta(s, ctype), pool):
-            if m:
+            if m and m["id"] not in seen:   # dub/season variants share imdb ids
+                seen.add(m["id"])
                 metas.append(m)
     return {"metas": metas[skip:skip + 100]}
 
 def search_catalog(ctype, query):
     st = 1 if ctype == "movie" else 2
     subs = search_subjects(query, st)
-    metas = []
+    metas, seen = [], set()
     for s in subs[:40]:
         m = subject_to_meta(s, ctype)
-        if m:
+        if m and m["id"] not in seen:
+            seen.add(m["id"])
             metas.append(m)
     return {"metas": metas}
 
@@ -663,20 +690,23 @@ def build_streams(ctype, imdb, se, ep):
     matched = match_subjects(subs, title, year, stype, season=se)
     if not matched:
         return {"streams": []}
-    # expand with dubs, dedupe by subjectId
-    entries, seen = [], set()
+    # expand with dubs, dedupe by subjectId AND label (clean card list)
+    entries, seen, seen_labels = [], set(), set()
     for s, label in matched:
         sid = str(s.get("subjectId"))
-        if sid not in seen:
+        if sid not in seen and label not in seen_labels:
             seen.add(sid)
+            seen_labels.add(label)
             entries.append((sid, label))
     for s, _ in matched[:2]:
         for d in subject_dubs(str(s.get("subjectId")))[:6]:
             dsid = str(d.get("subjectId"))
-            if dsid not in seen:
+            nm = (d.get("lanName") or "").replace(" dub", "").replace(" Audio", "").strip()
+            nm = nm or "Dub"
+            if dsid not in seen and nm not in seen_labels:
                 seen.add(dsid)
-                nm = (d.get("lanName") or "").replace(" dub", "").replace(" Audio", "").strip()
-                entries.append((dsid, nm or "Dub"))
+                seen_labels.add(nm)
+                entries.append((dsid, nm))
     entries = entries[:8]
     streams = []
     for sid, label in entries:
