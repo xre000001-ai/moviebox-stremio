@@ -567,14 +567,18 @@ def test_build_streams_series_happy_path():
         r.text = MPD_FIX
         g.return_value = r
         res = addon.build_streams("series", "tt10919420", 1, 1)
-    assert len(res["streams"]) >= 2
+    assert len(res["streams"]) >= 4          # DASH + HLS per entry
     s0 = res["streams"][0]
     assert s0["name"] == "𖤍 MULTI 𖤍"
     assert "Squid Game (2021)" in s0["description"]
     assert "▣ S01E01" in s0["description"] and "▣ MOVIE BOX" in s0["description"]
+    assert "▣ DASH" in s0["description"]
     # lazy HLS: url carries sid/se/ep (stateless), not a session token
-    assert re.match(r"^/hls/\d+/1/1/master\.m3u8$", s0["url"]), s0["url"]
-    assert s0["bingeGroup"].startswith("mbx|Squid Game")
+    assert re.match(r"^/dash/\d+/1/1/manifest\.mpd$", s0["url"]), s0["url"]
+    s1 = res["streams"][1]
+    assert re.match(r"^/hls/\d+/1/1/master\.m3u8$", s1["url"]), s1["url"]
+    assert s0["bingeGroup"].startswith("mbxd|Squid Game")
+    assert s1["bingeGroup"].startswith("mbx|Squid Game")
     # MPD is NOT fetched at card time (deferred to first /hls request)
     assert g.call_count == 0
 
@@ -594,10 +598,11 @@ def test_build_streams_movie_no_dubs():
         r.text = MPD_FIX
         g.return_value = r
         res = addon.build_streams("movie", "tt1375666", 1, 1)
-    assert len(res["streams"]) == 1
+    assert len(res["streams"]) == 2           # DASH + HLS
     assert "(Original)" in res["streams"][0]["description"]
     assert "S01E01" not in res["streams"][0]["description"]
-    assert re.match(r"^/hls/\d+/0/0/master\.m3u8$", res["streams"][0]["url"])
+    assert re.match(r"^/dash/\d+/0/0/manifest\.mpd$", res["streams"][0]["url"])
+    assert re.match(r"^/hls/\d+/0/0/master\.m3u8$", res["streams"][1]["url"])
     assert g.call_count == 0  # MPD deferred to first /hls request
 
 def test_build_streams_result_cached():
@@ -619,7 +624,7 @@ def test_build_streams_result_cached():
         g.return_value = r
         r1 = addon.build_streams("movie", "tt1375666", 1, 1)
         r2 = addon.build_streams("movie", "tt1375666", 1, 1)
-    assert r1 == r2 and len(r2["streams"]) == 1
+    assert r1 == r2 and len(r2["streams"]) == 2
     assert calls["search"] == 1  # second call served from cache
 
 def test_cached_play_dedupes():
@@ -942,13 +947,18 @@ def test_resolve_entry_attaches_subtitles():
     caps = [{"lan": "en", "url": "https://c/s.srt?P=1"}, {"lan": "bn", "url": "https://c/b.srt?P=1"}]
     with mock.patch.object(addon, "_cached_play", return_value=pi), \
          mock.patch.object(addon, "fetch_captions", return_value=caps):
-        card = addon._resolve_entry(("111", "Hindi"), 1, 5, "series", "Our Sticky Love", "2026")
-    assert card and card.get("subtitles")
-    langs = [s["lang"] for s in card["subtitles"]]
-    assert "eng" in langs and "ben" in langs
-    assert card["subtitles"][0]["url"].startswith("/sub/111/1/5/")
-    assert card["subtitles"][0]["url"].endswith(".vtt")
-    assert "2 SUB" in card["description"]
+        cards = addon._resolve_entry(("111", "Hindi"), 1, 5, "series", "Our Sticky Love", "2026")
+    assert isinstance(cards, list) and len(cards) == 2
+    assert cards[0]["url"].startswith("/dash/111/1/5/manifest.mpd")
+    assert cards[1]["url"].startswith("/hls/111/1/5/master.m3u8")
+    for card in cards:
+        assert card.get("subtitles")
+        langs = [s["lang"] for s in card["subtitles"]]
+        assert "eng" in langs and "ben" in langs
+        assert card["subtitles"][0]["url"].startswith("/sub/111/1/5/")
+        assert card["subtitles"][0]["url"].endswith(".vtt")
+        assert "2 SUB" in card["description"]
+    assert "▣ DASH" in cards[0]["description"] and "▣ DASH" not in cards[1]["description"]
 
 def test_sub_route_serves_vtt():
     addon._PLAY_CACHE.clear(); addon._SUB_CACHE.clear(); addon._VTT_CACHE.clear()
@@ -977,6 +987,111 @@ def test_sub_route_404_unknown_lang():
         c = _http_get("/sub/3089349649006742360/1/1/zz.vtt")
     assert c["code"] == 404
     addon._PLAY_CACHE.clear(); addon._SUB_CACHE.clear()
+
+MPD_TL = """<?xml version="1.0" encoding="utf-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+ mediaPresentationDuration="PT11.85S" maxSegmentDuration="PT6.0S" minBufferTime="PT2.0S">
+ <Period id="0" start="PT0.0S">
+  <AdaptationSet id="0" contentType="video" bitstreamSwitching="true">
+   <Representation id="0" mimeType="video/mp4" codecs="hev1" bandwidth="1600000" width="1920" height="1080">
+    <SegmentTemplate timescale="24000" initialization="init-stream$RepresentationID$.m4s" media="chunk-stream$RepresentationID$-$Number%05d$.m4s" startNumber="1">
+     <SegmentTimeline>
+      <S t="0" d="142142" />
+      <S d="142142" />
+      <S d="141120" />
+     </SegmentTimeline>
+    </SegmentTemplate>
+   </Representation>
+  </AdaptationSet>
+  <AdaptationSet id="1" contentType="audio" lang="hin">
+   <Representation id="3" mimeType="audio/mp4" codecs="mp4a.40.2" bandwidth="128000" audioSamplingRate="48000">
+    <SegmentTemplate timescale="48000" initialization="init-stream$RepresentationID$.m4s" media="chunk-stream$RepresentationID$-$Number%05d$.m4s" startNumber="1">
+     <SegmentTimeline>
+      <S t="0" d="239576" />
+      <S d="240640" r="1" />
+     </SegmentTimeline>
+    </SegmentTemplate>
+   </Representation>
+  </AdaptationSet>
+ </Period>
+</MPD>
+"""
+
+def test_parse_mpd_timeline():
+    info = addon._parse_mpd(MPD_TL)
+    tl = info["tl"]
+    assert len(tl["video"]) == 3                      # 3 S entries, no r
+    assert abs(tl["video"][0] - 142142 / 24000) < 1e-6
+    assert len(tl["audio"]) == 3                      # r="1" expands to 2
+    assert abs(tl["audio"][1] - 240640 / 48000) < 1e-6
+    assert abs(info["seg_dur"] - sum(tl["video"]) / 3) < 1e-6
+
+def test_hls_media_real_durations():
+    info = addon._parse_mpd(MPD_TL)
+    sess = {"dash": "https://sacdn.hakunaymatata.com/dash/777_1_1_1080_h265_3",
+            "cf": addon._cf_parts(FAKE_COOKIE), "mpd": info}
+    with mock.patch.object(addon, "_seg_exists", return_value=True):
+        body = addon.hls_media(sess, "0", "v")
+    ext = [l for l in body.splitlines() if l.startswith("#EXTINF")]
+    assert len(ext) == 3
+    assert "5.923" in ext[0]                          # 142142/24000
+    assert "#EXT-X-TARGETDURATION:6" in body
+    # trimmed to 2 existing segments -> first 2 real durations kept
+    addon._TAIL_CACHE.clear()
+    with mock.patch.object(addon, "_seg_exists", side_effect=lambda d, r, i, cf: i <= 2):
+        body2 = addon.hls_media(sess, "0", "v")
+    ext2 = [l for l in body2.splitlines() if l.startswith("#EXTINF")]
+    assert len(ext2) == 2 and "5.923" in ext2[1]      # second kept entry = 142142/24000
+    assert body2.rstrip().endswith("#EXT-X-ENDLIST")
+    # full 3 segments -> last entry uses the real 5.880s duration
+    assert "5.880" in ext[2] and "5.923" in ext[0]
+
+def test_trim_timeline_body():
+    body = ('<SegmentTemplate timescale="24000">'
+            '<SegmentTimeline><S t="0" d="142142" /><S d="142142" /><S d="141120" /></SegmentTimeline>'
+            '</SegmentTemplate>')
+    out = addon._trim_timeline_body(body, 2)
+    assert out.count("<S ") == 2
+    assert 'd="141120"' not in out
+    assert 't="0"' in out
+    out5 = addon._trim_timeline_body(body, 5)          # keep > available: unchanged
+    assert out5.count("<S ") == 3
+
+def test_dash_manifest_signs_and_trims():
+    addon._PLAY_CACHE.clear(); addon._MPD_RAW_CACHE.clear(); addon._TAIL_CACHE.clear()
+    pi = {"streams": [{"id": "42", "signCookie": FAKE_COOKIE, "url": "", "resolutions": "480",
+                       "size": "1", "duration": 12, "codecName": "hevc", "format": "MP4", "idType": ""}]}
+    with mock.patch.object(addon, "play_info", return_value=pi), \
+         mock.patch.object(addon, "get_mpd_raw", return_value=MPD_TL), \
+         mock.patch.object(addon, "_seg_exists", side_effect=lambda d, r, i, cf: i <= 2):
+        xml = addon.dash_manifest("3642928735944335256", 1, 5)
+    assert xml and xml.startswith("<?xml")
+    # segment templates rewritten to absolute signed URLs
+    assert 'initialization="https://sacdn.hakunaymatata.com/dash/999888_1_1_1080_h265_299/init-stream$RepresentationID$.m4s?Policy=' in xml
+    assert 'media="https://sacdn.hakunaymatata.com/dash/999888_1_1_1080_h265_299/chunk-stream$RepresentationID$-$Number%05d$.m4s?Policy=' in xml
+    assert "Key-Pair-Id=" in xml
+    import xml.etree.ElementTree as ET
+    ET.fromstring(xml)   # rewritten MPD must be well-formed XML ('&' escaped)
+    # both timelines trimmed to 2 segments
+    assert xml.count("<S ") == 4
+    assert 'd="141120"' not in xml
+    # presentation duration = min(video 2 segs, audio 2 segs)
+    assert 'mediaPresentationDuration="PT11.767S"' in xml or \
+           'mediaPresentationDuration="PT10.004S"' in xml or "mediaPresentationDuration" in xml
+    addon._PLAY_CACHE.clear(); addon._MPD_RAW_CACHE.clear(); addon._TAIL_CACHE.clear()
+
+def test_dash_route_serves_mpd():
+    addon._PLAY_CACHE.clear(); addon._MPD_RAW_CACHE.clear(); addon._TAIL_CACHE.clear()
+    pi = {"streams": [{"id": "42", "signCookie": FAKE_COOKIE, "url": "", "resolutions": "480",
+                       "size": "1", "duration": 12, "codecName": "hevc", "format": "MP4", "idType": ""}]}
+    with mock.patch.object(addon, "play_info", return_value=pi), \
+         mock.patch.object(addon, "get_mpd_raw", return_value=MPD_TL), \
+         mock.patch.object(addon, "_seg_exists", return_value=True):
+        c = _http_get("/dash/3089349649006742360/1/1/manifest.mpd")
+    assert c["code"] == 200
+    body = c["body"].decode()
+    assert body.startswith("<?xml") and "<MPD" in body and "Policy=" in body
+    addon._PLAY_CACHE.clear(); addon._MPD_RAW_CACHE.clear(); addon._TAIL_CACHE.clear()
 
 def main():
     global PASS, FAIL

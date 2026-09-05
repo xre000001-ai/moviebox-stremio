@@ -41,7 +41,7 @@ from urllib.parse import urlparse, parse_qs, urlencode, quote, unquote
 
 import requests
 
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 BRAND = "MOVIE BOX"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -668,12 +668,38 @@ def _parse_mpd(xml_text):
             elif ct == "audio" or rep.get("audioSamplingRate"):
                 audio.append({"id": rid, "lang": aset.get("lang") or "und", "bw": bw,
                               "codecs": rep.get("codecs") or "mp4a.40.2"})
-    tmpl = root.find(".//m:SegmentTemplate", ns)
+    # per-kind expanded SegmentTimeline (real per-segment durations, seconds)
+    tl = {}
+    for aset in root.findall(".//m:AdaptationSet", ns):
+        ct = aset.get("contentType") or ("audio" if aset.get("lang") else "video")
+        if ct in tl:
+            continue
+        t = aset.find(".//m:SegmentTemplate", ns)
+        if t is None:
+            continue
+        ts = float(t.get("timescale") or 1)
+        stl = t.find("m:SegmentTimeline", ns)
+        if stl is None:
+            continue
+        durs = []
+        for s in stl.findall("m:S", ns):
+            d = s.get("d")
+            if not d:
+                continue
+            rep = int(s.get("r") or 0) + 1
+            durs.extend([float(d) / ts] * rep)
+        if durs:
+            tl[ct] = durs
     seg_dur = 5.0
-    if tmpl is not None and tmpl.get("duration"):
-        ts = float(tmpl.get("timescale") or 1)
-        seg_dur = float(tmpl.get("duration")) / ts if ts else 5.0
-    return {"video": video, "audio": audio, "dur": dur, "seg_dur": seg_dur or 5.0}
+    if tl:
+        k = "video" if "video" in tl else list(tl.keys())[0]
+        seg_dur = sum(tl[k]) / len(tl[k])
+    if not tl:
+        tmpl = root.find(".//m:SegmentTemplate", ns)
+        if tmpl is not None and tmpl.get("duration"):
+            ts = float(tmpl.get("timescale") or 1)
+            seg_dur = float(tmpl.get("duration")) / ts if ts else 5.0
+    return {"video": video, "audio": audio, "dur": dur, "seg_dur": seg_dur or 5.0, "tl": tl}
 
 def get_mpd_info(dash_base, cookie):
     hit, val = _cache_get(_MPD_CACHE, dash_base)
@@ -694,6 +720,103 @@ def get_mpd_info(dash_base, cookie):
     except requests.RequestException:
         return None
     return None
+
+_MPD_RAW_CACHE = {}   # dash_base -> raw MPD xml (30 min)
+
+def get_mpd_raw(dash_base, cookie):
+    hit, val = _cache_get(_MPD_RAW_CACHE, dash_base)
+    if hit:
+        return val
+    try:
+        r = requests.get(dash_base + "/index.mpd",
+                         headers={"Cookie": cookie, "User-Agent": "ExoPlayerLib/2.18.7"},
+                         timeout=15)
+        if r.status_code == 200 and b"<MPD" in r.content[:600]:
+            _cache_put(_MPD_RAW_CACHE, dash_base, r.text, 30 * 60)
+            return r.text
+    except requests.RequestException:
+        pass
+    return None
+
+_S_ENTRY = re.compile(r"<S\s+([^>]*?)/?>")
+
+def _trim_timeline_body(body, keep):
+    """Trim an AdaptationSet's SegmentTimeline to its first `keep` segments."""
+    m = re.search(r"<SegmentTimeline>(.*?)</SegmentTimeline>", body, re.S)
+    if not m:
+        return body
+    out, count = [], 0
+    for e in _S_ENTRY.findall(m.group(1)):
+        if count >= keep:
+            break
+        dm = re.search(r'd="(\d+)"', e)
+        if not dm:
+            continue
+        d = int(dm.group(1))
+        rm = re.search(r'r="(\d+)"', e)
+        rep = (int(rm.group(1)) + 1) if rm else 1
+        tm = re.search(r't="(\d+)"', e)
+        take = min(rep, keep - count)
+        if take <= 0:
+            break
+        parts = []
+        if tm:
+            parts.append('t="%s"' % tm.group(1))
+        parts.append('d="%d"' % d)
+        if take > 1:
+            parts.append('r="%d"' % (take - 1))
+        out.append("<S %s />" % " ".join(parts))
+        count += take
+    return body[:m.start(1)] + "\n" + "\n".join(out) + "\n" + body[m.end(1):]
+
+def dash_manifest(sid, se, ep):
+    """Stateless rewritten DASH MPD for native players (Stremio/Nuvio):
+    the platform's own manifest with (a) segment URLs made absolute and
+    query-signed with the CloudFront cookie (players can't send Cookie
+    headers), and (b) each AdaptationSet's SegmentTimeline trimmed to the
+    segments that actually exist on the CDN. Text-only: a few KB."""
+    pi = _cached_play(sid, se or None, ep or None)
+    pl = (pi.get("streams") or [None])[0] if pi else None
+    ck = (pl or {}).get("signCookie") or ""
+    if not ck:
+        return None
+    cf = _cf_parts(ck)
+    dash = _dash_base(cf.get("CloudFront-Policy")) if cf else None
+    if not dash:
+        return None
+    xml = get_mpd_raw(dash, ck)
+    if not xml:
+        return None
+    info = _parse_mpd(xml)
+    qs = urlencode({"Policy": cf["CloudFront-Policy"],
+                    "Signature": cf["CloudFront-Signature"],
+                    "Key-Pair-Id": cf["CloudFront-Key-Pair-Id"]})
+    qs = qs.replace("&", "&amp;")   # XML attribute: raw & must be &amp;
+    xml = xml.replace('initialization="init-stream$RepresentationID$.m4s"',
+                      'initialization="%s/init-stream$RepresentationID$.m4s?%s"' % (dash, qs))
+    xml = xml.replace('media="chunk-stream$RepresentationID$-$Number%05d$.m4s"',
+                      'media="%s/chunk-stream$RepresentationID$-$Number%%05d$.m4s?%s"' % (dash, qs))
+    out, pos, kind_durs = [], 0, {}
+    for m in re.finditer(r"(<AdaptationSet\b[^>]*>)(.*?)(</AdaptationSet>)", xml, re.S):
+        head, body = m.group(1), m.group(2)
+        kind = "audio" if 'contentType="audio"' in head or 'lang="' in head else "video"
+        tl = (info.get("tl") or {}).get(kind)
+        reps = info.get(kind) or []
+        if tl and reps:
+            last = min(_last_good_seg(dash, r["id"], len(tl), cf) for r in reps)
+            body = _trim_timeline_body(body, last)
+            kind_durs[kind] = sum(tl[:last])
+        out.append(xml[pos:m.start()])
+        out.append(head + body + m.group(3))
+        pos = m.end()
+    out.append(xml[pos:])
+    xml = "".join(out)
+    if kind_durs:
+        total = min(kind_durs.values())
+        xml = re.sub(r'mediaPresentationDuration="[^"]+"',
+                     'mediaPresentationDuration="PT%.3fS"' % total, xml, count=1)
+        xml = re.sub(r'maxSegmentDuration="[^"]+"', 'maxSegmentDuration="PT6.5S"', xml, count=1)
+    return xml
 
 def new_hls_session(dash_base, cf, mpd):
     tok = secrets.token_urlsafe(12)
@@ -764,15 +887,25 @@ def _last_good_seg(dash, rep, n, cf):
 
 def hls_media(sess, rep_id, kind):
     mpd = sess["mpd"]
-    seg = mpd["seg_dur"] or 5.0
-    n = max(1, int(math.ceil((mpd["dur"] or 0) / seg)))
+    tl = (mpd.get("tl") or {}).get("video" if kind == "v" else "audio")
+    if tl:
+        durs, n = tl, len(tl)
+        tgt = int(math.ceil(max(durs)))
+    else:
+        seg = mpd["seg_dur"] or 5.0
+        durs, n = None, max(1, int(math.ceil((mpd["dur"] or 0) / seg)))
+        tgt = int(math.ceil(seg))
     n = _last_good_seg(sess["dash"], rep_id, n, sess["cf"])
+    use = durs[:n] if durs else None
+    if use:
+        tgt = int(math.ceil(max(use)))
     lines = ["#EXTM3U", "#EXT-X-VERSION:7",
-             "#EXT-X-TARGETDURATION:%d" % int(math.ceil(seg)),
+             "#EXT-X-TARGETDURATION:%d" % tgt,
              "#EXT-X-PLAYLIST-TYPE:VOD",
              "#EXT-X-MAP:URI=\"%s\"" % _signed(sess["dash"], "init-stream%s.m4s" % rep_id, sess["cf"])]
     for i in range(1, n + 1):
-        lines.append("#EXTINF:%.3f," % seg)
+        d = use[i - 1] if use else (mpd["seg_dur"] or 5.0)
+        lines.append("#EXTINF:%.3f," % d)
         lines.append(_signed(sess["dash"], "chunk-stream%s-%05d.m4s" % (rep_id, i), sess["cf"]))
     lines.append("#EXT-X-ENDLIST")
     return "\n".join(lines) + "\n"
@@ -995,28 +1128,33 @@ def _resolve_entry(pair, se, ep, ctype, title, year):
         desc += " ▣ S%02dE%02d" % (se, ep)
     desc += " ◀ MBCLOUD"
     use_se, use_ep = (se, ep) if ctype == "series" else (0, 0)
-    card = {
-        "name": "𖤍 %s 𖤍" % res,
-        "description": desc,
-        "url": "/hls/%s/%d/%d/master.m3u8" % (sid, use_se, use_ep),
-        "behaviorHints": {"notWebReady": False, "isBingeable": True},
-        "bingeGroup": "mbx|%s:%s:%s|%s|%s" % (title, se if ctype == "series" else "",
-                                              ep if ctype == "series" else "", label, res),
-    }
-    # subtitles from the site's web API (caption endpoint; ungated)
+    def _mk(fmt, dash_mode):
+        b = "mbx%s" % ("d" if dash_mode else "")
+        return {
+            "name": "𖤍 %s 𖤍" % res,
+            "description": desc + (" ▣ DASH" if dash_mode else ""),
+            "url": ("/dash/%s/%d/%d/manifest.mpd" if dash_mode
+                    else "/hls/%s/%d/%d/master.m3u8") % (sid, use_se, use_ep),
+            "behaviorHints": {"notWebReady": False, "isBingeable": True},
+            "bingeGroup": "%s|%s:%s:%s|%s|%s" % (b, title, se if ctype == "series" else "",
+                                                 ep if ctype == "series" else "", label, res),
+        }
+    cards = [_mk("dash", True), _mk("hls", False)]
+    # subtitles from the platform's caption endpoints; attached to every card
     try:
         caps = fetch_captions(sid, pl.get("id"))
         if caps:
-            card["subtitles"] = [
-                {"url": "/sub/%s/%d/%d/%s.vtt" % (sid, use_se, use_ep, c.get("lan")),
-                 "lang": _LANG3.get(c.get("lan"), c.get("lan")),
-                 "id": "mbx-%s" % c.get("lan")}
-                for c in caps if c.get("lan")]
-            if len(card["subtitles"]) > 1:
-                card["description"] += " ▣ %d SUB" % len(card["subtitles"])
+            subs = [{"url": "/sub/%s/%d/%d/%s.vtt" % (sid, use_se, use_ep, c.get("lan")),
+                     "lang": _LANG3.get(c.get("lan"), c.get("lan")),
+                     "id": "mbx-%s" % c.get("lan")}
+                    for c in caps if c.get("lan")]
+            for c in cards:
+                c["subtitles"] = subs
+                if len(subs) > 1:
+                    c["description"] += " ▣ %d SUB" % len(subs)
     except Exception:
         pass
-    return card
+    return cards
 
 def _lazy_hls(sid, se, ep, file):
     """Stateless HLS: derive playlists from (sid, se, ep) via cached
@@ -1086,7 +1224,7 @@ def build_streams(ctype, imdb, se, ep, _prewarm_next=True):
     with ThreadPoolExecutor(max_workers=6) as ex:
         results = list(ex.map(lambda p: _resolve_entry(p, se, ep, ctype, title, year),
                               entries))
-    streams = [r for r in results if r]
+    streams = [c for r in results if r for c in r]
     if streams:
         _cache_put(_STREAM_CACHE, key, streams, _STREAM_CACHE_TTL)
         if _prewarm_next and ctype == "series":
@@ -1354,12 +1492,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps({"streams": []}))
             res = build_streams(ctype, oid, se, ep)
             for s in res.get("streams", []):
-                if s.get("url", "").startswith("/hls/"):
+                if s.get("url", "").startswith("/hls/") or s.get("url", "").startswith("/dash/"):
                     s["url"] = self._host_base() + s["url"]
                 for sub in s.get("subtitles") or []:
                     if sub.get("url", "").startswith("/sub/"):
                         sub["url"] = self._host_base() + sub["url"]
             return self._send(200, json.dumps(res))
+
+        m = re.match(r"^/dash/(\d{5,25})/(\d{1,3})/(\d{1,5})/manifest\.mpd$", path)
+        if m:
+            body = dash_manifest(m.group(1), int(m.group(2)), int(m.group(3)))
+            if body is None:
+                return self._send(404, "no stream for this entry", "application/dash+xml")
+            return self._send(200, body, "application/dash+xml; charset=utf-8")
 
         m = re.match(r"^/sub/(\d{5,25})/(\d{1,3})/(\d{1,5})/([a-z0-9_]+)\.vtt$", path)
         if m:
