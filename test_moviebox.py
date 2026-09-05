@@ -556,11 +556,13 @@ def test_api_call_bootstraps_when_no_token():
     addon._AUTH_TOKEN = "tok"
 
 def test_manifest_shape():
-    cats = MANIFEST_IDS = [c["id"] for c in addon.MANIFEST["catalogs"]]
+    cats = [c["id"] for c in addon.MANIFEST["catalogs"]]
     assert "netnaija-movies" in cats and "moviebox-movies" in cats
     assert "netnaija-series" in cats and "moviebox-series" in cats
     assert cats.count("netnaija-animated") == 2  # movie + series entries
-    assert set(addon.MANIFEST["type"]) == {"movie", "series"}
+    assert set(addon.MANIFEST["types"]) == {"movie", "series"}
+    assert "type" not in addon.MANIFEST           # must be 'types' (Stremio protocol)
+    assert addon.MANIFEST["idPrefixes"] == ["tt"]
     assert "stream" in addon.MANIFEST["resources"]
 
 def test_listing_paths_covered():

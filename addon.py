@@ -773,9 +773,10 @@ MANIFEST = {
     "description": ("Netnaija.film + MovieBoxOnline.net in Stremio — movies & series "
                     "in up to 1080p, multi-language dubs. HEVC/H.265 streams "
                     "(best on Stremio desktop / Android TV)."),
-    "type": ["movie", "series"],
+    "types": ["movie", "series"],
+    "idPrefixes": ["tt"],
     "logo": "/logo.png",
-    "background": "https://movieboxonline.net/",
+    "behaviorHints": {"configurable": False},
     "catalogs": [
         {"type": "movie", "id": "netnaija-movies", "name": "Netnaija • Movies",
          "extraSupported": [{"name": "search", "isRequired": False},
