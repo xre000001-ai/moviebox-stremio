@@ -226,6 +226,68 @@ def api_call(method, path, body=None, timeout=10):
     return None
 
 # --------------------------------------------------------------------------
+# TEMPORARY: web-play reachability diagnostic (see /debug/webplay route)
+# --------------------------------------------------------------------------
+def _debug_webplay(sid, se, ep, dpath):
+    import urllib.parse as _up
+    out = {"version": VERSION}
+    try:
+        r = requests.get("https://api.ipify.org?format=json", timeout=10)
+        out["egress_ip"] = r.json().get("ip")
+    except Exception as e:
+        out["egress_ip"] = "err:" + str(e)[:40]
+    try:
+        from curl_cffi import requests as _cr
+        S = _cr.Session(impersonate="chrome")
+        out["engine"] = "curl_cffi(chrome)"
+    except Exception:
+        S = requests.Session()
+        out["engine"] = "requests"
+    H = "https://netnaija.film"
+    try:
+        r0 = S.get(H + "/", timeout=20)
+        out["home"] = r0.status_code
+    except Exception as e:
+        out["home"] = "err:" + str(e)[:60]
+    jwt = None
+    try:
+        r1 = S.post(H + "/wefeed-h5api-bff/subject/search-suggest",
+                    json={"keyword": "our", "perPage": 3},
+                    headers={"Accept": "application/json",
+                             "X-Client-Info": json.dumps({"timezone": "Asia/Dhaka"}),
+                             "X-Request-Lang": "en", "Referer": H + "/"},
+                    timeout=20)
+        out["suggest"] = r1.status_code
+        jwt = json.loads(r1.headers.get("x-user", "{}")).get("token")
+    except Exception as e:
+        out["suggest"] = "err:" + str(e)[:60]
+    out["jwt"] = bool(jwt)
+    ck = "netnaija_i18n_lang=%22en%22"
+    if jwt:
+        ck = "netnaija_token=" + _up.quote(json.dumps(jwt)) + "; " + ck
+    try:
+        r2 = S.get(H + "/wefeed-h5api-bff/subject/play?subjectId=%s&se=%s&ep=%s&detailPath=%s"
+                   % (sid, se, ep, dpath),
+                   headers={"Accept": "application/json",
+                            "X-Client-Info": json.dumps({"timezone": "Asia/Dhaka"}),
+                            "X-Source": "webNetnaijaSite",
+                            "Referer": "%s/movieDetail/%s?se=%s&ep=%s&utm_source=webNetnaijaSite"
+                                       % (H, dpath, se, ep),
+                            "Cookie": ck},
+                   timeout=25)
+        d = r2.json()
+        data = d.get("data") or {}
+        out["play_http"] = r2.status_code
+        out["play_code"] = d.get("code")
+        out["counts"] = {k: len(data.get(k) or []) for k in ("streams", "dash", "hls")}
+        out["hasResource"] = data.get("hasResource")
+        out["data"] = data
+    except Exception as e:
+        out["play"] = "err:" + str(e)[:80]
+    return out
+
+
+# --------------------------------------------------------------------------
 # platform: search / dubs / play-info
 # --------------------------------------------------------------------------
 
@@ -1179,6 +1241,18 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, f.read(), "image/png")
             except Exception:
                 return self._send(404, "no logo", "text/plain")
+
+        if path == "/debug/webplay":
+            # TEMPORARY diagnostic: replicate the netnaija.film browser play
+            # flow from THIS server's IP. Answers whether the web play API is
+            # usable from a datacenter (Render) egress at all.
+            sid = (q.get("sid") or [""])[0]
+            se = (q.get("se") or ["1"])[0]
+            ep = (q.get("ep") or ["1"])[0]
+            dpath = (q.get("path") or [""])[0]
+            if not sid or not dpath:
+                return self._send(400, json.dumps({"error": "need sid, se, ep, path"}))
+            return self._send(200, json.dumps(_debug_webplay(sid, se, ep, dpath)))
 
         m = re.match(r"^/catalog/([a-z]+)/([a-z0-9-]+)\.json$", path)
         if m:
