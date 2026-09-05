@@ -64,6 +64,15 @@ POLICY_B64 = base64.b64encode(POLICY_JSON.encode()).decode().rstrip("=")
 FAKE_COOKIE = ("CloudFront-Policy=%s;CloudFront-Signature=SIGabc123~_-; "
                "CloudFront-Key-Pair-Id=KP123" % POLICY_B64)
 
+# REAL platform format: CloudFront policies are URL-SAFE base64 ('_' chars).
+# Captured live: Squid Game Hindi S1E1 policy (standard b64decode fails on it).
+URLSAFE_POLICY = ("eyJTdGF0ZW1lbnQiOlt7IlJlc291cmNlIjoiaHR0cHM6Ly9zYWNkbi5oYWt1"
+                  "bmF5bWF0YXRhLmNvbS9kYXNoLzk3MzA0MTUyNTc4MzQ5NjQ4MF8xXzFfMTA4"
+                  "MF9oMjY1XzI5OS8qIiwiQ29uZGl0aW9uIjp7IkRhdGVMZXNzVGhhbiI6eyJB"
+                  "V1M6RXBvY2hUaW1lIjoxNzg5MTkxNDk4fX19XX0_")
+URLSAFE_COOKIE = ("CloudFront-Policy=%s;CloudFront-Signature=sig;CloudFront-Key-Pair-Id=KP9"
+                  % URLSAFE_POLICY)
+
 SUBJ_SQUID_HI = {"subjectId": "973041525783496480", "subjectType": 2,
                  "title": "Squid Game [Hindi] S1", "releaseDate": "2021-09-17",
                  "corner": "Hindi"}
@@ -184,6 +193,22 @@ def test_cf_parts_bad():
 
 def test_dash_base():
     assert addon._dash_base(POLICY_B64) == "https://sacdn.hakunaymatata.com/dash/999888_1_1_1080_h265_299"
+
+def test_dash_base_urlsafe_policy():
+    # real platform cookies: URL-safe base64 with '_' — old parser failed here,
+    # dropping ~half of the dub streams
+    assert addon._dash_base(URLSAFE_POLICY) == \
+        "https://sacdn.hakunaymatata.com/dash/973041525783496480_1_1_1080_h265_299"
+
+def test_cf_parts_urlsafe():
+    cf = addon._cf_parts(URLSAFE_COOKIE)
+    assert cf is not None and cf["CloudFront-Key-Pair-Id"] == "KP9"
+    assert cf["CloudFront-Policy"] == URLSAFE_POLICY
+
+def test_b64d_handles_both_alphabets():
+    assert addon._b64d("aGk=") == b"hi"                       # standard, padded
+    assert addon._b64d("aGk") == b"hi"                        # standard, unpadded
+    assert addon._b64d(base64.urlsafe_b64encode(b"hi-/").decode().rstrip("=")) == b"hi-/"
 
 def test_parse_mpd():
     info = addon._parse_mpd(MPD_FIX)
@@ -496,6 +521,12 @@ def test_search_catalog_uses_platform_search():
          mock.patch.object(addon, "resolve_imdb", return_value="tt1375666"):
         res = addon.search_catalog("movie", "inception")
     assert res["metas"][0]["id"] == "tt1375666"
+
+def test_pretty_label():
+    assert addon._pretty_label("esla") == "Spanish"
+    assert addon._pretty_label("ptbr") == "Portuguese (BR)"
+    assert addon._pretty_label("Hindi") == "Hindi"
+    assert addon._pretty_label("") == "Dub"
 
 def test_api_call_signs_headers():
     captured = {}

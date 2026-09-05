@@ -94,7 +94,9 @@ def _cache_get(store, key):
 # --------------------------------------------------------------------------
 
 def _b64d(v):
-    return base64.b64decode(v + "=" * ((4 - len(v) % 4) % 4))
+    """CloudFront policies arrive URL-safe base64 ('_'/'-'); platform secrets
+    are standard base64 — urlsafe_b64decode handles both."""
+    return base64.urlsafe_b64decode(v + "=" * ((4 - len(v) % 4) % 4))
 
 def _x_client_token(ts):
     return "%d,%s" % (ts, hashlib.md5(str(ts)[::-1].encode()).hexdigest())
@@ -562,7 +564,7 @@ def _cf_parts(sign_cookie):
 
 def _dash_base(policy_value):
     try:
-        pol = base64.b64decode(policy_value + "=" * (-len(policy_value) % 4)).decode()
+        pol = _b64d(policy_value).decode(errors="replace")
         m = re.search(r'Resource"?\s*:\s*"(https://[^"]+)/\*"', pol)
         return m.group(1) if m else None
     except Exception:
@@ -681,6 +683,13 @@ def _res_label(heights):
 _STREAM_CACHE = {}       # (ctype, imdb, se, ep) -> (card list, expiry)
 _STREAM_CACHE_TTL = 600  # HLS sessions live 6h; 10 min keeps replays instant
 
+_LABEL_PRETTY = {"esla": "Spanish", "ptbr": "Portuguese (BR)", "pt": "Portuguese",
+                 "es": "Spanish", "id": "Indonesian"}
+
+def _pretty_label(nm):
+    nm = (nm or "").strip()
+    return _LABEL_PRETTY.get(nm.lower(), nm) or "Dub"
+
 def _resolve_entry(pair, se, ep, ctype, title, year):
     """play-info + MPD for one dub entry. Returns a stream card or None."""
     sid, label = pair
@@ -747,7 +756,7 @@ def build_streams(ctype, imdb, se, ep):
         for d in dubs[:6]:
             dsid = str(d.get("subjectId"))
             nm = (d.get("lanName") or "").replace(" dub", "").replace(" Audio", "").strip()
-            nm = nm or "Dub"
+            nm = _pretty_label(nm)
             if dsid not in seen and nm not in seen_labels:
                 seen.add(dsid)
                 seen_labels.add(nm)
