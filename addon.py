@@ -41,7 +41,7 @@ from urllib.parse import urlparse, parse_qs, urlencode, quote
 
 import requests
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 BRAND = "MOVIE BOX"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -167,14 +167,14 @@ def _bootstrap_token():
                 "X-Client-Status": "0",
                 "X-M-Version": "11.7.0",
             }
-            r = requests.get(url, headers=headers, timeout=12)
+            r = requests.get(url, headers=headers, timeout=10)
             _absorb_token(r)
             if r.status_code < 400:
                 return
     except Exception:
         pass
 
-def api_call(method, path, body=None, timeout=15):
+def api_call(method, path, body=None, timeout=10):
     """Signed platform call with host rotation + 1 retry. Returns dict|None.
     None => transient failure (never cached by callers)."""
     global _AUTH_TOKEN
@@ -678,7 +678,48 @@ def _res_label(heights):
         return "HD"
     return "MULTI" if len(hs) > 1 else str(hs[0])
 
+_STREAM_CACHE = {}       # (ctype, imdb, se, ep) -> (card list, expiry)
+_STREAM_CACHE_TTL = 600  # HLS sessions live 6h; 10 min keeps replays instant
+
+def _resolve_entry(pair, se, ep, ctype, title, year):
+    """play-info + MPD for one dub entry. Returns a stream card or None."""
+    sid, label = pair
+    pi = play_info(sid, se if ctype == "series" else None,
+                   ep if ctype == "series" else None)
+    if not pi:
+        return None
+    pl = (pi.get("streams") or [None])[0]
+    if not pl or not pl.get("signCookie"):
+        return None
+    cf = _cf_parts(pl["signCookie"])
+    if not cf:
+        return None
+    dash = _dash_base(cf["CloudFront-Policy"])
+    if not dash:
+        return None
+    mpd = get_mpd_info(dash, pl["signCookie"])
+    if not mpd:
+        return None
+    tok = new_hls_session(dash, cf, mpd)
+    res = _res_label([v["height"] for v in mpd["video"]])
+    desc = "%s (%s) (%s) ▣ %s" % (title, year or "----", label, BRAND)
+    if ctype == "series":
+        desc += " ▣ S%02dE%02d" % (se, ep)
+    desc += " ◀ MBCLOUD"
+    return {
+        "name": "𖤍 %s 𖤍" % res,
+        "description": desc,
+        "url": "/hls/%s/master.m3u8" % tok,
+        "behaviorHints": {"notWebReady": False, "isBingeable": True},
+        "bingeGroup": "mbx|%s:%s:%s|%s|%s" % (title, se if ctype == "series" else "",
+                                              ep if ctype == "series" else "", label, res),
+    }
+
 def build_streams(ctype, imdb, se, ep):
+    key = (ctype, imdb, se, ep)
+    hit, val = _cache_get(_STREAM_CACHE, key)
+    if hit:
+        return {"streams": val}
     meta = cinemeta(ctype, imdb)
     if not meta:
         return {"streams": [], "message": "no metadata"}
@@ -690,7 +731,11 @@ def build_streams(ctype, imdb, se, ep):
     matched = match_subjects(subs, title, year, stype, season=se)
     if not matched:
         return {"streams": []}
-    # expand with dubs, dedupe by subjectId AND label (clean card list)
+    # dub lists for the top matches, fetched in parallel
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        dub_lists = list(ex.map(lambda m: subject_dubs(str(m[0].get("subjectId"))),
+                                matched[:2]))
+    # dedupe by subjectId AND label (clean card list)
     entries, seen, seen_labels = [], set(), set()
     for s, label in matched:
         sid = str(s.get("subjectId"))
@@ -698,8 +743,8 @@ def build_streams(ctype, imdb, se, ep):
             seen.add(sid)
             seen_labels.add(label)
             entries.append((sid, label))
-    for s, _ in matched[:2]:
-        for d in subject_dubs(str(s.get("subjectId")))[:6]:
+    for dubs in dub_lists:
+        for d in dubs[:6]:
             dsid = str(d.get("subjectId"))
             nm = (d.get("lanName") or "").replace(" dub", "").replace(" Audio", "").strip()
             nm = nm or "Dub"
@@ -708,38 +753,13 @@ def build_streams(ctype, imdb, se, ep):
                 seen_labels.add(nm)
                 entries.append((dsid, nm))
     entries = entries[:8]
-    streams = []
-    for sid, label in entries:
-        pi = play_info(sid, se if ctype == "series" else None, ep if ctype == "series" else None)
-        if not pi:
-            continue
-        pl = (pi.get("streams") or [None])[0]
-        if not pl or not pl.get("signCookie"):
-            continue
-        cf = _cf_parts(pl["signCookie"])
-        if not cf:
-            continue
-        dash = _dash_base(cf["CloudFront-Policy"])
-        if not dash:
-            continue
-        mpd = get_mpd_info(dash, pl["signCookie"])
-        if not mpd:
-            continue
-        tok = new_hls_session(dash, cf, mpd)
-        heights = [v["height"] for v in mpd["video"]]
-        res = _res_label(heights)
-        name = "𖤍 %s 𖤍" % res
-        desc = "%s (%s) (%s) ▣ %s" % (title, year or "----", label, BRAND)
-        if ctype == "series":
-            desc += " ▣ S%02dE%02d" % (se, ep)
-        desc += " ◀ MBCLOUD"
-        streams.append({
-            "name": name,
-            "description": desc,
-            "url": "/hls/%s/master.m3u8" % tok,
-            "behaviorHints": {"notWebReady": False, "isBingeable": True},
-            "bingeGroup": "mbx|%s|%s|%s" % (imdb, label, res),
-        })
+    # resolve every dub in parallel (play-info + MPD each)
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        results = list(ex.map(lambda p: _resolve_entry(p, se, ep, ctype, title, year),
+                              entries))
+    streams = [r for r in results if r]
+    if streams:
+        _cache_put(_STREAM_CACHE, key, streams, _STREAM_CACHE_TTL)
     return {"streams": streams}
 
 # --------------------------------------------------------------------------
@@ -808,7 +828,12 @@ class Handler(BaseHTTPRequestHandler):
     def _host_base(self):
         host = self.headers.get("Host") or ("127.0.0.1:%d" % PORT)
         scheme = "https" if any(x in host for x in ("onrender.com", ".com", ".app", ".dev", ".io")) else "http"
-        return "%s://%s" % (scheme, host)
+        base = "%s://%s" % (scheme, host)
+        try:
+            _note_public_base(base)
+        except Exception:
+            pass
+        return base
 
     def do_GET(self):
         try:
@@ -829,7 +854,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, json.dumps({
                 "ok": True, "version": VERSION, "brand": BRAND,
                 "uptime_s": int(time.time() - START),
-                "keepalive": bool(PUBLIC_URL),
+                "keepalive": bool(PUBLIC_URL or _KEEPALIVE_URL),
+                "keepalive_url": PUBLIC_URL or _KEEPALIVE_URL,
                 "auth_token": bool(_AUTH_TOKEN),
             }))
 
@@ -889,16 +915,39 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, json.dumps({"error": "not found"}))
 
 # --------------------------------------------------------------------------
-# keep-alive (anti-sleep)
+# keep-alive (anti-sleep) — auto-detected from Host header if env not set
 # --------------------------------------------------------------------------
+
+_KEEPALIVE_URL = None
+_KEEPALIVE_LOCK = threading.Lock()
+
+def _note_public_base(base):
+    """Remember the first public-looking Host so we can self-ping."""
+    global _KEEPALIVE_URL
+    if PUBLIC_URL or not base:
+        return
+    host = base.split("//", 1)[-1].split(":")[0].lower()
+    if (not host or host in ("localhost", "0.0.0.0") or host.startswith("127.")
+            or host.startswith("10.") or host.startswith("192.168.")
+            or re.match(r"^172\.(1[6-9]|2\d|3[01])\.", host)):
+        return
+    with _KEEPALIVE_LOCK:
+        if _KEEPALIVE_URL:
+            return
+        _KEEPALIVE_URL = base
+        threading.Thread(target=_keepalive_loop, daemon=True).start()
+        print("keepalive auto-armed: %s" % base, flush=True)
 
 def _keepalive_loop():
     while True:
+        url = PUBLIC_URL or _KEEPALIVE_URL
+        if not url:
+            return
         try:
-            requests.get(PUBLIC_URL + "/health", timeout=20)
+            requests.get(url + "/health", timeout=20)
         except Exception:
             pass
-        time.sleep(300)
+        time.sleep(240)
 
 def main():
     if PUBLIC_URL:

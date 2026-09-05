@@ -403,6 +403,7 @@ def test_get_catalog_bad_id():
 
 def test_build_streams_series_happy_path():
     addon._MPD_CACHE.clear()
+    addon._STREAM_CACHE.clear()
     dubs = [{"subjectId": "973041525783496480", "lanName": "Hindi dub"},
             {"subjectId": "3089349649006742360", "lanName": "Original"}]
     with mock.patch.object(addon, "cinemeta",
@@ -422,9 +423,11 @@ def test_build_streams_series_happy_path():
     assert "Squid Game (2021)" in s0["description"]
     assert "▣ S01E01" in s0["description"] and "▣ MOVIE BOX" in s0["description"]
     assert s0["url"].startswith("/hls/") and s0["url"].endswith("/master.m3u8")
+    assert s0["bingeGroup"].startswith("mbx|Squid Game")
 
 def test_build_streams_movie_no_dubs():
     addon._MPD_CACHE.clear()
+    addon._STREAM_CACHE.clear()
     with mock.patch.object(addon, "cinemeta",
                            return_value={"name": "Inception", "year": "2010"}), \
          mock.patch.object(addon, "search_subjects",
@@ -440,7 +443,29 @@ def test_build_streams_movie_no_dubs():
     assert "(Original)" in res["streams"][0]["description"]
     assert "S01E01" not in res["streams"][0]["description"]
 
+def test_build_streams_result_cached():
+    addon._MPD_CACHE.clear()
+    addon._STREAM_CACHE.clear()
+    calls = {"search": 0}
+    def counting_search(kw, st):
+        calls["search"] += 1
+        return [SUBJ_INCEPTION]
+    with mock.patch.object(addon, "cinemeta",
+                           return_value={"name": "Inception", "year": "2010"}), \
+         mock.patch.object(addon, "search_subjects", side_effect=counting_search), \
+         mock.patch.object(addon, "subject_dubs", return_value=[]), \
+         mock.patch.object(addon, "play_info", return_value=PLAY_INFO_FIX), \
+         mock.patch.object(addon.requests, "get") as g:
+        r = mock.Mock(status_code=200, content=b"<MPD" + b"x" * 50)
+        r.text = MPD_FIX
+        g.return_value = r
+        r1 = addon.build_streams("movie", "tt1375666", 1, 1)
+        r2 = addon.build_streams("movie", "tt1375666", 1, 1)
+    assert r1 == r2 and len(r2["streams"]) == 1
+    assert calls["search"] == 1  # second call served from cache
+
 def test_build_streams_no_match():
+    addon._STREAM_CACHE.clear()
     with mock.patch.object(addon, "cinemeta",
                            return_value={"name": "Zzz Nothing", "year": "1990"}), \
          mock.patch.object(addon, "search_subjects", return_value=[SUBJ_INCEPTION]):
@@ -448,6 +473,7 @@ def test_build_streams_no_match():
     assert res["streams"] == []
 
 def test_build_streams_play_info_transparent_on_none():
+    addon._STREAM_CACHE.clear()
     addon._MPD_CACHE.clear()
     with mock.patch.object(addon, "cinemeta",
                            return_value={"name": "Inception", "year": "2010"}), \
@@ -585,6 +611,17 @@ def test_http_health():
     assert c["code"] == 200
     d = json.loads(c["body"])
     assert d["ok"] is True and d["brand"] == "MOVIE BOX"
+
+def test_note_public_base_ignores_private():
+    for bad in ["http://localhost:7000", "http://127.0.0.1:7000",
+                "http://0.0.0.0:7000", "http://192.168.1.5:7000"]:
+        addon._note_public_base(bad)
+    assert addon._KEEPALIVE_URL is None
+
+def test_health_reports_keepalive_off_for_localhost():
+    c = _http_get("/health")
+    d = json.loads(c["body"])
+    assert d["ok"] is True and "keepalive" in d and "version" in d
 
 def test_http_manifest():
     c = _http_get("/manifest.json")
