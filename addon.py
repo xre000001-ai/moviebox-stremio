@@ -41,7 +41,7 @@ from urllib.parse import urlparse, parse_qs, urlencode, quote, unquote
 
 import requests
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 BRAND = "MOVIE BOX"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -865,10 +865,12 @@ def _web_jwt():
         pass
     return _WEB_JWT
 
-def web_captions(sid, stream_id):
-    """Subtitle tracks for one stream via the site's caption endpoint
-    (the same API the netnaija.film web player uses). Returns a list of
-    {id, lan, lanName, url}; empty on any failure (streams unaffected)."""
+def fetch_captions(sid, stream_id):
+    """Subtitle tracks for one stream. Primary: the platform's own mobile
+    caption endpoint (get-stream-captions — same signed API as play-info,
+    discovered in phisher98's CloudStream MovieBoxProvider). Fallback: the
+    site's web caption endpoint (netnaija.film h5api-bff; ungated).
+    Returns [{id, lan, lanName, url}, ...]; empty on failure."""
     if not stream_id:
         return []
     key = (str(sid), str(stream_id))
@@ -876,6 +878,17 @@ def web_captions(sid, stream_id):
     if hit:
         return val
     caps = []
+    d = api_call("GET", "/wefeed-mobile-bff/subject-api/get-stream-captions"
+                 "?subjectId=%s&streamId=%s" % (sid, stream_id))
+    if d and "__error__" not in d:
+        caps = d.get("extCaptions") or []
+    if not caps:
+        caps = _web_captions(sid, stream_id)
+    _cache_put(_SUB_CACHE, key, caps, 3600)
+    return caps
+
+def _web_captions(sid, stream_id):
+    """Fallback: the netnaija.film web caption endpoint (needs a web JWT)."""
     for attempt in (1, 2):
         tok = _web_jwt()
         if not tok:
@@ -897,12 +910,10 @@ def web_captions(sid, stream_id):
             _WEB_JWT_TS = 0.0          # force a fresh token, retry once
             continue
         try:
-            caps = ((r.json().get("data") or {}).get("captions")) or []
+            return ((r.json().get("data") or {}).get("captions")) or []
         except Exception:
-            caps = []
-        break
-    _cache_put(_SUB_CACHE, key, caps, 3600)
-    return caps
+            return []
+    return []
 
 def _srt_to_vtt(srt):
     """Minimal SRT -> WebVTT conversion (comma -> dot milliseconds, drop
@@ -929,7 +940,7 @@ def _lazy_sub(sid, se, ep, lan):
     pl = (pi.get("streams") or [None])[0] if pi else None
     if not pl or not pl.get("id"):
         return None
-    caps = web_captions(sid, pl["id"])
+    caps = fetch_captions(sid, pl["id"])
     c = next((x for x in caps if x.get("lan") == lan), None)
     if not c or not c.get("url"):
         return None
@@ -994,7 +1005,7 @@ def _resolve_entry(pair, se, ep, ctype, title, year):
     }
     # subtitles from the site's web API (caption endpoint; ungated)
     try:
-        caps = web_captions(sid, pl.get("id"))
+        caps = fetch_captions(sid, pl.get("id"))
         if caps:
             card["subtitles"] = [
                 {"url": "/sub/%s/%d/%d/%s.vtt" % (sid, use_se, use_ep, c.get("lan")),
