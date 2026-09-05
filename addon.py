@@ -1,5 +1,5 @@
 """
-MOVIE BOX — a Stremio addon for a wefeed-based streaming platform.
+MovieBox — a Stremio addon for a wefeed-based streaming platform.
 
 ZERO-MEDIA-BYTES RULE
     This server (Render free tier) only ever emits SMALL TEXT: addon JSON,
@@ -49,8 +49,8 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION = "1.6.0"
-BRAND = "MOVIE BOX"
+VERSION = "1.6.1"
+BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "adc48d20c0956934fb224de5c40bb85d")
@@ -1467,7 +1467,7 @@ def _bg_refresh(ctype, imdb, se, ep, key):
 MANIFEST = {
     "id": "com.movbox.stremio",
     "version": VERSION,
-    "name": "MOVIE BOX",
+    "name": "MovieBox",
     "description": ("Netnaija.film + MovieBoxOnline.net in Stremio — movies & series "
                     "in up to 1080p, multi-language dubs. HEVC/H.265 streams "
                     "(best on Stremio desktop / Android TV)."),
@@ -1511,7 +1511,7 @@ _LANDING_HTML = """<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MOVIE BOX — Stremio Addon</title>
+<title>MovieBox — Stremio Addon</title>
 <style>
   *{margin:0;padding:0;box-sizing:border-box}
   body{font-family:'Segoe UI',system-ui,-apple-system,Roboto,Arial,sans-serif;
@@ -1543,7 +1543,7 @@ _LANDING_HTML = """<!doctype html>
   footer a{color:#5dd3ff;text-decoration:none}
 </style></head><body><div class="wrap">
 <header>
-  <img class="logo" src="/logo.png" alt="MOVIE BOX"
+  <img class="logo" src="/logo.png" alt="MovieBox"
        onerror="this.style.display='none'">
   <h1>MOVIE <span>BOX</span></h1>
   <div class="tag">netnaija.film + movieboxonline.net &mdash; movies, series &amp; anime<br>
@@ -1573,8 +1573,8 @@ _LANDING_HTML = """<!doctype html>
   <ol>
     <li>Click the <b style="color:#fff">Install in Stremio</b> button above.</li>
     <li>Stremio opens &rarr; press <b style="color:#fff">Install</b>.</li>
-    <li>Find any movie/series &mdash; MOVIE BOX streams appear with a
-        <b style="color:#fff">▣ MOVIE BOX</b> tag and language name.</li>
+    <li>Find any movie/series &mdash; MovieBox streams appear with a
+        <b style="color:#fff">▣ MovieBox</b> tag and language name.</li>
   </ol>
   <div class="warn">⚠ Streams are <b>HEVC / H.265</b>. Plays perfectly on Stremio
   desktop, Android &amp; Android TV — but some browsers (e.g. Firefox) can't decode HEVC.</div>
@@ -1793,7 +1793,7 @@ def main():
     if PUBLIC_URL:
         threading.Thread(target=_keepalive_loop, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    print("MOVIE BOX %s listening on :%d (keepalive=%s)" % (VERSION, PORT, bool(PUBLIC_URL)), flush=True)
+    print("MovieBox %s listening on :%d (keepalive=%s)" % (VERSION, PORT, bool(PUBLIC_URL)), flush=True)
     srv.serve_forever()
 
 if __name__ == "__main__":

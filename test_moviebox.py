@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for MOVIE BOX addon. Run: python3 test_moviebox.py"""
+"""Unit tests for MovieBox addon. Run: python3 test_moviebox.py"""
 import base64
 import json
 import os
@@ -574,7 +574,7 @@ def test_build_streams_series_happy_path():
     assert s0["description"].count("\n") == 2
     assert "480p–1080p" in s0["description"]      # real resolution range
     assert "HEVC" in s0["description"] and "863.7 MB" in s0["description"]
-    assert "▣ S01E01" in s0["description"] and "▣ MOVIE BOX" in s0["description"]
+    assert "▣ S01E01" in s0["description"] and "▣ MovieBox" in s0["description"]
     assert "NO SUB" in s0["description"]          # captions mocked empty
     assert "DASH" not in s0["description"]
     # lazy HLS: url carries sid/se/ep (stateless), not a session token
@@ -602,7 +602,7 @@ def test_build_streams_movie_no_dubs():
     assert len(res["streams"]) == 1
     assert "(Original)" in res["streams"][0]["name"]
     assert res["streams"][0]["description"].count("\n") == 2
-    assert "▣ 2010 ▣ MOVIE BOX" in res["streams"][0]["description"]
+    assert "▣ 2010 ▣ MovieBox" in res["streams"][0]["description"]
     assert "S01E01" not in res["streams"][0]["description"]
     assert re.match(r"^/hls/\d+/0/0/master\.m3u8$", res["streams"][0]["url"])
     assert g.call_count == 0  # MPD deferred to first /hls request
@@ -868,7 +868,7 @@ def test_http_health():
     c = _http_get("/health")
     assert c["code"] == 200
     d = json.loads(c["body"])
-    assert d["ok"] is True and d["brand"] == "MOVIE BOX"
+    assert d["ok"] is True and d["brand"] == "MovieBox"
 
 def test_note_public_base_ignores_private():
     for bad in ["http://localhost:7000", "http://127.0.0.1:7000",
@@ -1246,7 +1246,7 @@ def test_gzip_response():
     assert captured["code"] == 200
     assert captured["headers"].get("Content-Encoding") == "gzip"
     body = gz.decompress(buf.getvalue()).decode()
-    assert "MOVIE BOX" in body
+    assert "MovieBox" in body
     assert len(buf.getvalue()) < len(body.encode())   # actually compressed
 
 def main():
