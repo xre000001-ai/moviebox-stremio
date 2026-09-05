@@ -41,7 +41,7 @@ from urllib.parse import urlparse, parse_qs, urlencode, quote
 
 import requests
 
-VERSION = "1.1.0"
+VERSION = "1.1.3"
 BRAND = "MOVIE BOX"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -231,31 +231,42 @@ def api_call(method, path, body=None, timeout=10):
 
 def search_subjects(kw, subject_type):
     """subject_type: 1=movie 2=series. Returns list of subject dicts.
-    v2 search index is flaky for some multi-word queries ("john wick" -> 0);
-    falls back to the v1 endpoint which handles them."""
-    base = {"keyword": kw, "page": 1, "perPage": 20, "subjectType": subject_type}
-    d = api_call("POST", "/wefeed-mobile-bff/subject-api/search/v2",
-                 json.dumps(dict(base, tabId="All")))
-    if d and "__error__" not in d:
+    Filters results to the EXACT requested type (platform search sometimes
+    mixes in EPG junk like 'Episode #1.347' of the other type). Fallback
+    chain for the platform's flaky multi-word index: v2 -> v1 -> single
+    longest word via v1."""
+    def _filtered(subs):
+        return [s for s in subs if int(s.get("subjectType") or 0) == subject_type]
+
+    def _v2(keyword):
+        d = api_call("POST", "/wefeed-mobile-bff/subject-api/search/v2",
+                     json.dumps({"keyword": keyword, "page": 1, "perPage": 20,
+                                 "subjectType": subject_type, "tabId": "All"}))
+        if not (d and "__error__" not in d):
+            return []
         res = d.get("results") or []
-        subs = res[0].get("subjects", []) if res else []
-        subs = [s for s in subs if s.get("subjectType") in (1, 2)]
-        if subs:
-            return subs
-    # v1 fallback (no tabId; returns data.items[])
-    d = api_call("POST", "/wefeed-mobile-bff/subject-api/search", json.dumps(base))
-    if d and "__error__" not in d:
-        subs = [s for s in (d.get("items") or []) if s.get("subjectType") in (1, 2)]
-        if subs:
-            return subs
-    # last resort: single longest word via v1
+        return _filtered(res[0].get("subjects", []) if res else [])
+
+    def _v1(keyword):
+        d = api_call("POST", "/wefeed-mobile-bff/subject-api/search",
+                     json.dumps({"keyword": keyword, "page": 1, "perPage": 20,
+                                 "subjectType": subject_type}))
+        if not (d and "__error__" not in d):
+            return []
+        return _filtered(d.get("items") or [])
+
+    subs = _v2(kw)
+    if subs:
+        return subs
+    subs = _v1(kw)
+    if subs:
+        return subs
     words = [w for w in re.split(r"\W+", kw) if len(w) > 1]
     if len(words) > 1:
         w = max(words, key=len)
-        d = api_call("POST", "/wefeed-mobile-bff/subject-api/search",
-                     json.dumps(dict(base, keyword=w)))
-        if d and "__error__" not in d:
-            return [s for s in (d.get("items") or []) if s.get("subjectType") in (1, 2)]
+        subs = _v1(w) or _v2(w)
+        if subs:
+            return subs
     return []
 
 def subject_dubs(sid):
@@ -291,25 +302,39 @@ def _year_of(s):
     return m.group(1) if m else ""
 
 def match_subjects(subjects, title, year, subject_type, season=None):
-    """Return [(subject, lang_label)] matching cinemeta title/year."""
+    """Return [(subject, lang_label)] matching cinemeta title/year.
+    Year tolerance: ±1 for movies; if every exact-title candidate fails the
+    year check but exactly ONE candidate exists, trust it (platform upload
+    dates are often wrong)."""
     want = clean_title(title).lower()
     want_se = "%s s%d" % (want, season) if season else None
-    out = []
+    exact = []
     for s in subjects:
         if int(s.get("subjectType") or 0) != subject_type:
             continue
         st = clean_title(s.get("title") or "").lower()
-        ok = (st == want or (want_se and st == want_se)
-              or st == re.sub(r"\s*part\s*\d+$", "", want))
-        if not ok:
-            continue
-        if subject_type == 1 and year:
+        if st == want or (want_se and st == want_se) \
+                or st == re.sub(r"\s*part\s*\d+$", "", want):
+            exact.append(s)
+    if not exact:
+        return []
+    if subject_type == 1 and year:
+        in_year = []
+        for s in exact:
             sy = _year_of(s.get("releaseDate"))
-            if sy and abs(int(sy) - int(year)) > 1:
-                continue
+            if not sy or abs(int(sy) - int(year)) <= 1:
+                in_year.append(s)
+        if in_year:
+            exact = in_year
+        elif len(exact) == 1:
+            pass  # single exact-title match with odd upload year: trust it
+        else:
+            return []
+    out = []
+    for s in exact[:4]:
         label = (s.get("corner") or "").strip() or "Original"
         out.append((s, label))
-    return out[:4]
+    return out
 
 # --------------------------------------------------------------------------
 # Cinemeta + imdb resolution
@@ -867,6 +892,8 @@ class Handler(BaseHTTPRequestHandler):
                 "keepalive": bool(PUBLIC_URL or _KEEPALIVE_URL),
                 "keepalive_url": PUBLIC_URL or _KEEPALIVE_URL,
                 "auth_token": bool(_AUTH_TOKEN),
+                "video_proxy": False,
+                "segment_routing": "cdn-direct (sacdn CloudFront, query-signed)",
             }))
 
         if path == "/manifest.json":

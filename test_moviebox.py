@@ -159,8 +159,26 @@ def test_match_movie_year():
     assert "6391474290696802080" in ids and "977486567826752424" in ids
 
 def test_match_movie_year_reject():
-    subs = [SUBJ_INCEPTION]
-    assert addon.match_subjects(subs, "Inception", "1999", 1) == []
+    # two same-title candidates BOTH outside ±1 -> ambiguous, rejected
+    a = dict(SUBJ_INCEPTION)
+    b = {"subjectId": "99", "subjectType": 1, "title": "Inception",
+         "releaseDate": "2003-01-01"}
+    assert addon.match_subjects([a, b], "Inception", "1999", 1) == []
+
+def test_match_single_exact_wrong_year_trusted():
+    # platform upload dates are often wrong; a single exact-title match is
+    # trusted even when its year is off
+    odd = {"subjectId": "77", "subjectType": 1, "title": "Inception",
+           "releaseDate": "2016-08-01", "corner": ""}
+    got = addon.match_subjects([odd], "Inception", "2010", 1)
+    assert [s["subjectId"] for s, _ in got] == ["77"]
+
+def test_match_multiple_wrong_year_rejected():
+    odd1 = {"subjectId": "77", "subjectType": 1, "title": "Inception",
+            "releaseDate": "2016-08-01"}
+    odd2 = {"subjectId": "78", "subjectType": 1, "title": "Inception",
+            "releaseDate": "2003-01-01"}
+    assert addon.match_subjects([odd1, odd2], "Inception", "2010", 1) == []
 
 def test_match_series_season():
     subs = [SUBJ_SQUID_ORIG, SUBJ_SQUID_HI, SUBJ_SQUID_S3]
@@ -331,6 +349,22 @@ def test_search_subjects_filters_junk_types():
         ac.return_value = {"results": [{"subjects": [junk, SUBJ_INCEPTION]}]}
         subs = addon.search_subjects("Inception", 1)
     assert subs == [SUBJ_INCEPTION]
+
+def test_search_subjects_drops_wrong_type_junk():
+    # EPG junk ('Episode #1.347', series-type) must be dropped for a MOVIE
+    # query and count as "no results" so the fallback chain can kick in
+    epg = {"subjectId": "e1", "subjectType": 2, "title": "Episode #1.347"}
+    with mock.patch.object(addon, "api_call") as ac:
+        ac.side_effect = [
+            {"results": [{"subjects": [epg]}]},        # v2: junk only
+            {"items": [epg]},                          # v1: junk only
+            {"items": [SUBJ_INCEPTION, epg]},          # v1 single word
+        ]
+        subs = addon.search_subjects("Avengers Endgame", 1)
+    assert subs == [SUBJ_INCEPTION]
+    body = json.loads(ac.call_args_list[2][0][2])
+    assert body["keyword"] in ("Avengers", "Endgame")
+    assert body["subjectType"] == 1 and "tabId" not in body
 
 def test_get_catalog_dedupes_imdb():
     m1 = {"subjectId": "a", "subjectType": 1, "title": "John Wick", "releaseDate": "2014-10-24",
