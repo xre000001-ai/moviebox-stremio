@@ -41,7 +41,7 @@ from urllib.parse import urlparse, parse_qs, urlencode, quote
 
 import requests
 
-VERSION = "1.1.4"
+VERSION = "1.1.5"
 BRAND = "MOVIE BOX"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -744,7 +744,36 @@ def _res_label(heights):
     return "MULTI" if len(hs) > 1 else str(hs[0])
 
 _STREAM_CACHE = {}       # (ctype, imdb, se, ep) -> (card list, expiry)
-_STREAM_CACHE_TTL = 600  # HLS sessions live 6h; 10 min keeps replays instant
+_STREAM_CACHE_TTL = 600  # results cached 10 min; replays are instant
+_PLAY_CACHE = {}         # (sid, se, ep) -> play-info payload (10 min)
+_DUB_CACHE = {}          # sid -> dub list (30 min)
+_SEARCH_CACHE = {}       # (kw, subject_type) -> subjects (10 min)
+
+def _cached_search(kw, subject_type):
+    key = (kw, subject_type)
+    hit, val = _cache_get(_SEARCH_CACHE, key)
+    if hit:
+        return val
+    val = search_subjects(kw, subject_type)
+    _cache_put(_SEARCH_CACHE, key, val, 600)
+    return val
+
+def _cached_dubs(sid):
+    hit, val = _cache_get(_DUB_CACHE, sid)
+    if hit:
+        return val
+    val = subject_dubs(sid)
+    _cache_put(_DUB_CACHE, sid, val, 1800)
+    return val
+
+def _cached_play(sid, se, ep):
+    key = (str(sid), se, ep)
+    hit, val = _cache_get(_PLAY_CACHE, key)
+    if hit:
+        return val
+    val = play_info(sid, se, ep)
+    _cache_put(_PLAY_CACHE, key, val, 600)
+    return val
 
 _LABEL_PRETTY = {"esla": "Spanish", "ptbr": "Portuguese (BR)", "pt": "Portuguese",
                  "es": "Spanish", "id": "Indonesian"}
@@ -753,41 +782,74 @@ def _pretty_label(nm):
     nm = (nm or "").strip()
     return _LABEL_PRETTY.get(nm.lower(), nm) or "Dub"
 
+def _res_from_pi(pi, pl):
+    """Resolution label from play-info (no MPD fetch needed at card time)."""
+    raw = pi.get("displayResolutions") or (pl or {}).get("resolutions") or ""
+    try:
+        heights = [int(x) for x in re.findall(r"\d{3,4}", str(raw))]
+    except Exception:
+        heights = []
+    return _res_label(heights) if heights else "MULTI"
+
 def _resolve_entry(pair, se, ep, ctype, title, year):
-    """play-info + MPD for one dub entry. Returns a stream card or None."""
+    """Stream card for one dub entry. Only play-info is fetched here (cached);
+    the MPD + HLS playlists are resolved lazily on first /hls request — this
+    keeps card building fast enough for Stremio's ~20s timeout."""
     sid, label = pair
-    pi = play_info(sid, se if ctype == "series" else None,
-                   ep if ctype == "series" else None)
+    pi = _cached_play(sid, se if ctype == "series" else None,
+                      ep if ctype == "series" else None)
     if not pi:
         return None
     pl = (pi.get("streams") or [None])[0]
     if not pl or not pl.get("signCookie"):
         return None
     cf = _cf_parts(pl["signCookie"])
-    if not cf:
+    if not cf or "CloudFront-Policy" not in cf:
         return None
-    dash = _dash_base(cf["CloudFront-Policy"])
-    if not dash:
+    if not _dash_base(cf["CloudFront-Policy"]):
         return None
-    mpd = get_mpd_info(dash, pl["signCookie"])
-    if not mpd:
-        return None
-    tok = new_hls_session(dash, cf, mpd)
-    res = _res_label([v["height"] for v in mpd["video"]])
+    res = _res_from_pi(pi, pl)
     desc = "%s (%s) (%s) ▣ %s" % (title, year or "----", label, BRAND)
     if ctype == "series":
         desc += " ▣ S%02dE%02d" % (se, ep)
     desc += " ◀ MBCLOUD"
+    use_se, use_ep = (se, ep) if ctype == "series" else (0, 0)
     return {
         "name": "𖤍 %s 𖤍" % res,
         "description": desc,
-        "url": "/hls/%s/master.m3u8" % tok,
+        "url": "/hls/%s/%d/%d/master.m3u8" % (sid, use_se, use_ep),
         "behaviorHints": {"notWebReady": False, "isBingeable": True},
         "bingeGroup": "mbx|%s:%s:%s|%s|%s" % (title, se if ctype == "series" else "",
                                               ep if ctype == "series" else "", label, res),
     }
 
-def build_streams(ctype, imdb, se, ep):
+def _lazy_hls(sid, se, ep, file):
+    """Stateless HLS: derive playlists from (sid, se, ep) via cached
+    play-info + cached MPD. No session store — survives restarts and keeps
+    signing cookies fresh for long playback sessions."""
+    pi = _cached_play(sid, se or None, ep or None)
+    pl = (pi.get("streams") or [None])[0] if pi else None
+    ck = (pl or {}).get("signCookie") or ""
+    if not ck:
+        return None
+    cf = _cf_parts(ck)
+    pol = (cf or {}).get("CloudFront-Policy")
+    dash = _dash_base(pol) if pol else None
+    if not dash:
+        return None
+    mpd = get_mpd_info(dash, ck)
+    if not mpd:
+        return None
+    sess = {"dash": dash, "cf": cf, "mpd": mpd}
+    if file == "master":
+        return hls_master(sess)
+    kind, idx = file[0], int(file[1:])
+    reps = mpd["audio"] if kind == "a" else mpd["video"]
+    if idx >= len(reps):
+        return None
+    return hls_media(sess, reps[idx]["id"], kind)
+
+def build_streams(ctype, imdb, se, ep, _prewarm_next=True):
     key = (ctype, imdb, se, ep)
     hit, val = _cache_get(_STREAM_CACHE, key)
     if hit:
@@ -797,7 +859,7 @@ def build_streams(ctype, imdb, se, ep):
         return {"streams": [], "message": "no metadata"}
     title, year = meta["name"], meta["year"]
     stype = 1 if ctype == "movie" else 2
-    subs = search_subjects(title, stype)
+    subs = _cached_search(title, stype)
     if not subs:
         return {"streams": []}
     matched = match_subjects(subs, title, year, stype, season=se)
@@ -805,7 +867,7 @@ def build_streams(ctype, imdb, se, ep):
         return {"streams": []}
     # dub lists for the top matches, fetched in parallel
     with ThreadPoolExecutor(max_workers=2) as ex:
-        dub_lists = list(ex.map(lambda m: subject_dubs(str(m[0].get("subjectId"))),
+        dub_lists = list(ex.map(lambda m: _cached_dubs(str(m[0].get("subjectId"))),
                                 matched[:2]))
     # dedupe by subjectId AND label (clean card list)
     entries, seen, seen_labels = [], set(), set()
@@ -832,7 +894,17 @@ def build_streams(ctype, imdb, se, ep):
     streams = [r for r in results if r]
     if streams:
         _cache_put(_STREAM_CACHE, key, streams, _STREAM_CACHE_TTL)
+        if _prewarm_next and ctype == "series":
+            # background-warm the next episode so binge navigation is instant
+            threading.Thread(target=_safe_build, daemon=True,
+                             args=(ctype, imdb, se, ep + 1)).start()
     return {"streams": streams}
+
+def _safe_build(ctype, imdb, se, ep):
+    try:
+        build_streams(ctype, imdb, se, ep, _prewarm_next=False)
+    except Exception:
+        pass
 
 # --------------------------------------------------------------------------
 # HTTP server
@@ -1061,6 +1133,15 @@ class Handler(BaseHTTPRequestHandler):
                 if s.get("url", "").startswith("/hls/"):
                     s["url"] = self._host_base() + s["url"]
             return self._send(200, json.dumps(res))
+
+        m = re.match(r"^/hls/(\d{5,25})/(\d{1,3})/(\d{1,5})/(master|v\d+|a\d+)\.m3u8$", path)
+        if m:
+            sid, use_se, use_ep, file = m.group(1), int(m.group(2)), int(m.group(3)), m.group(4)
+            body = _lazy_hls(sid, use_se, use_ep, file)
+            if body is None:
+                return self._send(404, "#EXTM3U\n#error no stream for this entry\n",
+                                  "application/vnd.apple.mpegurl")
+            return self._send(200, body, "application/vnd.apple.mpegurl")
 
         m = re.match(r"^/hls/([A-Za-z0-9_-]{6,64})/(master|v\d+|a\d+)\.m3u8$", path)
         if m:

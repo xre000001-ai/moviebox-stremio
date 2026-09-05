@@ -3,6 +3,7 @@
 import base64
 import json
 import os
+import re
 import sys
 import time
 import unittest
@@ -508,7 +509,7 @@ def test_get_catalog_bad_id():
 
 def test_build_streams_series_happy_path():
     addon._MPD_CACHE.clear()
-    addon._STREAM_CACHE.clear()
+    addon._STREAM_CACHE.clear(); addon._PLAY_CACHE.clear(); addon._DUB_CACHE.clear(); addon._SEARCH_CACHE.clear()
     dubs = [{"subjectId": "973041525783496480", "lanName": "Hindi dub"},
             {"subjectId": "3089349649006742360", "lanName": "Original"}]
     with mock.patch.object(addon, "cinemeta",
@@ -517,6 +518,7 @@ def test_build_streams_series_happy_path():
                            return_value=[SUBJ_SQUID_ORIG, SUBJ_SQUID_HI]), \
          mock.patch.object(addon, "subject_dubs", return_value=dubs), \
          mock.patch.object(addon, "play_info", return_value=PLAY_INFO_FIX), \
+         mock.patch.object(addon, "_safe_build"), \
          mock.patch.object(addon.requests, "get") as g:
         r = mock.Mock(status_code=200, content=b"<MPD" + b"x" * 50)
         r.text = MPD_FIX
@@ -527,12 +529,15 @@ def test_build_streams_series_happy_path():
     assert s0["name"] == "𖤍 MULTI 𖤍"
     assert "Squid Game (2021)" in s0["description"]
     assert "▣ S01E01" in s0["description"] and "▣ MOVIE BOX" in s0["description"]
-    assert s0["url"].startswith("/hls/") and s0["url"].endswith("/master.m3u8")
+    # lazy HLS: url carries sid/se/ep (stateless), not a session token
+    assert re.match(r"^/hls/\d+/1/1/master\.m3u8$", s0["url"]), s0["url"]
     assert s0["bingeGroup"].startswith("mbx|Squid Game")
+    # MPD is NOT fetched at card time (deferred to first /hls request)
+    assert g.call_count == 0
 
 def test_build_streams_movie_no_dubs():
     addon._MPD_CACHE.clear()
-    addon._STREAM_CACHE.clear()
+    addon._STREAM_CACHE.clear(); addon._PLAY_CACHE.clear(); addon._DUB_CACHE.clear(); addon._SEARCH_CACHE.clear()
     with mock.patch.object(addon, "cinemeta",
                            return_value={"name": "Inception", "year": "2010"}), \
          mock.patch.object(addon, "search_subjects",
@@ -547,10 +552,12 @@ def test_build_streams_movie_no_dubs():
     assert len(res["streams"]) == 1
     assert "(Original)" in res["streams"][0]["description"]
     assert "S01E01" not in res["streams"][0]["description"]
+    assert re.match(r"^/hls/\d+/0/0/master\.m3u8$", res["streams"][0]["url"])
+    assert g.call_count == 0  # MPD deferred to first /hls request
 
 def test_build_streams_result_cached():
     addon._MPD_CACHE.clear()
-    addon._STREAM_CACHE.clear()
+    addon._STREAM_CACHE.clear(); addon._PLAY_CACHE.clear(); addon._DUB_CACHE.clear(); addon._SEARCH_CACHE.clear()
     calls = {"search": 0}
     def counting_search(kw, st):
         calls["search"] += 1
@@ -569,8 +576,44 @@ def test_build_streams_result_cached():
     assert r1 == r2 and len(r2["streams"]) == 1
     assert calls["search"] == 1  # second call served from cache
 
+def test_cached_play_dedupes():
+    addon._PLAY_CACHE.clear()
+    calls = {"n": 0}
+    def fake_pi(sid, se=None, ep=None):
+        calls["n"] += 1
+        return PLAY_INFO_FIX
+    with mock.patch.object(addon, "play_info", side_effect=fake_pi):
+        a = addon._cached_play("123", 1, 2)
+        b = addon._cached_play("123", 1, 2)
+    assert a == b and calls["n"] == 1
+    addon._PLAY_CACHE.clear()
+
+def test_lazy_hls_route_master_and_variant():
+    addon._PLAY_CACHE.clear(); addon._MPD_CACHE.clear()
+    with mock.patch.object(addon, "play_info", return_value=PLAY_INFO_FIX), \
+         mock.patch.object(addon.requests, "get") as g:
+        r = mock.Mock(status_code=200, content=b"<MPD" + b"x" * 50)
+        r.text = MPD_FIX
+        g.return_value = r
+        c1 = _http_get("/hls/3089349649006742360/1/1/master.m3u8")
+        c2 = _http_get("/hls/3089349649006742360/1/1/v0.m3u8")
+    assert c1["code"] == 200
+    m = c1["body"].decode()
+    assert "#EXT-X-STREAM-INF" in m and "v0.m3u8" in m
+    assert c2["code"] == 200
+    v = c2["body"].decode()
+    assert "#EXTINF" in v and "chunk-stream0-00001.m4s" in v
+    addon._PLAY_CACHE.clear(); addon._MPD_CACHE.clear()
+
+def test_lazy_hls_route_404_when_no_stream():
+    addon._PLAY_CACHE.clear()
+    with mock.patch.object(addon, "play_info", return_value=None):
+        c = _http_get("/hls/3089349649006742360/1/1/master.m3u8")
+    assert c["code"] == 404
+    addon._PLAY_CACHE.clear()
+
 def test_build_streams_no_match():
-    addon._STREAM_CACHE.clear()
+    addon._STREAM_CACHE.clear(); addon._PLAY_CACHE.clear(); addon._DUB_CACHE.clear(); addon._SEARCH_CACHE.clear()
     with mock.patch.object(addon, "cinemeta",
                            return_value={"name": "Zzz Nothing", "year": "1990"}), \
          mock.patch.object(addon, "search_subjects", return_value=[SUBJ_INCEPTION]):
@@ -578,7 +621,7 @@ def test_build_streams_no_match():
     assert res["streams"] == []
 
 def test_build_streams_play_info_transparent_on_none():
-    addon._STREAM_CACHE.clear()
+    addon._STREAM_CACHE.clear(); addon._PLAY_CACHE.clear(); addon._DUB_CACHE.clear(); addon._SEARCH_CACHE.clear()
     addon._MPD_CACHE.clear()
     with mock.patch.object(addon, "cinemeta",
                            return_value={"name": "Inception", "year": "2010"}), \
