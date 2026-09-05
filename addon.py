@@ -41,7 +41,7 @@ from urllib.parse import urlparse, parse_qs, urlencode, quote, unquote
 
 import requests
 
-VERSION = "1.1.6"
+VERSION = "1.1.7"
 BRAND = "MOVIE BOX"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -704,7 +704,7 @@ def new_hls_session(dash_base, cf, mpd):
 
 def hls_master(sess):
     mpd = sess["mpd"]
-    lines = ["#EXTM3U", "#EXT-X-VERSION:7"]
+    lines = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-INDEPENDENT-SEGMENTS"]
     auds = mpd["audio"]
     if auds:
         for i, a in enumerate(auds):
@@ -898,7 +898,33 @@ def build_streams(ctype, imdb, se, ep, _prewarm_next=True):
             # background-warm the next episode so binge navigation is instant
             threading.Thread(target=_safe_build, daemon=True,
                              args=(ctype, imdb, se, ep + 1)).start()
+        if _prewarm_next:
+            # background-warm play-info + MPD so the first PLAY click is instant
+            _spawn_warm(entries, se, ep, ctype)
     return {"streams": streams}
+
+def _spawn_warm(entries, se, ep, ctype):
+    def _w():
+        for sid, _ in entries[:8]:
+            try:
+                _warm_one(sid, se, ep, ctype)
+            except Exception:
+                pass
+    threading.Thread(target=_w, daemon=True).start()
+
+def _warm_one(sid, se, ep, ctype):
+    """Prefetch play-info + MPD for one card (no playlists built)."""
+    pi = _cached_play(sid, se if ctype == "series" else None,
+                      ep if ctype == "series" else None)
+    pl = (pi.get("streams") or [None])[0] if pi else None
+    ck = (pl or {}).get("signCookie") or ""
+    if not ck:
+        return
+    cf = _cf_parts(ck)
+    pol = (cf or {}).get("CloudFront-Policy")
+    dash = _dash_base(pol) if pol else None
+    if dash:
+        get_mpd_info(dash, ck)
 
 def _safe_build(ctype, imdb, se, ep):
     try:

@@ -519,6 +519,7 @@ def test_build_streams_series_happy_path():
          mock.patch.object(addon, "subject_dubs", return_value=dubs), \
          mock.patch.object(addon, "play_info", return_value=PLAY_INFO_FIX), \
          mock.patch.object(addon, "_safe_build"), \
+         mock.patch.object(addon, "_spawn_warm"), \
          mock.patch.object(addon.requests, "get") as g:
         r = mock.Mock(status_code=200, content=b"<MPD" + b"x" * 50)
         r.text = MPD_FIX
@@ -544,6 +545,7 @@ def test_build_streams_movie_no_dubs():
                            return_value=[SUBJ_INCEPTION]), \
          mock.patch.object(addon, "subject_dubs", return_value=[]), \
          mock.patch.object(addon, "play_info", return_value=PLAY_INFO_FIX), \
+         mock.patch.object(addon, "_spawn_warm"), \
          mock.patch.object(addon.requests, "get") as g:
         r = mock.Mock(status_code=200, content=b"<MPD" + b"x" * 50)
         r.text = MPD_FIX
@@ -622,6 +624,7 @@ def test_stream_route_accepts_encoded_colons():
          mock.patch.object(addon, "subject_dubs", return_value=[]), \
          mock.patch.object(addon, "play_info", return_value=PLAY_INFO_FIX), \
          mock.patch.object(addon, "_safe_build"), \
+         mock.patch.object(addon, "_spawn_warm"), \
          mock.patch.object(addon.requests, "get"):
         for p in ["/stream/series/tt10919420%3A1%3A1.json",
                   "/stream/series/tt10919420%3a2%3a7.json",
