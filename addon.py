@@ -49,7 +49,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 BRAND = "MOVIE BOX"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -844,7 +844,10 @@ def dash_manifest(sid, se, ep):
 # --------------------------------------------------------------------------
 # 7. hls — stateless playlists from the MPD timeline
 # --------------------------------------------------------------------------
-def hls_master(sess):
+def hls_master(sess, subs=()):
+    """Master playlist. `subs` = raw language codes — emitted as a proper
+    EXT-X-MEDIA TYPE=SUBTITLES group so manifest-driven players (Nuvio,
+    tvOS, ExoPlayer) see the subtitle tracks inside the HLS itself."""
     mpd = sess["mpd"]
     lines = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-INDEPENDENT-SEGMENTS"]
     auds = mpd["audio"]
@@ -853,12 +856,42 @@ def hls_master(sess):
             lines.append("#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"%s\","
                          "DEFAULT=%s,AUTOSELECT=YES,LANGUAGE=\"%s\",URI=\"a%d.m3u8\""
                          % (a["lang"].upper(), "YES" if i == 0 else "NO", a["lang"], i))
+    subs = list(dict.fromkeys(s for s in subs if s))
+    if subs:
+        for lan in subs:
+            lg, nm = _lang_hls(lan)
+            lines.append("#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"%s\","
+                         "DEFAULT=NO,AUTOSELECT=YES,LANGUAGE=\"%s\",URI=\"sub-%s.m3u8\""
+                         % (nm, lg, lan))
     for v in mpd["video"]:
         codecs = v["codecs"] + ("," + ",".join(a["codecs"] for a in auds) if auds else "")
         res = "%dx%d" % (v["width"], v["height"]) if v.get("width") else str(v["height"])
+        extra = ("AUDIO=\"aud\"" if auds else "") + (",SUBTITLES=\"subs\"" if subs else "")
         lines.append("#EXT-X-STREAM-INF:BANDWIDTH=%d,RESOLUTION=%s,CODECS=\"%s\"%s"
-                     % (v["bw"], res, codecs, ",AUDIO=\"aud\"" if auds else ""))
+                     % (v["bw"], res, codecs, ("," + extra) if extra else ""))
         lines.append("v%s.m3u8" % v["id"])
+    return "\n".join(lines) + "\n"
+
+def hls_sub_playlist(sid, se, ep, lan):
+    """Single-segment subtitle media playlist wrapping the WebVTT — the
+    HLS-spec way to attach subs (players resolve /sub/... against our host)."""
+    pi = _cached_play(sid, se or None, ep or None)
+    pl = (pi.get("streams") or [None])[0] if pi else None
+    if not pl or not pl.get("id"):
+        return None
+    caps = fetch_captions(sid, pl["id"])
+    if not any(c.get("lan") == lan for c in caps):
+        return None
+    try:
+        dur = float(pl.get("duration") or 3600)
+    except (TypeError, ValueError):
+        dur = 3600.0
+    lines = ["#EXTM3U", "#EXT-X-VERSION:3",
+             "#EXT-X-TARGETDURATION:%d" % max(1, math.ceil(dur)),
+             "#EXT-X-MEDIA-SEQUENCE:0",
+             "#EXTINF:%.3f," % dur,
+             "/sub/%s/%d/%d/%s.vtt" % (sid, se, ep, lan),
+             "#EXT-X-ENDLIST"]
     return "\n".join(lines) + "\n"
 
 _TAIL_CACHE = {}   # (dash, rep) -> last segment index that exists on the CDN
@@ -987,7 +1020,18 @@ _LANG3 = {"ar": "ara", "en": "eng", "es": "spa", "fil": "fil", "fr": "fra",
           "in_id": "ind", "id": "ind", "ms": "msa", "pt": "por", "ru": "rus",
           "bn": "ben", "hi": "hin", "ur": "urd", "pa": "pan", "zh": "zho",
           "ko": "kor", "ja": "jpn", "th": "tha", "vi": "vie", "tr": "tur",
-          "de": "deu", "it": "ita"}
+          "de": "deu", "ita": "ita", "it": "ita"}
+
+_LANG_NAME = {"ar": "Arabic", "bn": "Bangla", "en": "English", "es": "Spanish",
+              "fil": "Filipino", "fr": "French", "in_id": "Indonesian", "id": "Indonesian",
+              "ms": "Malay", "pt": "Portuguese", "ru": "Russian", "hi": "Hindi",
+              "ur": "Urdu", "pa": "Punjabi", "zh": "Chinese", "ko": "Korean",
+              "ja": "Japanese", "th": "Thai", "vi": "Vietnamese", "tr": "Turkish",
+              "de": "German", "it": "Italian"}
+
+def _lang_hls(code):
+    """(LANGUAGE attr, display NAME) for HLS subtitle renditions."""
+    return ({"in_id": "id"}.get(code, code), _LANG_NAME.get(code, code))
 
 def _web_jwt():
     """Anonymous web JWT via the site's search-suggest (x-user response
@@ -1079,7 +1123,7 @@ def _srt_to_vtt(srt):
     standalone cue numbers, WEBVTT header). Stremio's web player wants VTT."""
     s = (srt or "").replace("\r\n", "\n").replace("\r", "\n")
     lines = s.split("\n")
-    out, i, n = ["WEBVTT", ""], 0, len(lines)
+    out, i, n = ["WEBVTT", "X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0", ""], 0, len(lines)
     while i < n:
         if lines[i].strip().isdigit() and i + 1 < n and "-->" in lines[i + 1]:
             i += 1
@@ -1255,7 +1299,13 @@ def _lazy_hls(sid, se, ep, file):
         return None
     sess = {"dash": dash, "cf": cf, "mpd": mpd}
     if file == "master":
-        return hls_master(sess)
+        subs = []
+        try:
+            subs = [c.get("lan") for c in fetch_captions(sid, pl.get("id"))
+                    if c.get("lan")]
+        except Exception:
+            pass
+        return hls_master(sess, subs)
     kind, idx = file[0], int(file[1:])
     reps = mpd["audio"] if kind == "a" else mpd["video"]
     if idx >= len(reps):
@@ -1627,6 +1677,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(404, "WEBVTT\n\n# no subtitle for this entry\n",
                                   "text/vtt; charset=utf-8")
             return self._send(200, body, "text/vtt; charset=utf-8")
+
+        m = re.match(r"^/hls/(\d{5,25})/(\d{1,3})/(\d{1,5})/sub-([a-z0-9_]+)\.m3u8$", path)
+        if m:
+            body = hls_sub_playlist(m.group(1), int(m.group(2)), int(m.group(3)),
+                                    m.group(4))
+            if body is None:
+                return self._send(404, "#EXTM3U\n#error no subtitle for this entry\n",
+                                  "application/vnd.apple.mpegurl")
+            return self._send(200, body, "application/vnd.apple.mpegurl")
 
         m = re.match(r"^/hls/(\d{5,25})/(\d{1,3})/(\d{1,5})/(master|v\d+|a\d+)\.m3u8$", path)
         if m:

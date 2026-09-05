@@ -655,10 +655,43 @@ def test_lazy_hls_route_master_and_variant():
     assert c1["code"] == 200
     m = c1["body"].decode()
     assert "#EXT-X-STREAM-INF" in m and "v0.m3u8" in m
+    assert "#EXT-X-MEDIA:TYPE=SUBTITLES" not in m   # captions mocked empty
     assert c2["code"] == 200
     v = c2["body"].decode()
     assert "#EXTINF" in v and "chunk-stream0-00001.m4s" in v
     addon._PLAY_CACHE.clear(); addon._MPD_CACHE.clear()
+    # master WITH captions: subtitle renditions + SUBTITLES group on variants
+    caps = [{"lan": "en", "url": "https://c/e.srt"}, {"lan": "in_id", "url": "https://c/i.srt"}]
+    with mock.patch.object(addon, "play_info", return_value=PLAY_INFO_FIX), \
+         mock.patch.object(addon, "fetch_captions", return_value=caps), \
+         mock.patch.object(addon, "_seg_exists", return_value=True), \
+         mock.patch.object(addon.requests, "get") as g:
+        r = mock.Mock(status_code=200, content=b"<MPD" + b"x" * 50)
+        r.text = MPD_FIX
+        g.return_value = r
+        c3 = _http_get("/hls/3089349649006742360/1/1/master.m3u8")
+        c4 = _http_get("/hls/3089349649006742360/1/1/sub-en.m3u8")
+    assert c3["code"] == 200
+    m3 = c3["body"].decode()
+    assert ('#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",'
+            'DEFAULT=NO,AUTOSELECT=YES,LANGUAGE="en",URI="sub-en.m3u8"') in m3
+    assert 'LANGUAGE="id",URI="sub-in_id.m3u8"' in m3      # in_id -> id
+    assert 'SUBTITLES="subs"' in m3                        # variants join the group
+    assert c4["code"] == 200
+    m4 = c4["body"].decode()
+    assert m4.startswith("#EXTM3U") and "#EXT-X-ENDLIST" in m4
+    assert "/sub/3089349649006742360/1/1/en.vtt" in m4      # single VTT segment
+    assert "#EXTINF:%.3f," % 3643 in m4                     # play-info duration
+    assert "#EXT-X-TARGETDURATION:3643" in m4
+    addon._PLAY_CACHE.clear(); addon._MPD_CACHE.clear()
+
+def test_sub_playlist_404_on_unknown_lan():
+    caps = [{"lan": "en", "url": "https://c/e.srt"}]
+    with mock.patch.object(addon, "play_info", return_value=PLAY_INFO_FIX), \
+         mock.patch.object(addon, "fetch_captions", return_value=caps):
+        c = _http_get("/hls/3089349649006742360/1/1/sub-zz.m3u8")
+    assert c["code"] == 404
+    addon._PLAY_CACHE.clear()
 
 def test_lazy_hls_route_404_when_no_stream():
     addon._PLAY_CACHE.clear()
@@ -893,6 +926,12 @@ def test_srt_to_vtt():
     lines = [l for l in vtt.split("\n") if l.strip()]
     assert not any(l.strip() == "1" for l in lines)   # cue numbers dropped
     assert "Hello" in vtt and "World" in vtt
+
+def test_vtt_has_timestamp_map():
+    vtt = addon._srt_to_vtt("1\n00:00:01,000 --> 00:00:02,000\nHi\n\n")
+    assert vtt.splitlines()[1] == "X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0"
+    assert "00:00:01.000 --> 00:00:02.000" in vtt
+
 
 def test_fetch_captions_mobile_and_cache():
     addon._SUB_CACHE.clear()
