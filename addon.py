@@ -41,7 +41,7 @@ from urllib.parse import urlparse, parse_qs, urlencode, quote, unquote
 
 import requests
 
-VERSION = "1.1.7"
+VERSION = "1.1.8"
 BRAND = "MOVIE BOX"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -719,10 +719,51 @@ def hls_master(sess):
         lines.append("v%s.m3u8" % v["id"])
     return "\n".join(lines) + "\n"
 
+_TAIL_CACHE = {}   # (dash, rep) -> last segment index that exists on the CDN
+
+def _seg_exists(dash, rep, i, cf):
+    try:
+        r = requests.get(_signed(dash, "chunk-stream%s-%05d.m4s" % (rep, i), cf),
+                         headers={"Range": "bytes=0-1"}, timeout=8)
+        return r.status_code in (200, 206)
+    except Exception:
+        return False
+
+def _last_good_seg(dash, rep, n, cf):
+    """Some platform uploads have an MPD duration inflated ~1.2x — the
+    playlist lists segments that don't exist on the CDN, so players die
+    ~83% into the episode with a load error. Probe the tail once (cheap:
+    heuristic point first, then binary search) and trim the playlist to
+    what actually exists, ending it cleanly with ENDLIST."""
+    key = (dash, rep)
+    hit, val = _cache_get(_TAIL_CACHE, key)
+    if hit:
+        return val
+    last = n
+    if n > 1 and not _seg_exists(dash, rep, n, cf):
+        # common pattern: exactly ~83.25% of the listed count exists
+        k = max(1, int(n * 0.8325))
+        if _seg_exists(dash, rep, k, cf) and not _seg_exists(dash, rep, k + 1, cf):
+            last = k
+        else:
+            lo, hi = 1, n - 1
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if _seg_exists(dash, rep, mid, cf):
+                    lo = mid
+                else:
+                    hi = mid - 1
+            last = lo
+        if last < 2:      # probe looked broken — serve the full list
+            last = n
+    _cache_put(_TAIL_CACHE, key, last, 1800)
+    return last
+
 def hls_media(sess, rep_id, kind):
     mpd = sess["mpd"]
     seg = mpd["seg_dur"] or 5.0
     n = max(1, int(math.ceil((mpd["dur"] or 0) / seg)))
+    n = _last_good_seg(sess["dash"], rep_id, n, sess["cf"])
     lines = ["#EXTM3U", "#EXT-X-VERSION:7",
              "#EXT-X-TARGETDURATION:%d" % int(math.ceil(seg)),
              "#EXT-X-PLAYLIST-TYPE:VOD",

@@ -314,7 +314,8 @@ def test_hls_media_counts():
     mpd = addon._parse_mpd(MPD_FIX)   # dur 3643.6s / 5s = 729 chunks
     sess = {"dash": "https://sacdn.hakunaymatata.com/dash/999888_1_1_1080_h265_299",
             "cf": addon._cf_parts(FAKE_COOKIE), "mpd": mpd}
-    body = addon.hls_media(sess, "0", "v")
+    with mock.patch.object(addon, "_seg_exists", return_value=True):
+        body = addon.hls_media(sess, "0", "v")
     assert body.count("#EXTINF") == 729
     assert body.count("chunk-stream0-") == 729
     assert "chunk-stream0-00001.m3u8" not in body
@@ -327,8 +328,48 @@ def test_hls_media_counts():
 def test_hls_media_audio_rep():
     mpd = addon._parse_mpd(MPD_FIX)
     sess = {"dash": "https://x", "cf": addon._cf_parts(FAKE_COOKIE), "mpd": mpd}
-    body = addon.hls_media(sess, "3", "a")
+    with mock.patch.object(addon, "_seg_exists", return_value=True):
+        body = addon.hls_media(sess, "3", "a")
     assert "init-stream3.m4s" in body and "chunk-stream3-00001.m4s" in body
+
+def test_last_good_seg_complete_one_probe():
+    addon._TAIL_CACHE.clear()
+    calls = []
+    def fake(dash, rep, i, cf):
+        calls.append(i); return True
+    with mock.patch.object(addon, "_seg_exists", side_effect=fake):
+        assert addon._last_good_seg("https://d", "0", 729, {}) == 729
+    assert calls == [729]  # single probe, complete file
+    addon._TAIL_CACHE.clear()
+
+def test_last_good_seg_heuristic_83_percent():
+    # the known pattern: ~83.25% of listed segments exist (MPD duration 1.2x)
+    addon._TAIL_CACHE.clear()
+    def fake(dash, rep, i, cf):
+        return i <= 676
+    with mock.patch.object(addon, "_seg_exists", side_effect=fake):
+        got = addon._last_good_seg("https://d2", "0", 812, {})
+    assert got == 676
+    addon._TAIL_CACHE.clear()
+
+def test_last_good_seg_binary_search():
+    addon._TAIL_CACHE.clear()
+    def fake(dash, rep, i, cf):
+        return i <= 400   # not near the 83.25% point -> binary search path
+    with mock.patch.object(addon, "_seg_exists", side_effect=fake):
+        got = addon._last_good_seg("https://d3", "0", 812, {})
+    assert got == 400
+    addon._TAIL_CACHE.clear()
+
+def test_hls_media_trims_to_existing_segments():
+    mpd = addon._parse_mpd(MPD_FIX)   # 729 segments listed
+    sess = {"dash": "https://trunc", "cf": addon._cf_parts(FAKE_COOKIE), "mpd": mpd}
+    with mock.patch.object(addon, "_seg_exists", side_effect=lambda d, r, i, cf: i <= 600):
+        body = addon.hls_media(sess, "0", "v")
+    assert body.count("#EXTINF") == 600
+    assert "chunk-stream0-00600.m4s" in body
+    assert "chunk-stream0-00601.m4s" not in body
+    assert body.rstrip().endswith("#EXT-X-ENDLIST")
 
 def test_cache_put_get():
     store = {}
@@ -591,8 +632,9 @@ def test_cached_play_dedupes():
     addon._PLAY_CACHE.clear()
 
 def test_lazy_hls_route_master_and_variant():
-    addon._PLAY_CACHE.clear(); addon._MPD_CACHE.clear()
+    addon._PLAY_CACHE.clear(); addon._MPD_CACHE.clear(); addon._TAIL_CACHE.clear()
     with mock.patch.object(addon, "play_info", return_value=PLAY_INFO_FIX), \
+         mock.patch.object(addon, "_seg_exists", return_value=True), \
          mock.patch.object(addon.requests, "get") as g:
         r = mock.Mock(status_code=200, content=b"<MPD" + b"x" * 50)
         r.text = MPD_FIX
