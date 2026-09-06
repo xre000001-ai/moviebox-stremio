@@ -1279,6 +1279,54 @@ def test_gzip_response():
     assert "MovieBox" in body
     assert len(buf.getvalue()) < len(body.encode())   # actually compressed
 
+# --- v1.6.4: optional platform egress proxy (MOVIEBOX_PROXY) ----------------
+
+def test_plat_proxy_default_off():
+    # No env var set => no proxying at all (default production behavior).
+    assert addon._PLAT_PROXIES is None
+
+def test_api_call_uses_proxy_when_configured():
+    addon._PLAT_CB_UNTIL = 0.0
+    captured = {}
+    def fake_request(method, url, **kw):
+        captured["proxies"] = kw.get("proxies")
+        resp = mock.Mock(status_code=200)
+        resp.headers = {}
+        resp.json = lambda: {"code": 0, "message": "ok", "data": {"x": 1}}
+        return resp
+    gate = {"http": "http://gate.example:7000", "https": "http://gate.example:7000"}
+    saved = addon._PLAT_PROXIES
+    try:
+        addon._PLAT_PROXIES = gate
+        with mock.patch.object(addon, "_bootstrap_token"), \
+             mock.patch.object(addon.requests, "request", side_effect=fake_request):
+            addon._AUTH_TOKEN = "tok"
+            d = addon.api_call("GET", "/wefeed-mobile-bff/v2/search?keyword=x")
+        assert d == {"x": 1}
+        assert captured["proxies"] == gate
+    finally:
+        addon._PLAT_PROXIES = saved
+
+def test_bootstrap_uses_proxy_when_configured():
+    addon._PLAT_CB_UNTIL = 0.0
+    captured = {}
+    def fake_get(url, **kw):
+        captured["proxies"] = kw.get("proxies")
+        resp = mock.Mock(status_code=200)
+        resp.headers = {}
+        resp.json = lambda: {"code": 0, "data": {}}
+        return resp
+    gate = {"http": "http://gate.example:7000", "https": "http://gate.example:7000"}
+    saved_px, saved_tok = addon._PLAT_PROXIES, addon._AUTH_TOKEN
+    try:
+        addon._PLAT_PROXIES = gate
+        with mock.patch.object(addon.requests, "get", side_effect=fake_get):
+            addon._bootstrap_token()
+        assert captured["proxies"] == gate
+    finally:
+        addon._PLAT_PROXIES = saved_px
+        addon._AUTH_TOKEN = saved_tok
+
 def main():
     global PASS, FAIL
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

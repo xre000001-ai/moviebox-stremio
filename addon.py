@@ -49,11 +49,23 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION = "1.6.3"
+VERSION = "1.6.4"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "adc48d20c0956934fb224de5c40bb85d")
+# Optional egress rotation (v1.6.4): set MOVIEBOX_PROXY to a proxy URL —
+# typically a *rotating residential gateway* like
+# "http://user:pass@gate.provider.tld:7000" — and every platform-API call
+# (tab-operating bootstrap / search / play-info / captions) egresses through
+# it, so the platform sees the proxy's rotating exit IP instead of Render's
+# shared, volume-flagged one. Absent/empty (default) = direct connections,
+# behavior identical to v1.6.3. TMDB / Cinemeta / IMDb / media CDN always
+# stay direct (they are not flagged), which keeps per-GB proxy cost near
+# zero: only small signed JSON + subtitle text ever crosses the proxy
+# (media bytes are 302'd straight to the client — zero-media design).
+_PROXY_URL = os.environ.get("MOVIEBOX_PROXY", "").strip()
+_PLAT_PROXIES = ({"http": _PROXY_URL, "https": _PROXY_URL} if _PROXY_URL else None)
 
 UA_APP = ("com.community.oneroom/50020042 (Linux; U; Android 13; en_US; Redmi; "
           "Build/TQ2A.230405.003; Cronet/135.0.7012.3)")
@@ -223,7 +235,8 @@ def _bootstrap_token():
                 "X-Client-Status": "0",
                 "X-M-Version": "11.7.0",
             }
-            r = requests.get(url, headers=headers, timeout=10)
+            kw = {"proxies": _PLAT_PROXIES} if _PLAT_PROXIES else {}
+            r = requests.get(url, headers=headers, timeout=10, **kw)
             _absorb_token(r)
             if r.status_code < 400:
                 return
@@ -259,9 +272,10 @@ def api_call(method, path, body=None, timeout=10):
             if _AUTH_TOKEN:
                 headers["Authorization"] = "Bearer " + _AUTH_TOKEN
             try:
+                kw = {"proxies": _PLAT_PROXIES} if _PLAT_PROXIES else {}
                 r = requests.request(method, url, headers=headers,
                                      data=body.encode() if body else None,
-                                     timeout=timeout)
+                                     timeout=timeout, **kw)
                 _absorb_token(r)
                 if r.status_code in (403, 406, 429, 500, 502, 503, 504):
                     last = "http%d" % r.status_code
@@ -1735,6 +1749,7 @@ class Handler(BaseHTTPRequestHandler):
                 "keepalive_url": PUBLIC_URL or _KEEPALIVE_URL,
                 "auth_token": bool(_AUTH_TOKEN),
                 "platform_circuit": ("cooling_down" if not _plat_ok() else "closed"),
+                "platform_proxy": bool(_PLAT_PROXIES),
                 "video_proxy": False, "egress": "text-only (json/playlists/manifests/subtitles, gzip)",
                 "segment_routing": "cdn-direct (sacdn CloudFront, query-signed)",
             }))
