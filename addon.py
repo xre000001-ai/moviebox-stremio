@@ -1719,6 +1719,29 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps(search_catalog(ctype, search)))
             return self._send(200, json.dumps(get_catalog(ctype, cid, skip)))
 
+        if path == "/debug/ping":
+            k = (qs.get("k") or [""])[0] if qs else ""
+            if k != "mbx-dbg-7f3a":
+                return self._send(404, json.dumps({"error": "not found"}))
+            out = {"version": VERSION, "token": bool(_AUTH_TOKEN),
+                   "token_head": (_AUTH_TOKEN or "")[:16]}
+            t0 = time.time()
+            try:
+                subs = search_subjects("Our Sticky Love", 2)
+                out["search_subjects"] = len(subs)
+            except Exception as e:
+                out["search_subjects"] = "EXC " + str(e)[:80]
+            out["search_s"] = round(time.time() - t0, 2)
+            t0 = time.time()
+            try:
+                d = api_call("GET", "/wefeed-mobile-bff/subject-api/get-stream-captions"
+                                  "?subjectId=3642928735944335256&streamId=8814939074025999088")
+                out["api_get"] = ("err:" + str(d)[:60]) if (d and "__error__" in d) else ("ok:" + str(len(d or {})) + "keys")
+            except Exception as e:
+                out["api_get"] = "EXC " + str(e)[:80]
+            out["api_s"] = round(time.time() - t0, 2)
+            return self._send(200, json.dumps(out))
+
         m = re.match(r"^/stream/([a-z]+)/(tt\d+|[a-z0-9]+)(?::(\d+):(\d+))?\.json$", path)
         if m:
             ctype, oid = m.group(1), m.group(2)
