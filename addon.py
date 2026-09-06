@@ -49,7 +49,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION = "1.6.2"
+VERSION = "1.6.3"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -156,6 +156,28 @@ def _client_info():
 _AUTH_TOKEN = None
 _AUTH_LOCK = threading.RLock()
 _AUTH_REAUTH_TS = 0.0          # last forced re-auth (throttle: 1 per 30s)
+
+# platform circuit breaker: the API aggressively flags IPs by volume
+# (403 "Service not available" -> 401 AUTH_FAIL cascades). When calls keep
+# failing we go QUIET for 5 minutes so the flag decays; hammering makes
+# every endpoint fail harder, including token issuance.
+_PLAT_FAILS = 0
+_PLAT_CB_UNTIL = 0.0
+_PLAT_LOCK = threading.Lock()
+
+def _plat_ok():
+    return time.time() >= _PLAT_CB_UNTIL
+
+def _note_plat(ok):
+    global _PLAT_FAILS, _PLAT_CB_UNTIL
+    with _PLAT_LOCK:
+        if ok:
+            _PLAT_FAILS = 0
+            return
+        _PLAT_FAILS += 1
+        if _PLAT_FAILS >= 4:
+            _PLAT_CB_UNTIL = time.time() + 300   # 5 min of silence
+            _PLAT_FAILS = 0
 _AUTH_ERR_RE = re.compile(r"token|auth|login|expire|sign", re.I)
 
 def _force_reauth():
@@ -185,8 +207,10 @@ def _absorb_token(resp):
 
 def _bootstrap_token():
     """Anonymous auth token via tab-operating (x-user response header)."""
+    if not _plat_ok():
+        return
     try:
-        for base in API_HOSTS:
+        for base in API_HOSTS[:2]:
             url = base + "/wefeed-mobile-bff/tab-operating?page=1&tabId=0&version="
             ts = int(time.time() * 1000)
             headers = {
@@ -210,6 +234,8 @@ def api_call(method, path, body=None, timeout=10):
     """Signed platform call with host rotation + 1 retry. Returns dict|None.
     None => transient failure (never cached by callers)."""
     global _AUTH_TOKEN
+    if not _plat_ok():
+        return None                    # circuit breaker: stay quiet, let the IP cool
     if not _AUTH_TOKEN and not path.startswith("/wefeed-mobile-bff/tab-operating"):
         with _AUTH_LOCK:
             if not _AUTH_TOKEN:
@@ -243,21 +269,25 @@ def api_call(method, path, body=None, timeout=10):
                 try:
                     d = r.json()
                 except Exception:
+                    _note_plat(False)
                     return None  # transient garbage
                 if d.get("code") == 0:
+                    _note_plat(True)
                     return d.get("data") or {}
                 msg = str(d.get("message") or d.get("reason") or "api")
                 # server-side token expiry ("Token is invalid") self-heals:
                 # drop the stale token, bootstrap a fresh one, retry
                 if _AUTH_TOKEN and _AUTH_ERR_RE.search(msg) and _force_reauth():
                     continue          # same call again, now with a fresh token
-                # definitive API-level error
+                # definitive API-level error (bad id, not found, ...) — the
+                # service answered, so this is not an IP-health problem
                 return {"__error__": msg}
             except requests.RequestException as e:
                 last = type(e).__name__
                 continue
         if attempt == 1:
             time.sleep(0.4)
+    _note_plat(False)
     return None
 
 # --------------------------------------------------------------------------
@@ -1360,6 +1390,7 @@ def build_streams(ctype, imdb, se, ep, _prewarm_next=True):
     stype = 1 if ctype == "movie" else 2
     subs = _cached_search(title, stype)
     if not subs:
+        _cache_put(_STREAM_CACHE, key, [], 300)   # 5 min: don't hammer when failing
         return {"streams": []}
     matched = match_subjects(subs, title, year, stype, season=se)
     if not matched:
@@ -1442,9 +1473,22 @@ def build_streams(ctype, imdb, se, ep, _prewarm_next=True):
             _spawn_warm(entries, se, ep, ctype)
     return {"streams": streams}
 
+_WARM_TS = [0.0]                  # last prewarm batch (module-level, mutable)
+
 def _spawn_warm(entries, se, ep, ctype):
+    """Background prewarm of the next episode — heavily throttled: one batch
+    per 10 minutes and never while the platform breaker is open (prewarm is
+    the biggest source of platform call volume on a busy instance)."""
+    if not _plat_ok():
+        return
+    now = time.time()
+    if now - _WARM_TS[0] < 600:
+        return
+    _WARM_TS[0] = now
     def _w():
         for sid, _ in entries[:8]:
+            if not _plat_ok():
+                return
             try:
                 _warm_one(sid, se, ep, ctype)
             except Exception:
