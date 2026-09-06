@@ -49,7 +49,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION = "1.6.7"
+VERSION = "1.6.8"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -76,10 +76,79 @@ _PROXY_URL = os.environ.get("MOVIEBOX_PROXY", "").strip()
 _PLAT_PROXIES = ({"http": _PROXY_URL, "https": _PROXY_URL} if _PROXY_URL else None)
 _PROXY_POOL = len(_PROXY_URLS) > 1
 
+# v1.6.8: auto-refreshed FREE proxy pool — no signup, no key, no bandwidth
+# cap. MOVIEBOX_PROXY_SOURCE is a public plain-text list URL (default:
+# ProxyScrape v4, ~1800 mixed-protocol proxies the provider refreshes
+# continuously). A daemon thread re-fetches it every 10 min, samples the
+# http:// entries (socks entries are skipped — no PySocks dependency),
+# probes CONNECT-aliveness in parallel and caches up to 12 alive URLs.
+# Free proxies are untrusted intermediaries; platform calls are read-only
+# catalog fetches and the anonymous token re-bootstraps on failure, which
+# bounds the blast radius of a hostile exit.
+_FREE_POOL_SRC = os.environ.get(
+    "MOVIEBOX_PROXY_SOURCE",
+    "https://api.proxyscrape.com/v4/free-proxy-list/get"
+    "?request=display_proxies&proxy_format=protocolipport&format=text",
+).strip()
+_FREE_POOL = [[]]                   # alive free proxies (auto-refreshed)
+_FREE_POOL_TS = [0.0]               # last refresh start (throttle: 10 min)
+_FREE_POOL_LOCK = threading.Lock()
+_FREE_POOL_ON = [False]             # enabled only when run as a server
+
+def _pool_all():
+    """Merged fallback pool: env MOVIEBOX_PROXY_LIST URLs first, then the
+    auto-refreshed free pool (deduped)."""
+    seen, out = set(), []
+    for u in list(_PROXY_URLS) + list(_FREE_POOL[0]):
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
 def _pool_pick():
     """Random pool URL as a requests proxies= dict (fresh exit IP per call)."""
-    u = random.choice(_PROXY_URLS)
+    u = random.choice(_pool_all() or ["http://127.0.0.1:9"])
     return {"http": u, "https": u}
+
+def _free_pool_refresh():
+    """Fetch the public list, sample http:// entries, probe, cache alive."""
+    now = time.time()
+    if (not _FREE_POOL_SRC) or (now - _FREE_POOL_TS[0] < 600):
+        return
+    _FREE_POOL_TS[0] = now
+    try:
+        r = requests.get(_FREE_POOL_SRC, timeout=20)
+        cand = [u.strip() for u in r.text.replace("\r", "").splitlines()
+                if u.strip().startswith("http://")]
+        cand = random.sample(cand, min(60, len(cand))) if cand else []
+
+        def _probe(u):
+            try:
+                rr = requests.head("https://www.gstatic.com/generate_204",
+                                   proxies={"http": u, "https": u}, timeout=4)
+                if rr.status_code in (200, 204):
+                    return u
+            except Exception:
+                pass
+            return None
+
+        alive = []
+        with ThreadPoolExecutor(max_workers=20) as ex:
+            for u in ex.map(_probe, cand):
+                if u and u not in alive:
+                    alive.append(u)
+        with _FREE_POOL_LOCK:
+            _FREE_POOL[0] = alive[:12]
+    except Exception:
+        pass                            # keep the previous pool; retry next cycle
+
+def _free_pool_loop():
+    while True:
+        try:
+            _free_pool_refresh()
+        except Exception:
+            pass
+        time.sleep(300)
 # Scrape.do egress fallback (v1.6.5): platform calls go DIRECT first; on the
 # IP-flag signature (HTTP 403/406) the endpoint family is re-routed through
 # Scrape.do's rotating residential exits for 30 minutes, after which direct
@@ -103,8 +172,9 @@ def _sd_family(path):
     return "/" + "/".join(seg[:3]) if len(seg) >= 3 else "/" + "/".join(seg)
 
 def _sd_forced(path):
-    if not _SCRAPEDO_TOKEN:
-        return False
+    # v1.6.8: the family flag now routes through the proxy pool too (free
+    # pool first, scrape.do only if no pool), so it no longer requires
+    # SCRAPEDO_TOKEN to be set.
     fam = _sd_family(path)
     with _SD_LOCK:
         until = _SD_FALLBACK.get(fam)
@@ -303,12 +373,16 @@ def _bootstrap_token():
     """Anonymous auth token via tab-operating (x-user response header)."""
     if not _plat_ok():
         return
+    if _FREE_POOL_ON[0] and not _pool_all():
+        _free_pool_refresh()      # cold start: build the free pool now
     try:
-        # pool mode: the proxy IS the egress, so rotate pool picks
-        # (up to 4) instead of rotating (irrelevant) platform hosts
-        attempts = ["pool"] * min(4, len(_PROXY_URLS)) if _PROXY_POOL else API_HOSTS[:2]
-        for kind in attempts:
-            url = API_HOSTS[0] + "/wefeed-mobile-bff/tab-operating?page=1&tabId=0&version="
+        # direct first; if no direct attempt yields a token, rotate pool
+        # exits (up to 4 picks — free proxies are often dead). On an
+        # IP-flagged host the pool is what actually yields the token.
+        attempts = ([("direct", b) for b in API_HOSTS[:2]] +
+                    ([("pool", None)] * 4 if _pool_all() else []))
+        for kind, pbase in attempts:
+            url = (pbase or API_HOSTS[0]) + "/wefeed-mobile-bff/tab-operating?page=1&tabId=0&version="
             ts = int(time.time() * 1000)
             headers = {
                 "User-Agent": UA_APP,
@@ -343,10 +417,17 @@ def api_call(method, path, body=None, timeout=10):
             if not _AUTH_TOKEN:
                 _bootstrap_token()
     last = None
-    sd_entry = _sd_forced(path)
-    via_pool = _PROXY_POOL and not path.startswith("/wefeed-mobile-bff/tab-operating")
+    # v1.6.8 fallback-only egress: calls go DIRECT first. On the IP-flag
+    # signature (403/406) the endpoint family is re-routed through the
+    # rotating proxy pool (env MOVIEBOX_PROXY_LIST + the auto-refreshed
+    # free pool) when available, else scrape.do, for 30 minutes — after
+    # which direct is probed again. tab-operating always stays direct
+    # (its auth token arrives in a response header proxies must not touch).
+    fb = None
+    if _sd_forced(path):
+        fb = "pool" if _pool_all() else ("sd" if _SCRAPEDO_TOKEN else None)
     for attempt in (1, 2):
-        for base in (API_HOSTS[:1] if sd_entry else API_HOSTS):
+        for base in (API_HOSTS[:1] if fb == "sd" else API_HOSTS):
             url = base + path
             ts = int(time.time() * 1000)
             headers = {
@@ -363,9 +444,9 @@ def api_call(method, path, body=None, timeout=10):
             if _AUTH_TOKEN:
                 headers["Authorization"] = "Bearer " + _AUTH_TOKEN
             try:
-                if sd_entry or _sd_forced(path):
+                if fb == "sd":
                     r = _sd_fetch(method, url, headers, body)
-                elif via_pool:
+                elif fb == "pool":
                     r = requests.request(method, url, headers=headers,
                                          data=body.encode() if body else None,
                                          timeout=timeout, proxies=_pool_pick())
@@ -375,18 +456,28 @@ def api_call(method, path, body=None, timeout=10):
                                          data=body.encode() if body else None,
                                          timeout=timeout, **kw)
                     _absorb_token(r)
-                    if (r.status_code in (403, 406) and _SCRAPEDO_TOKEN
+                    if (r.status_code in (403, 406) and fb is None
                             and not path.startswith("/wefeed-mobile-bff/tab-operating")):
-                        # IP-flag signature on our egress: route this endpoint
-                        # family through scrape.do for 30 min, retry now
-                        _sd_mark(path)
-                        sd_entry = True
-                        r = _sd_fetch(method, url, headers, body)
+                        # IP-flag signature on our direct egress: route this
+                        # endpoint family through the fallback for 30 min and
+                        # retry the call immediately — free pool preferred,
+                        # scrape.do when no pool is available.
+                        if _pool_all():
+                            fb = "pool"
+                        elif _SCRAPEDO_TOKEN:
+                            fb = "sd"
+                        if fb:
+                            _sd_mark(path)
+                            r = (_sd_fetch(method, url, headers, body) if fb == "sd"
+                                 else requests.request(
+                                     method, url, headers=headers,
+                                     data=body.encode() if body else None,
+                                     timeout=timeout, proxies=_pool_pick()))
                 if r.status_code in (403, 406, 429, 500, 502, 503, 504):
                     last = "http%d" % r.status_code
-                    if sd_entry:
+                    if fb == "sd":
                         break   # scrape.do transport trouble: host rotation gains nothing
-                    continue
+                    continue    # pool: next iteration picks a fresh exit IP
                 try:
                     d = r.json()
                 except Exception:
@@ -405,7 +496,7 @@ def api_call(method, path, body=None, timeout=10):
                 return {"__error__": msg}
             except requests.RequestException as e:
                 last = type(e).__name__
-                if sd_entry:
+                if fb == "sd":
                     break
                 continue    # pool mode: next iteration picks a fresh exit IP
         if attempt == 1:
@@ -1604,7 +1695,7 @@ def _spawn_warm(entries, se, ep, ctype):
     the biggest source of platform call volume on a busy instance)."""
     if not _plat_ok():
         return
-    if _PROXY_POOL or ((_SCRAPEDO_TOKEN or _PLAT_PROXIES) and _sd_forced("/wefeed-mobile-bff/subject-api/search/v2")):
+    if _sd_forced("/wefeed-mobile-bff/subject-api/search/v2") and (_pool_all() or _SCRAPEDO_TOKEN or _PLAT_PROXIES):
         return  # credit conservation: no prefetch while ANY proxy egress is active
     now = time.time()
     if now - _WARM_TS[0] < 600:
@@ -1860,7 +1951,9 @@ class Handler(BaseHTTPRequestHandler):
                 "keepalive_url": PUBLIC_URL or _KEEPALIVE_URL,
                 "auth_token": bool(_AUTH_TOKEN),
                 "platform_circuit": ("cooling_down" if not _plat_ok() else "closed"),
-                "platform_proxy": (("pool(%d)" % len(_PROXY_URLS)) if _PROXY_POOL else bool(_PLAT_PROXIES)),
+                "platform_proxy": ("pool(%d env+%d free)" % (len(_PROXY_URLS), len(_FREE_POOL[0]))
+                                 if _pool_all() else bool(_PLAT_PROXIES)),
+                "free_pool": len(_FREE_POOL[0]),
                 "scrape_do": bool(_SCRAPEDO_TOKEN),
                 "scrape_do_credits": _SD_CREDITS[0],
                 "video_proxy": False, "egress": "text-only (json/playlists/manifests/subtitles, gzip)",
@@ -2021,6 +2114,8 @@ def _keepalive_loop():
         time.sleep(240)
 
 def main():
+    _FREE_POOL_ON[0] = True
+    threading.Thread(target=_free_pool_loop, daemon=True).start()
     if PUBLIC_URL:
         threading.Thread(target=_keepalive_loop, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)

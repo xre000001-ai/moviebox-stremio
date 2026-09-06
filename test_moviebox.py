@@ -1483,16 +1483,24 @@ def test_pool_parsing():
     assert addon._PROXY_POOL is False
 
 def test_api_call_rotates_proxy_on_pool_failure():
+    # v1.6.8: direct first; on the 403 IP-flag the pool engages and rotates
+    # exits until one answers.
     addon._PLAT_CB_UNTIL = 0.0
     addon._PLAT_FAILS = 0
     saved_pool, saved_urls = addon._PROXY_POOL, list(addon._PROXY_URLS)
     try:
         addon._PROXY_POOL = True
         addon._PROXY_URLS = ["http://p1:1", "http://p2:2"]
+        addon._SD_FALLBACK.clear()
         picks = []
         def fake_request(method, url, **kw):
             px = kw.get("proxies") or {}
             picks.append(px.get("http"))
+            if px.get("http") is None:
+                resp = mock.Mock(status_code=403)      # direct egress IP-flagged
+                resp.headers = {}
+                resp.json = lambda: {}
+                return resp
             if px.get("http") == "http://p1:1":
                 raise addon.requests.ConnectionError("p1 dead")
             resp = mock.Mock(status_code=200)
@@ -1507,13 +1515,16 @@ def test_api_call_rotates_proxy_on_pool_failure():
             addon._AUTH_TOKEN = "tok"
             d = addon.api_call("POST", "/wefeed-mobile-bff/subject-api/search/v2", "{}")
         assert d == {"x": 9}
-        assert picks == ["http://p1:1", "http://p2:2"]   # died on p1, rotated, won on p2
+        assert picks == [None, "http://p1:1", "http://p2:2"]  # direct 403 -> pool: died on p1, won on p2
     finally:
         addon._PROXY_POOL = saved_pool
         addon._PROXY_URLS = saved_urls
+        addon._SD_FALLBACK.clear()
         addon._PLAT_FAILS = 0
 
 def test_bootstrap_uses_pool():
+    # v1.6.8: direct attempts first (IP-flagged here -> 403), then pool
+    # rotation (p1 403 -> p2 ok).
     addon._PLAT_CB_UNTIL = 0.0
     addon._PLAT_FAILS = 0
     saved_pool, saved_urls = addon._PROXY_POOL, list(addon._PROXY_URLS)
@@ -1524,7 +1535,7 @@ def test_bootstrap_uses_pool():
         def fake_get(url, **kw):
             px = kw.get("proxies") or {}
             picked.append(px.get("http"))
-            resp = mock.Mock(status_code=403 if px.get("http") == "http://p1:1" else 200)
+            resp = mock.Mock(status_code=403 if (px.get("http") in (None, "http://p1:1")) else 200)
             resp.headers = {}
             return resp
         with mock.patch.object(addon, "_pool_pick",
@@ -1533,16 +1544,20 @@ def test_bootstrap_uses_pool():
              mock.patch.object(addon.requests, "get", side_effect=fake_get):
             addon._AUTH_TOKEN = None
             addon._bootstrap_token()
-        assert picked == ["http://p1:1", "http://p2:2"]  # rotated past the 403
+        assert picked == [None, None, "http://p1:1", "http://p2:2"]  # 2 direct hosts, then pool rotation
     finally:
         addon._PROXY_POOL = saved_pool
         addon._PROXY_URLS = saved_urls
 
 def test_warm_skipped_while_pool_active():
+    # v1.6.8: pool is fallback-only, so warm is skipped only while the
+    # search family is flagged (warm calls would ride the pool).
     saved_pool, saved_urls = addon._PROXY_POOL, list(addon._PROXY_URLS)
     try:
         addon._PROXY_POOL = True
         addon._PROXY_URLS = ["http://p:1"]
+        addon._SD_FALLBACK.clear()
+        addon._sd_mark(SD_PATH)
         saved = addon._WARM_TS[0]
         addon._WARM_TS[0] = 0.0
         try:
@@ -1550,6 +1565,7 @@ def test_warm_skipped_while_pool_active():
             assert addon._WARM_TS[0] == 0.0    # untouched -> skipped pre-throttle
         finally:
             addon._WARM_TS[0] = saved
+            addon._SD_FALLBACK.clear()
     finally:
         addon._PROXY_POOL = saved_pool
         addon._PROXY_URLS = saved_urls
@@ -1561,6 +1577,102 @@ def main():
         run(t)
     print("\n%d/%d passed" % (PASS, len(tests)))
     sys.exit(0 if FAIL == 0 else 1)
+
+
+# --- v1.6.8: auto-refreshed free proxy pool -------------------------------
+
+def test_free_pool_source_default_and_env():
+    try:
+        os.environ.pop("MOVIEBOX_PROXY_SOURCE", None)
+        importlib.reload(addon)
+        assert "proxyscrape.com" in addon._FREE_POOL_SRC   # public default
+        assert addon._FREE_POOL_SRC.startswith("https://")
+        os.environ["MOVIEBOX_PROXY_SOURCE"] = "https://example.com/list.txt"
+        importlib.reload(addon)
+        assert addon._FREE_POOL_SRC == "https://example.com/list.txt"
+        os.environ["MOVIEBOX_PROXY_SOURCE"] = ""            # disable
+        importlib.reload(addon)
+        assert addon._FREE_POOL_SRC == ""
+    finally:
+        os.environ.pop("MOVIEBOX_PROXY_SOURCE", None)
+        importlib.reload(addon)
+    assert "proxyscrape.com" in addon._FREE_POOL_SRC
+
+def test_free_pool_refresh_probes_and_caches():
+    saved_ts, saved_pool = addon._FREE_POOL_TS[0], list(addon._FREE_POOL[0])
+    try:
+        addon._FREE_POOL_TS[0] = 0.0
+        addon._FREE_POOL[0] = []
+        list_text = ("http://a:1\nsocks5://x:2\nhttp://b:2\nhttp://c:3\r\nhttp://d:4\n")
+        def fake_get(url, **kw):
+            assert url == addon._FREE_POOL_SRC
+            r = mock.Mock(status_code=200)
+            r.text = list_text
+            return r
+        def fake_head(url, **kw):
+            px = kw.get("proxies") or {}
+            u = px.get("http")
+            return mock.Mock(status_code=204 if u in ("http://a:1", "http://c:3") else 502)
+        with mock.patch.object(addon.requests, "get", side_effect=fake_get), \
+             mock.patch.object(addon.requests, "head", side_effect=fake_head):
+            addon._free_pool_refresh()
+        assert sorted(addon._FREE_POOL[0]) == ["http://a:1", "http://c:3"]  # socks skipped, dead dropped
+        # throttled: a second refresh within 10 min must not re-fetch
+        with mock.patch.object(addon.requests, "get", side_effect=AssertionError("re-fetched")):
+            addon._free_pool_refresh()
+    finally:
+        addon._FREE_POOL_TS[0] = saved_ts
+        addon._FREE_POOL[0] = saved_pool
+
+def test_api_call_falls_back_to_free_pool():
+    # free pool only (no env pool): direct 403 -> free-pool retry succeeds
+    addon._PLAT_CB_UNTIL = 0.0
+    addon._PLAT_FAILS = 0
+    saved_urls = list(addon._PROXY_URLS)
+    saved_pool = addon._PROXY_POOL
+    saved_fp = list(addon._FREE_POOL[0])
+    try:
+        addon._PROXY_URLS = []
+        addon._PROXY_POOL = False
+        addon._FREE_POOL[0] = ["http://f1:1"]
+        addon._SD_FALLBACK.clear()
+        picks = []
+        def fake_request(method, url, **kw):
+            px = kw.get("proxies") or {}
+            picks.append(px.get("http"))
+            if px.get("http") is None:
+                resp = mock.Mock(status_code=403)   # direct egress IP-flagged
+            else:
+                resp = mock.Mock(status_code=200)   # free proxy works
+            resp.headers = {}
+            resp.json = lambda: {"code": 0, "message": "ok", "data": {"x": 5}}
+            return resp
+        with mock.patch.object(addon, "_bootstrap_token"), \
+             mock.patch.object(addon.requests, "request", side_effect=fake_request):
+            addon._AUTH_TOKEN = "tok"
+            d = addon.api_call("POST", SD_PATH, "{}")
+        assert d == {"x": 5}
+        assert picks[0] is None                     # direct tried first
+        assert picks[1] == "http://f1:1"            # free pool engaged after 403
+        assert addon._sd_forced(SD_PATH)            # family remembered for 30 min
+    finally:
+        addon._PROXY_URLS = saved_urls
+        addon._PROXY_POOL = saved_pool
+        addon._FREE_POOL[0] = saved_fp
+        addon._SD_FALLBACK.clear()
+        addon._PLAT_FAILS = 0
+
+def test_health_reports_free_pool():
+    saved_fp = list(addon._FREE_POOL[0])
+    try:
+        addon._FREE_POOL[0] = ["http://f1:1", "http://f2:2"]
+        c = _http_get("/health")
+        assert c["code"] == 200
+        d = json.loads(c["body"])
+        assert d["free_pool"] == 2
+        assert "free" in d["platform_proxy"] and "2" in d["platform_proxy"]
+    finally:
+        addon._FREE_POOL[0] = saved_fp
 
 if __name__ == "__main__":
     main()
