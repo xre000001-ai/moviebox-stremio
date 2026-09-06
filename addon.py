@@ -49,7 +49,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION = "1.7.1"
+VERSION = "1.7.2"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -838,7 +838,8 @@ def cinemeta(ctype, imdb):
                 mm = re.match(r"^(\d{4})", ri)
                 if mm:
                     year = mm.group(1)
-                val = {"name": name, "year": year}
+                val = {"name": name, "year": year,
+                       "tmdb": str(m.get("moviedb_id") or "")}
                 _cache_put(_CINEMETA_CACHE, (ctype, imdb), val, 12 * 3600)
                 return val
         if r.status_code in (400, 404):
@@ -1778,6 +1779,70 @@ def _lazy_hls(sid, se, ep, file):
         return None
     return hls_media(sess, reps[idx]["id"], kind)
 
+_ALT_CACHE = {}          # (ctype, tmdb_id) -> alternative titles (24h)
+_JUNK_RE = re.compile(r"\b(review|trailer|teaser|recap|explained|full movie|cam)\b", re.I)
+
+def _alt_titles(ctype, tmdb_id):
+    """Latin-script alternative titles from TMDB (localised-name rescue:
+    IMDb calls a show "Back to Work!" while the platform lists it as
+    "See You at Work Tomorrow!")."""
+    tmdb_id = str(tmdb_id or "").strip()
+    if not tmdb_id:
+        return []
+    key = (ctype, tmdb_id)
+    hit, val = _cache_get(_ALT_CACHE, key)
+    if hit:
+        return val
+    try:
+        u = "%s/%s/%s/alternative_titles?api_key=%s" % (
+            "https://api.themoviedb.org/3",
+            "movie" if ctype == "movie" else "tv", tmdb_id, TMDB_API_KEY)
+        d = requests.get(u, timeout=10).json()
+        en, other, seen = [], [], set()
+        for t in (d.get("titles") or d.get("results") or []):
+            ttl = (t.get("title") or t.get("name") or "").strip()
+            if (not ttl or ttl in seen or not ttl.isascii()
+                    or not re.search(r"[a-z]", ttl, re.I)):
+                continue
+            seen.add(ttl)
+            # English-market titles first; romanizations ("Nae-il-do...")
+            # are weak platform-search terms, keep them as last resort
+            (en if (t.get("iso_3166_1") or "").upper() in ("US", "GB", "WW")
+             else other).append(ttl)
+        out = (en + other)[:6]
+    except Exception:
+        out = []
+    _cache_put(_ALT_CACHE, key, out, 24 * 3600)
+    return out
+
+def _ftokens(t):
+    """Punctuation-free token set ("Tomorrow's Work!" -> {tomorrow, s, work})
+    — punctuation would otherwise break token equality."""
+    return set(re.findall(r"[a-z0-9]+", clean_title(t or "").lower()))
+
+def _fuzzy_match(subjects, query, year, subject_type):
+    """Junk-guarded fuzzy match for the alt-title rescue: >=2 shared title
+    tokens, >=50% of the query covered, year within +/-1, and the candidate
+    must not be review/trailer/recap junk."""
+    q = _ftokens(query)
+    hits = []
+    for s in subjects:
+        if int(s.get("subjectType") or 0) != subject_type:
+            continue
+        t = s.get("title") or ""
+        if _JUNK_RE.search(t):
+            continue
+        ctoks = _ftokens(t)
+        shared = {w for w in (q & ctoks) if len(w) > 2}
+        if len(shared) < 2 or len(shared) / max(len(q), 1) < 0.5:
+            continue
+        sy = _year_of(s.get("releaseDate"))
+        if year and sy and abs(int(sy) - int(year)) > 1:
+            continue
+        label = (s.get("corner") or "").strip() or "Original"
+        hits.append((s, label))
+    return hits[:2]
+
 def build_streams(ctype, imdb, se, ep, _prewarm_next=True):
     key = (ctype, imdb, se, ep)
     hit, val = _cache_get(_STREAM_CACHE, key)
@@ -1803,10 +1868,23 @@ def build_streams(ctype, imdb, se, ep, _prewarm_next=True):
     if subs is None:
         # transient egress failure — NOT cached; the player may retry at once
         return {"streams": [], "message": "platform busy — try again"}
-    if not subs:
+    matched = match_subjects(subs, title, year, stype, season=se) if subs else []
+    if not matched:
+        # v1.7.2 localised-name rescue: IMDb/cinemeta and the platform often
+        # use different English names for the same show. Retry the platform
+        # search with TMDB alternative titles and fuzzy-match the answers.
+        for alt in _alt_titles(ctype, meta.get("tmdb")):
+            if not alt or clean_title(alt).lower() == clean_title(title).lower():
+                continue
+            alt_subs = _cached_search(alt, stype)
+            if not alt_subs:
+                continue
+            matched = _fuzzy_match(alt_subs, alt, year, stype)
+            if matched:
+                break
+    if not subs and not matched:
         _cache_put(_STREAM_CACHE, key, [], 600)
         return {"streams": [], "message": "not in platform catalog"}
-    matched = match_subjects(subs, title, year, stype, season=se)
     if not matched:
         _cache_put(_STREAM_CACHE, key, [], 600)
         return {"streams": [], "message": "no matching subject"}

@@ -1958,5 +1958,71 @@ def test_build_streams_transient_message_not_cached():
     finally:
         addon._STREAM_CACHE.clear()
 
+
+# --- v1.7.2: localised-name rescue (alt titles + fuzzy match) ----------------
+
+def test_fuzzy_match_guards():
+    subs = [
+        {"subjectId": "1", "title": "See You at Work Tomorrow! [Hindi]",
+         "subjectType": 2, "releaseDate": "2026-06-22"},
+        {"subjectId": "2", "title": "Demon Slayer: Infinity Castle Review",
+         "subjectType": 1, "releaseDate": "2025-09-13"},
+        {"subjectId": "3", "title": "Back to the Future",
+         "subjectType": 2, "releaseDate": "1985-07-03"},
+        {"subjectId": "4", "title": "Work Tomorrow Something Else Entirely Okay",
+         "subjectType": 2, "releaseDate": "2019-01-01"},   # 50% overlap but wrong year
+    ]
+    hits = addon._fuzzy_match(subs, "Going to Work Tomorrow", "2026", 2)
+    assert [h[0]["subjectId"] for h in hits] == ["1"]   # junk + weak-overlap + wrong-year rejected
+    # no year info on the query side: only tokens guard
+    hits2 = addon._fuzzy_match(subs, "Going to Work Tomorrow", "", 2)
+    assert {h[0]["subjectId"] for h in hits2} == {"1", "4"}
+
+def test_alt_titles_fetch_and_cache():
+    addon._ALT_CACHE.clear()
+    try:
+        def fake_get(url, **kw):
+            assert "alternative_titles" in url
+            r = mock.Mock(status_code=200)
+            r.json = lambda: {"titles": [
+                {"title": "See You at Work Tomorrow!", "type": "alternative"},
+                {"title": "李小姐明天也要上班", "type": "other"},      # non-latin: dropped
+                {"title": "Going to Work Tomorrow", "type": "working title"},
+                {"title": "", "type": "x"},
+            ]}
+            return r
+        with mock.patch.object(addon.requests, "get", side_effect=fake_get):
+            alts = addon._alt_titles("series", "289763")
+        assert alts == ["See You at Work Tomorrow!", "Going to Work Tomorrow"]
+        assert addon._alt_titles("series", "289763") == alts   # served from cache
+        assert addon._alt_titles("series", "") == []           # no tmdb id: skip
+    finally:
+        addon._ALT_CACHE.clear()
+
+def test_build_streams_alt_title_rescue():
+    addon._STREAM_CACHE.clear()
+    addon._SEARCH_CACHE.clear()
+    sub = {"subjectId": "777", "title": "See You at Work Tomorrow! [Hindi]",
+           "subjectType": 2, "releaseDate": "2026-06-22", "corner": "Hindi"}
+    try:
+        with mock.patch.object(addon, "cinemeta",
+                               return_value={"name": "Back to Work!", "year": "2026",
+                                             "tmdb": "289763"}), \
+             mock.patch.object(addon, "_cached_search",
+                               side_effect=[[], [sub]]), \
+             mock.patch.object(addon, "_alt_titles",
+                               return_value=["Going to Work Tomorrow"]), \
+             mock.patch.object(addon, "_cached_dubs", return_value=[]), \
+             mock.patch.object(addon, "_cached_play", return_value=None), \
+             mock.patch.object(addon, "fetch_captions", return_value=[]), \
+             mock.patch.object(addon, "_resolve_entry",
+                               side_effect=lambda *a, **k: [{"name": "card", "url": "u"}]):
+            r = addon.build_streams("series", "tt38960812", 1, 1, _prewarm_next=False)
+        assert len(r["streams"]) == 1          # rescued via the alt title
+        assert "message" not in r
+    finally:
+        addon._STREAM_CACHE.clear()
+        addon._SEARCH_CACHE.clear()
+
 if __name__ == "__main__":
     main()
