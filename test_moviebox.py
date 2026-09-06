@@ -1327,6 +1327,130 @@ def test_bootstrap_uses_proxy_when_configured():
         addon._PLAT_PROXIES = saved_px
         addon._AUTH_TOKEN = saved_tok
 
+# --- v1.6.5: scrape.do egress fallback (SCRAPEDO_TOKEN) ----------------------
+
+SD_PATH = "/wefeed-mobile-bff/subject-api/search/v2"
+
+def test_sd_family_mark_and_expiry():
+    addon._SCRAPEDO_TOKEN = "tok"
+    addon._SD_FALLBACK.clear()
+    try:
+        assert not addon._sd_forced(SD_PATH)
+        addon._sd_mark(SD_PATH)
+        assert addon._sd_forced(SD_PATH)                    # same family
+        assert addon._sd_forced("/wefeed-mobile-bff/subject-api/search")
+        assert not addon._sd_forced("/wefeed-mobile-bff/get-stream-captions?x=1")
+        assert not addon._sd_forced("/wefeed-mobile-bff/tab-operating?page=1")
+        # expired -> not forced, entry dropped
+        addon._SD_FALLBACK[addon._sd_family(SD_PATH)] = time.time() - 1
+        assert not addon._sd_forced(SD_PATH)
+        assert addon._SD_FALLBACK == {}
+    finally:
+        addon._SCRAPEDO_TOKEN = ""
+        addon._SD_FALLBACK.clear()
+
+def test_api_call_via_scrapedo_when_forced():
+    addon._PLAT_CB_UNTIL = 0.0
+    addon._PLAT_FAILS = 0
+    calls = []
+    def fake_request(method, url, **kw):
+        calls.append(url)
+        if "api.scrape.do" in url:
+            assert kw.get("params", {}).get("token") == "tok"
+            assert kw.get("params", {}).get("customHeaders") == "true"
+            resp = mock.Mock(status_code=200)
+            resp.headers = {}
+            resp.json = lambda: {"code": 0, "message": "ok", "data": {"x": 9}}
+            return resp
+        raise AssertionError("direct platform call made while scrape.do forced")
+    saved_tok, saved_fb = addon._SCRAPEDO_TOKEN, dict(addon._SD_FALLBACK)
+    try:
+        addon._SCRAPEDO_TOKEN = "tok"
+        addon._SD_FALLBACK.clear()
+        addon._sd_mark(SD_PATH)
+        with mock.patch.object(addon, "_bootstrap_token"), \
+             mock.patch.object(addon.requests, "request", side_effect=fake_request):
+            addon._AUTH_TOKEN = "tok"
+            d = addon.api_call("POST", SD_PATH, "{}")
+        assert d == {"x": 9}
+        assert calls and all("api.scrape.do" in u for u in calls)
+    finally:
+        addon._SCRAPEDO_TOKEN = saved_tok
+        addon._SD_FALLBACK.clear()
+        addon._SD_FALLBACK.update(saved_fb)
+
+def test_api_call_direct_403_falls_back_to_scrapedo():
+    addon._PLAT_CB_UNTIL = 0.0
+    addon._PLAT_FAILS = 0
+    seq = []
+    def fake_request(method, url, **kw):
+        seq.append(url)
+        if "api.scrape.do" in url:
+            resp = mock.Mock(status_code=200)
+            resp.headers = {}
+            resp.json = lambda: {"code": 0, "message": "ok", "data": {"ok": 1}}
+            return resp
+        resp = mock.Mock(status_code=403)
+        resp.headers = {}
+        return resp
+    saved_tok = addon._SCRAPEDO_TOKEN
+    try:
+        addon._SCRAPEDO_TOKEN = "tok"
+        addon._SD_FALLBACK.clear()
+        with mock.patch.object(addon, "_bootstrap_token"), \
+             mock.patch.object(addon.requests, "request", side_effect=fake_request):
+            addon._AUTH_TOKEN = "tok"
+            d = addon.api_call("POST", SD_PATH, "{}")
+        assert d == {"ok": 1}
+        assert any("api.scrape.do" in u for u in seq)
+        assert any("aoneroom" in u for u in seq)       # direct was tried first
+        assert addon._sd_forced(SD_PATH)               # family remembered
+    finally:
+        addon._SCRAPEDO_TOKEN = saved_tok
+        addon._SD_FALLBACK.clear()
+
+def test_scrapedo_not_used_for_tab_operating():
+    addon._PLAT_CB_UNTIL = 0.0
+    addon._PLAT_FAILS = 0
+    seq = []
+    def fake_request(method, url, **kw):
+        seq.append(url)
+        resp = mock.Mock(status_code=403)
+        resp.headers = {}
+        return resp
+    saved_tok = addon._SCRAPEDO_TOKEN
+    try:
+        addon._SCRAPEDO_TOKEN = "tok"
+        addon._SD_FALLBACK.clear()
+        with mock.patch.object(addon, "_bootstrap_token"), \
+             mock.patch.object(addon.requests, "request", side_effect=fake_request):
+            addon._AUTH_TOKEN = "tok"
+            d = addon.api_call("GET", "/wefeed-mobile-bff/tab-operating?page=1&tabId=0&version=")
+        assert d is None                        # all direct 403s -> transient None
+        assert seq and all("api.scrape.do" not in u for u in seq)
+        assert not addon._sd_forced("/wefeed-mobile-bff/tab-operating?page=1")
+    finally:
+        addon._SCRAPEDO_TOKEN = saved_tok
+        addon._SD_FALLBACK.clear()
+        addon._PLAT_FAILS = 0
+
+def test_warm_skipped_while_search_family_on_scrapedo():
+    saved_tok = addon._SCRAPEDO_TOKEN
+    try:
+        addon._SCRAPEDO_TOKEN = "tok"
+        addon._SD_FALLBACK.clear()
+        addon._sd_mark(SD_PATH)
+        saved = addon._WARM_TS[0]
+        addon._WARM_TS[0] = 0.0
+        try:
+            addon._spawn_warm([], None, None, "movie")
+            assert addon._WARM_TS[0] == 0.0    # untouched -> skipped pre-throttle
+        finally:
+            addon._WARM_TS[0] = saved
+    finally:
+        addon._SCRAPEDO_TOKEN = saved_tok
+        addon._SD_FALLBACK.clear()
+
 def main():
     global PASS, FAIL
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

@@ -49,7 +49,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION = "1.6.4"
+VERSION = "1.6.5"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -66,6 +66,69 @@ TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "adc48d20c0956934fb224de5c40bb85d"
 # (media bytes are 302'd straight to the client — zero-media design).
 _PROXY_URL = os.environ.get("MOVIEBOX_PROXY", "").strip()
 _PLAT_PROXIES = ({"http": _PROXY_URL, "https": _PROXY_URL} if _PROXY_URL else None)
+# Scrape.do egress fallback (v1.6.5): platform calls go DIRECT first; on the
+# IP-flag signature (HTTP 403/406) the endpoint family is re-routed through
+# Scrape.do's rotating residential exits for 30 minutes, after which direct
+# is probed again — so we automatically return to free egress once the
+# platform's flag on our own IP decays. Scrape.do charges per *successful*
+# request (free tier: 1000/month), therefore:
+#   - tab-operating (bootstrap) is NEVER routed through it: it works direct
+#     and its auth token arrives in a response header scrape.do drops;
+#   - prewarm batches are skipped while the search family rides scrape.do.
+# Verified: platform search rejects datacenter IPs (406) but accepts
+# scrape.do residential exits (code:0), with customHeaders=true forwarding
+# every signed header + POST body.
+_SCRAPEDO_TOKEN = os.environ.get("SCRAPEDO_TOKEN", "").strip()
+_SD_TTL = 1800.0
+_SD_FALLBACK = {}                     # endpoint family -> until-ts
+_SD_LOCK = threading.Lock()
+
+def _sd_family(path):
+    seg = path.split("?")[0].strip("/").split("/")
+    return "/" + "/".join(seg[:3]) if len(seg) >= 3 else "/" + "/".join(seg)
+
+def _sd_forced(path):
+    if not _SCRAPEDO_TOKEN:
+        return False
+    fam = _sd_family(path)
+    with _SD_LOCK:
+        until = _SD_FALLBACK.get(fam)
+        if not until:
+            return False
+        if time.time() >= until:
+            _SD_FALLBACK.pop(fam, None)
+            return False
+    return True
+
+def _sd_mark(path):
+    with _SD_LOCK:
+        _SD_FALLBACK[_sd_family(path)] = time.time() + _SD_TTL
+
+class _SDResp:
+    """Shim so Scrape.do answers flow through the existing api_call logic."""
+    def __init__(self, status_code, payload):
+        self.status_code = status_code
+        self.headers = {}
+        self._payload = payload
+    def json(self):
+        if self._payload is None:
+            raise ValueError("scrape.do: non-json response")
+        return self._payload
+
+def _sd_fetch(method, url, headers, body, timeout=45):
+    """One platform call via Scrape.do (rotating residential egress)."""
+    r = requests.request(method, "https://api.scrape.do/",
+                         params={"token": _SCRAPEDO_TOKEN, "url": url,
+                                 "customHeaders": "true"},
+                         headers=headers,
+                         data=body.encode() if body else None,
+                         timeout=timeout)
+    if r.status_code == 200:
+        try:
+            return _SDResp(200, r.json())
+        except Exception:
+            return _SDResp(502, None)
+    return _SDResp(r.status_code, None)
 
 UA_APP = ("com.community.oneroom/50020042 (Linux; U; Android 13; en_US; Redmi; "
           "Build/TQ2A.230405.003; Cronet/135.0.7012.3)")
@@ -254,8 +317,9 @@ def api_call(method, path, body=None, timeout=10):
             if not _AUTH_TOKEN:
                 _bootstrap_token()
     last = None
+    sd_entry = _sd_forced(path)
     for attempt in (1, 2):
-        for base in API_HOSTS:
+        for base in (API_HOSTS[:1] if sd_entry else API_HOSTS):
             url = base + path
             ts = int(time.time() * 1000)
             headers = {
@@ -272,13 +336,25 @@ def api_call(method, path, body=None, timeout=10):
             if _AUTH_TOKEN:
                 headers["Authorization"] = "Bearer " + _AUTH_TOKEN
             try:
-                kw = {"proxies": _PLAT_PROXIES} if _PLAT_PROXIES else {}
-                r = requests.request(method, url, headers=headers,
-                                     data=body.encode() if body else None,
-                                     timeout=timeout, **kw)
-                _absorb_token(r)
+                if sd_entry or _sd_forced(path):
+                    r = _sd_fetch(method, url, headers, body)
+                else:
+                    kw = {"proxies": _PLAT_PROXIES} if _PLAT_PROXIES else {}
+                    r = requests.request(method, url, headers=headers,
+                                         data=body.encode() if body else None,
+                                         timeout=timeout, **kw)
+                    _absorb_token(r)
+                    if (r.status_code in (403, 406) and _SCRAPEDO_TOKEN
+                            and not path.startswith("/wefeed-mobile-bff/tab-operating")):
+                        # IP-flag signature on our egress: route this endpoint
+                        # family through scrape.do for 30 min, retry now
+                        _sd_mark(path)
+                        sd_entry = True
+                        r = _sd_fetch(method, url, headers, body)
                 if r.status_code in (403, 406, 429, 500, 502, 503, 504):
                     last = "http%d" % r.status_code
+                    if sd_entry:
+                        break   # scrape.do transport trouble: host rotation gains nothing
                     continue
                 try:
                     d = r.json()
@@ -298,6 +374,8 @@ def api_call(method, path, body=None, timeout=10):
                 return {"__error__": msg}
             except requests.RequestException as e:
                 last = type(e).__name__
+                if sd_entry:
+                    break
                 continue
         if attempt == 1:
             time.sleep(0.4)
@@ -1495,6 +1573,8 @@ def _spawn_warm(entries, se, ep, ctype):
     the biggest source of platform call volume on a busy instance)."""
     if not _plat_ok():
         return
+    if _SCRAPEDO_TOKEN and _sd_forced("/wefeed-mobile-bff/subject-api/search/v2"):
+        return  # credit conservation: no prefetch while egress rides scrape.do
     now = time.time()
     if now - _WARM_TS[0] < 600:
         return
@@ -1750,6 +1830,7 @@ class Handler(BaseHTTPRequestHandler):
                 "auth_token": bool(_AUTH_TOKEN),
                 "platform_circuit": ("cooling_down" if not _plat_ok() else "closed"),
                 "platform_proxy": bool(_PLAT_PROXIES),
+                "scrape_do": bool(_SCRAPEDO_TOKEN),
                 "video_proxy": False, "egress": "text-only (json/playlists/manifests/subtitles, gzip)",
                 "segment_routing": "cdn-direct (sacdn CloudFront, query-signed)",
             }))
