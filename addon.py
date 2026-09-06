@@ -1734,6 +1734,7 @@ class Handler(BaseHTTPRequestHandler):
                 "keepalive": bool(PUBLIC_URL or _KEEPALIVE_URL),
                 "keepalive_url": PUBLIC_URL or _KEEPALIVE_URL,
                 "auth_token": bool(_AUTH_TOKEN),
+                "platform_circuit": ("cooling_down" if not _plat_ok() else "closed"),
                 "video_proxy": False, "egress": "text-only (json/playlists/manifests/subtitles, gzip)",
                 "segment_routing": "cdn-direct (sacdn CloudFront, query-signed)",
             }))
