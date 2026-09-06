@@ -49,7 +49,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION = "1.6.9"
+VERSION = "1.6.10"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -149,9 +149,9 @@ def _pool_note(kind):
     if kind == "good":
         with _FREE_POOL_LOCK:
             _POOL_BAD.pop(u, None)
-            _POOL_STICKY[0], _POOL_STICKY[1] = u, now + 90
+            _POOL_STICKY[0], _POOL_STICKY[1] = u, now + 120
         return
-    dur = 600 if kind == "dead" else 900
+    dur = 600 if kind == "dead" else 1800   # blocked exits: 30 min
     with _FREE_POOL_LOCK:
         _POOL_BAD[u] = max(_POOL_BAD.get(u, 0.0), now + dur)
         if _POOL_STICKY[0] == u:
@@ -175,10 +175,24 @@ def _free_pool_refresh():
         cand = random.sample(cand, min(80, len(cand))) if cand else []
 
         def _probe(u):
+            # v1.6.10: probe the PLATFORM itself (light signed tab-operating
+            # GET) — an exit that is CONNECT-alive but platform-blocked
+            # (403/406) is useless to us, so it must not enter the pool.
             try:
-                rr = requests.head("https://www.gstatic.com/generate_204",
-                                   proxies={"http": u, "https": u}, timeout=4)
-                if rr.status_code in (200, 204):
+                purl = API_HOSTS[0] + "/wefeed-mobile-bff/tab-operating?page=1&tabId=0&version="
+                pts = int(time.time() * 1000)
+                rr = requests.get(purl, timeout=5, proxies={"http": u, "https": u},
+                                  headers={
+                                      "User-Agent": UA_APP,
+                                      "Accept": "application/json",
+                                      "Content-Type": "application/json",
+                                      "X-Client-Token": _x_client_token(pts),
+                                      "x-tr-signature": _x_tr_signature("GET", purl, None, pts),
+                                      "X-Client-Info": _client_info(),
+                                      "X-Client-Status": "0",
+                                      "X-M-Version": "11.7.0",
+                                  })
+                if rr.status_code < 400:
                     return u
             except Exception:
                 pass

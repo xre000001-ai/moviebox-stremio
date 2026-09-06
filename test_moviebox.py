@@ -1605,18 +1605,18 @@ def test_free_pool_refresh_probes_and_caches():
         addon._FREE_POOL[0] = []
         list_text = ("http://a:1\nsocks5://x:2\nhttp://b:2\nhttp://c:3\r\nhttp://d:4\n")
         def fake_get(url, **kw):
-            assert url == addon._FREE_POOL_SRC
-            r = mock.Mock(status_code=200)
-            r.text = list_text
-            return r
-        def fake_head(url, **kw):
+            if url == addon._FREE_POOL_SRC:            # list fetch
+                r = mock.Mock(status_code=200)
+                r.text = list_text
+                return r
+            # v1.6.10: platform probe (tab-operating via the candidate)
+            assert "tab-operating" in url
             px = kw.get("proxies") or {}
             u = px.get("http")
-            return mock.Mock(status_code=204 if u in ("http://a:1", "http://c:3") else 502)
-        with mock.patch.object(addon.requests, "get", side_effect=fake_get), \
-             mock.patch.object(addon.requests, "head", side_effect=fake_head):
+            return mock.Mock(status_code=200 if u in ("http://a:1", "http://c:3") else 403)
+        with mock.patch.object(addon.requests, "get", side_effect=fake_get):
             addon._free_pool_refresh()
-        assert sorted(addon._FREE_POOL[0]) == ["http://a:1", "http://c:3"]  # socks skipped, dead dropped
+        assert sorted(addon._FREE_POOL[0]) == ["http://a:1", "http://c:3"]  # socks skipped, platform-blocked dropped
         # throttled: a second refresh within 10 min must not re-fetch
         with mock.patch.object(addon.requests, "get", side_effect=AssertionError("re-fetched")):
             addon._free_pool_refresh()
