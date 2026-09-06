@@ -49,7 +49,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION = "1.6.10"
+VERSION = "1.6.11"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -104,10 +104,14 @@ _POOL_TLS = threading.local()       # per-thread current pool url
 _POOL_REBUILD_TS = [0.0]            # last dry-pool rebuild spawn
 
 def _pool_all():
-    """Merged fallback pool: env MOVIEBOX_PROXY_LIST URLs first, then the
-    auto-refreshed free pool (deduped)."""
+    """Fallback pool: the auto-refreshed FREE pool is PRIMARY (user
+    preference — no bandwidth caps, self-refreshing); env MOVIEBOX_PROXY_LIST
+    URLs are an emergency backup used only while the free pool is empty."""
+    free = [u for u in _FREE_POOL[0] if u]
+    if free:
+        return list(dict.fromkeys(free))
     seen, out = set(), []
-    for u in list(_PROXY_URLS) + list(_FREE_POOL[0]):
+    for u in _PROXY_URLS:
         if u and u not in seen:
             seen.add(u)
             out.append(u)
@@ -1216,7 +1220,11 @@ def hls_master(sess, subs=()):
                          "DEFAULT=NO,AUTOSELECT=YES,LANGUAGE=\"%s\",URI=\"sub-%s.m3u8\""
                          % (nm, lg, lan))
     for v in mpd["video"]:
-        codecs = v["codecs"] + ("," + ",".join(a["codecs"] for a in auds) if auds else "")
+        # hev1 -> hvc1: identical HEVC bitstream tag, but hvc1 is what
+        # Safari/iOS/AVPlayer and strict hls.js builds accept; players that
+        # don't care ignore the difference.
+        vcodecs = v["codecs"].replace("hev1", "hvc1")
+        codecs = vcodecs + ("," + ",".join(a["codecs"] for a in auds) if auds else "")
         res = "%dx%d" % (v["width"], v["height"]) if v.get("width") else str(v["height"])
         extra = ("AUDIO=\"aud\"" if auds else "") + (",SUBTITLES=\"subs\"" if subs else "")
         lines.append("#EXT-X-STREAM-INF:BANDWIDTH=%d,RESOLUTION=%s,CODECS=\"%s\"%s"
@@ -1972,6 +1980,8 @@ _LANDING_HTML = """<!doctype html>
 # --------------------------------------------------------------------------
 # 11. http server — routes, gzip, CORS, cache headers
 # --------------------------------------------------------------------------
+_REQLOG = []          # v1.6.11: last ~300 served requests (player diagnostics)
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "MovieBox/" + VERSION
@@ -1979,11 +1989,27 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print("[%s] %s" % (time.strftime("%H:%M:%S"), fmt % args), flush=True)
 
+    def _log_req(self, code, nbytes):
+        """Record served requests so player-side playback failures can be
+        diagnosed from the outside (/debug/reqlog)."""
+        try:
+            p = (self.path or "")[:160]
+            if not p.startswith(("/health", "/debug")):
+                _REQLOG.append({"t": time.strftime("%H:%M:%S"), "path": p,
+                                "code": code, "ms": int((time.time() - getattr(self, "_t0", time.time())) * 1000),
+                                "ua": (self.headers.get("User-Agent") or "")[:70],
+                                "bytes": nbytes})
+                if len(_REQLOG) > 400:
+                    del _REQLOG[:200]
+        except Exception:
+            pass
+
     def _send(self, code, body, ctype="application/json", extra=None):
         """Text-only responses; gzip when the client allows (keeps Render's
         free-plan egress tiny: playlists/subs/manifests shrink ~5-10x)."""
         if isinstance(body, str):
             body = body.encode()
+        self._log_req(code, len(body))
         if len(body) > 512 and "gzip" in (self.headers.get("Accept-Encoding") or ""):
             buf = io.BytesIO()
             with gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as gz:
@@ -2021,6 +2047,7 @@ class Handler(BaseHTTPRequestHandler):
         return base
 
     def do_GET(self):
+        self._t0 = time.time()
         try:
             self._route()
         except BrokenPipeError:
@@ -2046,7 +2073,8 @@ class Handler(BaseHTTPRequestHandler):
                 "keepalive_url": PUBLIC_URL or _KEEPALIVE_URL,
                 "auth_token": bool(_AUTH_TOKEN),
                 "platform_circuit": ("cooling_down" if not _plat_ok() else "closed"),
-                "platform_proxy": ("pool(%d env+%d free)" % (len(_PROXY_URLS), len(_FREE_POOL[0]))
+                "platform_proxy": ("pool(%d free%s)" % (len(_FREE_POOL[0]),
+                                 ("+%d env" % len(_PROXY_URLS)) if _PROXY_URLS else "")
                                  if _pool_all() else bool(_PLAT_PROXIES)),
                 "free_pool": len(_FREE_POOL[0]),
                 "scrape_do": bool(_SCRAPEDO_TOKEN),
@@ -2079,6 +2107,14 @@ class Handler(BaseHTTPRequestHandler):
             if search:
                 return self._send(200, json.dumps(search_catalog(ctype, search)))
             return self._send(200, json.dumps(get_catalog(ctype, cid, skip)))
+
+        if path == "/debug/reqlog":
+            k = (q.get("k") or [""])[0] if q else ""
+            if k != "mbx-dbg-7f3a":
+                return self._send(404, json.dumps({"error": "not found"}))
+            return self._send(200, json.dumps({"version": VERSION,
+                                               "free_pool": len(_FREE_POOL[0]),
+                                               "entries": _REQLOG[-120:]}))
 
         if path == "/debug/ping":
             k = (q.get("k") or [""])[0] if q else ""

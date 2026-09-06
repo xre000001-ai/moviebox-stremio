@@ -307,7 +307,7 @@ def test_hls_master():
     assert m.startswith("#EXTM3U")
     assert '#EXT-X-MEDIA:TYPE=AUDIO' in m and 'NAME="HIN"' in m
     assert m.count("#EXT-X-STREAM-INF") == 3
-    assert 'CODECS="hev1,mp4a.40.2"' in m
+    assert 'CODECS="hvc1,mp4a.40.2"' in m      # v1.6.11: hev1 rewritten for player compat
     assert 'RESOLUTION=1920x1080' in m and 'RESOLUTION=1280x720' in m
     assert "v0.m3u8" in m and "v2.m3u8" in m and "a0.m3u8" in m
 
@@ -1799,6 +1799,48 @@ def test_transient_negative_cache_heals_fast():
         assert 0 < dexp - time.time() <= 61
         addon._DUB_CACHE["7"] = ([], time.time() - 1)
         assert addon._cached_dubs("7") == [{"subjectId": "9"}]
+
+
+# --- v1.6.11: free-pool primary + hvc1 + reqlog ------------------------------
+
+def test_pool_free_first_precedence():
+    # free pool is PRIMARY; env MOVIEBOX_PROXY_LIST only when free is empty
+    saved_urls, saved_fp = list(addon._PROXY_URLS), list(addon._FREE_POOL[0])
+    try:
+        addon._PROXY_URLS = ["http://env1:1", "http://env2:2"]
+        addon._FREE_POOL[0] = ["http://f1:1", "http://f2:2"]
+        assert addon._pool_all() == ["http://f1:1", "http://f2:2"]   # free only
+        addon._FREE_POOL[0] = []
+        assert addon._pool_all() == ["http://env1:1", "http://env2:2"]  # backup
+        addon._PROXY_URLS = []
+        assert addon._pool_all() == []
+    finally:
+        addon._PROXY_URLS = saved_urls
+        addon._FREE_POOL[0] = saved_fp
+
+def test_master_codecs_hvc1():
+    sess = {"mpd": {"video": [{"id": "0", "height": 480, "width": 854,
+                               "bw": 350000, "codecs": "hev1.1.6.L93.B0"}],
+                    "audio": [{"lang": "hin", "bw": 64000, "codecs": "mp4a.40.2"}]}}
+    m = addon.hls_master(sess, ("en",))
+    assert "hvc1.1.6.L93.B0" in m
+    assert "hev1" not in m
+    assert 'CODECS="hvc1.1.6.L93.B0,mp4a.40.2"' in m
+    assert 'URI="a0.m3u8"' in m and "sub-en.m3u8" in m
+
+def test_reqlog_records_served_requests():
+    saved = list(addon._REQLOG)
+    addon._REQLOG.clear()
+    try:
+        c = _http_get("/manifest.json")
+        assert c["code"] == 200
+        assert _http_get("/health")["code"] == 200
+        ent = [e for e in addon._REQLOG if e["path"] == "/manifest.json"]
+        assert ent and ent[0]["code"] == 200 and ent[0]["bytes"] > 0
+        assert not any(e["path"].startswith("/health") for e in addon._REQLOG)
+    finally:
+        del addon._REQLOG[:]
+        addon._REQLOG.extend(saved)
 
 if __name__ == "__main__":
     main()
