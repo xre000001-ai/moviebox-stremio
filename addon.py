@@ -1725,6 +1725,30 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(404, json.dumps({"error": "not found"}))
             out = {"version": VERSION, "token": bool(_AUTH_TOKEN),
                    "token_head": (_AUTH_TOKEN or "")[:16]}
+            # per-host tab-operating: status + x-user presence (with & without XFF)
+            hosts = []
+            for base in API_HOSTS:
+                for xff in (False, True):
+                    url = base + "/wefeed-mobile-bff/tab-operating?page=1&tabId=0&version="
+                    ts = int(time.time() * 1000)
+                    hd = {"User-Agent": UA_APP, "Accept": "application/json",
+                          "Content-Type": "application/json",
+                          "X-Client-Token": _x_client_token(ts),
+                          "x-tr-signature": _x_tr_signature("GET", url, None, ts),
+                          "X-Client-Info": json.dumps(_client_info()),
+                          "X-Client-Status": "0", "X-M-Version": "11.7.0"}
+                    if xff:
+                        hd["X-Forwarded-For"] = "103.241.224.%d" % random.randint(1, 254)
+                    try:
+                        r = requests.get(url, headers=hd, timeout=8)
+                        hosts.append({"h": base.split("//")[1][:14], "xff": xff,
+                                      "s": r.status_code,
+                                      "tok": bool(r.headers.get("x-user")),
+                                      "b": r.text[:40]})
+                    except Exception as e:
+                        hosts.append({"h": base.split("//")[1][:14], "xff": xff,
+                                      "s": type(e).__name__})
+            out["tab_hosts"] = hosts
             t0 = time.time()
             try:
                 subs = search_subjects("Our Sticky Love", 2)
@@ -1732,14 +1756,6 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 out["search_subjects"] = "EXC " + str(e)[:80]
             out["search_s"] = round(time.time() - t0, 2)
-            t0 = time.time()
-            try:
-                d = api_call("GET", "/wefeed-mobile-bff/subject-api/get-stream-captions"
-                                  "?subjectId=3642928735944335256&streamId=8814939074025999088")
-                out["api_get"] = ("err:" + str(d)[:60]) if (d and "__error__" in d) else ("ok:" + str(len(d or {})) + "keys")
-            except Exception as e:
-                out["api_get"] = "EXC " + str(e)[:80]
-            out["api_s"] = round(time.time() - t0, 2)
             return self._send(200, json.dumps(out))
 
         m = re.match(r"^/stream/([a-z]+)/(tt\d+|[a-z0-9]+)(?::(\d+):(\d+))?\.json$", path)
