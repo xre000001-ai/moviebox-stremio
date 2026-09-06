@@ -49,7 +49,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -226,13 +226,24 @@ def _free_pool_refresh():
         cand = [u.strip() for u in r.text.replace("\r", "").splitlines()
                 if u.strip().startswith("http://")]
         cand = random.sample(cand, min(150, len(cand))) if cand else []
-        alive, seen = [], set()
-        with ThreadPoolExecutor(max_workers=25) as ex:
-            for u, res in zip(cand, ex.map(lambda x: _platform_probe(x, 5), cand)):
-                kind, ms = res
-                if kind == "good" and u not in seen:
-                    seen.add(u)
-                    alive.append((u, ms))
+
+        def _probe_batch(batch):
+            got = []
+            with ThreadPoolExecutor(max_workers=25) as ex:
+                for u, res in zip(batch, ex.map(lambda x: _platform_probe(x, 5), batch)):
+                    kind, ms = res
+                    if kind == "good":
+                        got.append((u, ms))
+            return got
+
+        # v1.7.1 wave probing: publish the first wave's exits immediately
+        # (a usable pool in ~half the time), then refine with wave 2.
+        alive = _probe_batch(cand[:60])
+        best = sorted(alive, key=lambda x: x[1])[:20]
+        with _FREE_POOL_LOCK:
+            _FREE_POOL[0] = [u for u, _ in best]
+        if len(cand) > 60:
+            alive += _probe_batch(cand[60:])
         alive.sort(key=lambda x: x[1])          # fastest first
         with _FREE_POOL_LOCK:
             _FREE_POOL[0] = [u for u, _ in alive[:20]]
@@ -995,9 +1006,11 @@ def scrape_subjects(site, kind, page):
 
 def catalog_pool(site, kind, want_type):
     """type-filtered subject pool across prefetch pages."""
+    with ThreadPoolExecutor(max_workers=3) as ex:   # v1.7.1: pages in parallel
+        pages = list(ex.map(lambda pg: scrape_subjects(site, kind, pg),
+                            range(1, CATALOG_PREFETCH + 1)))
     out = []
-    for pg in range(1, CATALOG_PREFETCH + 1):
-        subs = scrape_subjects(site, kind, pg)
+    for subs in pages:
         out.extend([s for s in subs if int(s.get("subjectType") or 0) == want_type])
     # dedupe by subjectId+title
     seen, dd = set(), []
@@ -2320,22 +2333,45 @@ def _note_public_base(base):
         print("keepalive auto-armed: %s" % base, flush=True)
 
 def _keepalive_loop():
+    # v1.7.1: NEVER exit. The public URL is learned from the first real
+    # request's Host header (_note_public_base -> _KEEPALIVE_URL), so the
+    # free-tier dyno can't silently lose its keepalive just because
+    # PUBLIC_URL was never configured — no more 50s cold boots after idle.
     while True:
         url = PUBLIC_URL or _KEEPALIVE_URL
-        if not url:
-            return
-        try:
-            requests.get(url + "/health", timeout=20)
-        except Exception:
-            pass
+        if url:
+            try:
+                requests.get(url + "/health", timeout=20)
+            except Exception:
+                pass
         time.sleep(240)
+
+def _boot_prewarm():
+    """Background warm-up after boot: wait for the first pool, bootstrap
+    the token, then build all six catalogs — so the first real user
+    request never pays the cold cost (free-tier CPU + fresh caches)."""
+    try:
+        for _ in range(8):                 # up to ~80s for the first pool
+            if _pool_all():
+                break
+            time.sleep(10)
+        _bootstrap_token()
+        for ctype, cat in (("movie", "moviebox-movies"), ("movie", "netnaija-movies"),
+                           ("movie", "moviebox-animated"), ("movie", "netnaija-animated"),
+                           ("series", "moviebox-series"), ("series", "netnaija-series")):
+            try:
+                get_catalog(ctype, cat, 0)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 def main():
     _FREE_POOL_ON[0] = True
     threading.Thread(target=_free_pool_loop, daemon=True).start()
     threading.Thread(target=_pool_train_loop, daemon=True).start()
-    if PUBLIC_URL:
-        threading.Thread(target=_keepalive_loop, daemon=True).start()
+    threading.Thread(target=_keepalive_loop, daemon=True).start()
+    threading.Thread(target=_boot_prewarm, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print("MovieBox %s listening on :%d (keepalive=%s)" % (VERSION, PORT, bool(PUBLIC_URL)), flush=True)
     srv.serve_forever()
