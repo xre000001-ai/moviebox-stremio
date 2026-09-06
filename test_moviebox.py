@@ -1359,7 +1359,7 @@ def test_api_call_via_scrapedo_when_forced():
             assert kw.get("params", {}).get("token") == "tok"
             assert kw.get("params", {}).get("customHeaders") == "true"
             resp = mock.Mock(status_code=200)
-            resp.headers = {}
+            resp.headers = {"scrape-do-remaining-credits": "777"}
             resp.json = lambda: {"code": 0, "message": "ok", "data": {"x": 9}}
             return resp
         raise AssertionError("direct platform call made while scrape.do forced")
@@ -1374,6 +1374,7 @@ def test_api_call_via_scrapedo_when_forced():
             d = addon.api_call("POST", SD_PATH, "{}")
         assert d == {"x": 9}
         assert calls and all("api.scrape.do" in u for u in calls)
+        assert addon._SD_CREDITS[0] == 777     # credit telemetry captured
     finally:
         addon._SCRAPEDO_TOKEN = saved_tok
         addon._SD_FALLBACK.clear()

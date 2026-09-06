@@ -49,7 +49,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION = "1.6.5"
+VERSION = "1.6.6"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -82,6 +82,7 @@ _SCRAPEDO_TOKEN = os.environ.get("SCRAPEDO_TOKEN", "").strip()
 _SD_TTL = 1800.0
 _SD_FALLBACK = {}                     # endpoint family -> until-ts
 _SD_LOCK = threading.Lock()
+_SD_CREDITS = [None]                  # last seen "scrape-do-remaining-credits"
 
 def _sd_family(path):
     seg = path.split("?")[0].strip("/").split("/")
@@ -124,6 +125,10 @@ def _sd_fetch(method, url, headers, body, timeout=45):
                          data=body.encode() if body else None,
                          timeout=timeout)
     if r.status_code == 200:
+        try:                          # free credit telemetry from response header
+            _SD_CREDITS[0] = int(r.headers.get("scrape-do-remaining-credits"))
+        except (TypeError, ValueError):
+            pass
         try:
             return _SDResp(200, r.json())
         except Exception:
@@ -1831,6 +1836,7 @@ class Handler(BaseHTTPRequestHandler):
                 "platform_circuit": ("cooling_down" if not _plat_ok() else "closed"),
                 "platform_proxy": bool(_PLAT_PROXIES),
                 "scrape_do": bool(_SCRAPEDO_TOKEN),
+                "scrape_do_credits": _SD_CREDITS[0],
                 "video_proxy": False, "egress": "text-only (json/playlists/manifests/subtitles, gzip)",
                 "segment_routing": "cdn-direct (sacdn CloudFront, query-signed)",
             }))
