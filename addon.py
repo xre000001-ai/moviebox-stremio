@@ -49,7 +49,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION = "1.7.3"
+VERSION = "1.7.4"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -785,18 +785,32 @@ def match_subjects(subjects, title, year, subject_type, season=None):
     want = clean_title(title).lower()
     want_se = "%s s%d" % (want, season) if season else None
     want_stripped = re.sub(r"\s*part\s*\d+$", "", want)
+    # v1.7.4: leading articles ("The/A/An") differ constantly between
+    # sources (TMDB: "East Palace" vs the platform's "The East Palace") —
+    # compare both raw and article-stripped forms.
+    art = re.compile(r"^(the|a|an)\s+")
+    want_art = art.sub("", want_stripped)
     exact, fuzzy = [], []
     want_toks = _title_tokens(title)
+    want_art_toks = _title_tokens(art.sub("", title or ""))
     for s in subjects:
         if int(s.get("subjectType") or 0) != subject_type:
             continue
         st = clean_title(s.get("title") or "").lower()
-        if st == want or (want_se and st == want_se) or st == want_stripped:
+        st_art = art.sub("", st)
+        if (st == want or (want_se and st == want_se) or st == want_stripped
+                or st_art == want_art or st == want_art or st_art == want_stripped):
             exact.append(s)
-        elif exact == [] and len(want_toks) >= 4:
+        elif exact == []:
             ctoks = _title_tokens(s.get("title"))
-            if len(ctoks) >= 3 and ctoks <= want_toks:
+            ctoks_art = _title_tokens(art.sub("", s.get("title") or ""))
+            if (len(want_toks) >= 4 and len(ctoks) >= 3 and ctoks <= want_toks):
                 fuzzy.append((len(ctoks), ctoks, s))
+            elif (ctoks_art and want_art_toks
+                  and (ctoks_art == want_art_toks        # only the article differs
+                       or (len(ctoks_art) >= 3 and ctoks_art <= want_art_toks))):
+                # "the east palace" ({east,palace}) vs "east palace" ({east,palace})
+                fuzzy.append((len(ctoks_art), ctoks_art, s))
     pool = exact or [s for _, _, s in
                      sorted(fuzzy, key=lambda x: -x[0])]
     if not pool:

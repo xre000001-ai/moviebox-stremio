@@ -2066,5 +2066,27 @@ def test_meta_any_all_fail_transient():
     finally:
         addon._CINEMETA_CACHE.clear()
 
+
+# --- v1.7.4: article-insensitive matching ------------------------------------
+
+def test_match_leading_article_insensitive():
+    subs = [{"subjectId": "1", "title": "The East Palace [Hindi]", "subjectType": 2,
+             "releaseDate": "2026-07-17"},
+            {"subjectId": "2", "title": "The East Palace", "subjectType": 2,
+             "releaseDate": "2026-07-17"},
+            {"subjectId": "3", "title": "East of Eden", "subjectType": 2,
+             "releaseDate": "2008-08-25"}]
+    # TMDB says "East Palace", the platform says "The East Palace"
+    m = addon.match_subjects(subs, "East Palace", "2026", 2)
+    assert {x[0]["subjectId"] for x in m} == {"1", "2"}
+    # and the reverse: query has the article, candidate doesn't
+    subs2 = [{"subjectId": "9", "title": "Quiet Place", "subjectType": 1,
+              "releaseDate": "2018-04-03"}]
+    m2 = addon.match_subjects(subs2, "A Quiet Place", "2018", 1)
+    assert [x[0]["subjectId"] for x in m2] == ["9"]
+    # unrelated still rejected
+    m3 = addon.match_subjects(subs, "East of Eden", "2008", 2)
+    assert [x[0]["subjectId"] for x in m3] == ["3"]
+
 if __name__ == "__main__":
     main()
