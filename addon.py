@@ -49,7 +49,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION = "1.6.6"
+VERSION = "1.6.7"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -64,8 +64,22 @@ TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "adc48d20c0956934fb224de5c40bb85d"
 # stay direct (they are not flagged), which keeps per-GB proxy cost near
 # zero: only small signed JSON + subtitle text ever crosses the proxy
 # (media bytes are 302'd straight to the client — zero-media design).
+# v1.6.7: MOVIEBOX_PROXY_LIST = comma-separated proxy URLs (e.g. the 10
+# Webshare free proxies "http://user:pass@ip:port,..."). Each platform call
+# picks a random URL; on failure the retry loop rotates to a fresh exit IP.
+# Pool mode overrides MOVIEBOX_PROXY (single) and SCRAPEDO_TOKEN (scrape.do)
+# for every non-tab-operating path; tab-operating always stays direct (its
+# auth token arrives in a response header proxies must not touch).
+_PROXY_RAW_LIST = os.environ.get("MOVIEBOX_PROXY_LIST", "").strip()
+_PROXY_URLS = [u.strip() for u in _PROXY_RAW_LIST.split(",") if u.strip()] if _PROXY_RAW_LIST else []
 _PROXY_URL = os.environ.get("MOVIEBOX_PROXY", "").strip()
 _PLAT_PROXIES = ({"http": _PROXY_URL, "https": _PROXY_URL} if _PROXY_URL else None)
+_PROXY_POOL = len(_PROXY_URLS) > 1
+
+def _pool_pick():
+    """Random pool URL as a requests proxies= dict (fresh exit IP per call)."""
+    u = random.choice(_PROXY_URLS)
+    return {"http": u, "https": u}
 # Scrape.do egress fallback (v1.6.5): platform calls go DIRECT first; on the
 # IP-flag signature (HTTP 403/406) the endpoint family is re-routed through
 # Scrape.do's rotating residential exits for 30 minutes, after which direct
@@ -290,8 +304,11 @@ def _bootstrap_token():
     if not _plat_ok():
         return
     try:
-        for base in API_HOSTS[:2]:
-            url = base + "/wefeed-mobile-bff/tab-operating?page=1&tabId=0&version="
+        # pool mode: the proxy IS the egress, so rotate pool picks
+        # (up to 4) instead of rotating (irrelevant) platform hosts
+        attempts = ["pool"] * min(4, len(_PROXY_URLS)) if _PROXY_POOL else API_HOSTS[:2]
+        for kind in attempts:
+            url = API_HOSTS[0] + "/wefeed-mobile-bff/tab-operating?page=1&tabId=0&version="
             ts = int(time.time() * 1000)
             headers = {
                 "User-Agent": UA_APP,
@@ -303,8 +320,12 @@ def _bootstrap_token():
                 "X-Client-Status": "0",
                 "X-M-Version": "11.7.0",
             }
-            kw = {"proxies": _PLAT_PROXIES} if _PLAT_PROXIES else {}
-            r = requests.get(url, headers=headers, timeout=10, **kw)
+            if kind == "pool":
+                r = requests.get(url, headers=headers, timeout=10,
+                                 proxies=_pool_pick())
+            else:
+                kw = {"proxies": _PLAT_PROXIES} if _PLAT_PROXIES else {}
+                r = requests.get(url, headers=headers, timeout=10, **kw)
             _absorb_token(r)
             if r.status_code < 400:
                 return
@@ -323,6 +344,7 @@ def api_call(method, path, body=None, timeout=10):
                 _bootstrap_token()
     last = None
     sd_entry = _sd_forced(path)
+    via_pool = _PROXY_POOL and not path.startswith("/wefeed-mobile-bff/tab-operating")
     for attempt in (1, 2):
         for base in (API_HOSTS[:1] if sd_entry else API_HOSTS):
             url = base + path
@@ -343,6 +365,10 @@ def api_call(method, path, body=None, timeout=10):
             try:
                 if sd_entry or _sd_forced(path):
                     r = _sd_fetch(method, url, headers, body)
+                elif via_pool:
+                    r = requests.request(method, url, headers=headers,
+                                         data=body.encode() if body else None,
+                                         timeout=timeout, proxies=_pool_pick())
                 else:
                     kw = {"proxies": _PLAT_PROXIES} if _PLAT_PROXIES else {}
                     r = requests.request(method, url, headers=headers,
@@ -381,7 +407,7 @@ def api_call(method, path, body=None, timeout=10):
                 last = type(e).__name__
                 if sd_entry:
                     break
-                continue
+                continue    # pool mode: next iteration picks a fresh exit IP
         if attempt == 1:
             time.sleep(0.4)
     _note_plat(False)
@@ -1578,8 +1604,8 @@ def _spawn_warm(entries, se, ep, ctype):
     the biggest source of platform call volume on a busy instance)."""
     if not _plat_ok():
         return
-    if _SCRAPEDO_TOKEN and _sd_forced("/wefeed-mobile-bff/subject-api/search/v2"):
-        return  # credit conservation: no prefetch while egress rides scrape.do
+    if _PROXY_POOL or ((_SCRAPEDO_TOKEN or _PLAT_PROXIES) and _sd_forced("/wefeed-mobile-bff/subject-api/search/v2")):
+        return  # credit conservation: no prefetch while ANY proxy egress is active
     now = time.time()
     if now - _WARM_TS[0] < 600:
         return
@@ -1834,7 +1860,7 @@ class Handler(BaseHTTPRequestHandler):
                 "keepalive_url": PUBLIC_URL or _KEEPALIVE_URL,
                 "auth_token": bool(_AUTH_TOKEN),
                 "platform_circuit": ("cooling_down" if not _plat_ok() else "closed"),
-                "platform_proxy": bool(_PLAT_PROXIES),
+                "platform_proxy": (("pool(%d)" % len(_PROXY_URLS)) if _PROXY_POOL else bool(_PLAT_PROXIES)),
                 "scrape_do": bool(_SCRAPEDO_TOKEN),
                 "scrape_do_credits": _SD_CREDITS[0],
                 "video_proxy": False, "egress": "text-only (json/playlists/manifests/subtitles, gzip)",

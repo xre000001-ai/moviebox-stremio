@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for MovieBox addon. Run: python3 test_moviebox.py"""
 import base64
+import importlib
 import json
 import os
 import re
@@ -1451,6 +1452,107 @@ def test_warm_skipped_while_search_family_on_scrapedo():
     finally:
         addon._SCRAPEDO_TOKEN = saved_tok
         addon._SD_FALLBACK.clear()
+
+# --- v1.6.7: multi-proxy pool (MOVIEBOX_PROXY_LIST) ------------------------
+
+def test_pool_parsing():
+    try:
+        os.environ["MOVIEBOX_PROXY"] = "http://u:p@h:1"
+        importlib.reload(addon)
+        assert addon._PLAT_PROXIES == {"http": "http://u:p@h:1",
+                                       "https": "http://u:p@h:1"}
+        assert addon._PROXY_POOL is False
+        os.environ.pop("MOVIEBOX_PROXY")
+        importlib.reload(addon)
+        assert addon._PLAT_PROXIES is None
+        assert addon._PROXY_POOL is False
+        os.environ["MOVIEBOX_PROXY_LIST"] = "http://u:p@h:1,http://u:p@h:2"
+        importlib.reload(addon)
+        assert addon._PROXY_URLS == ["http://u:p@h:1", "http://u:p@h:2"]
+        assert addon._PROXY_POOL is True
+        assert addon._PLAT_PROXIES is None      # single-URL var not set
+        # whitespace + trailing comma tolerated
+        os.environ["MOVIEBOX_PROXY_LIST"] = " http://a:1 , http://b:2 ,"
+        importlib.reload(addon)
+        assert addon._PROXY_URLS == ["http://a:1", "http://b:2"]
+    finally:
+        os.environ.pop("MOVIEBOX_PROXY", None)
+        os.environ.pop("MOVIEBOX_PROXY_LIST", None)
+        importlib.reload(addon)
+    assert addon._PLAT_PROXIES is None
+    assert addon._PROXY_POOL is False
+
+def test_api_call_rotates_proxy_on_pool_failure():
+    addon._PLAT_CB_UNTIL = 0.0
+    addon._PLAT_FAILS = 0
+    saved_pool, saved_urls = addon._PROXY_POOL, list(addon._PROXY_URLS)
+    try:
+        addon._PROXY_POOL = True
+        addon._PROXY_URLS = ["http://p1:1", "http://p2:2"]
+        picks = []
+        def fake_request(method, url, **kw):
+            px = kw.get("proxies") or {}
+            picks.append(px.get("http"))
+            if px.get("http") == "http://p1:1":
+                raise addon.requests.ConnectionError("p1 dead")
+            resp = mock.Mock(status_code=200)
+            resp.headers = {}
+            resp.json = lambda: {"code": 0, "message": "ok", "data": {"x": 9}}
+            return resp
+        with mock.patch.object(addon, "_bootstrap_token"), \
+             mock.patch.object(addon, "_pool_pick",
+                               side_effect=[{"http": "http://p1:1", "https": "http://p1:1"},
+                                           {"http": "http://p2:2", "https": "http://p2:2"}]), \
+             mock.patch.object(addon.requests, "request", side_effect=fake_request):
+            addon._AUTH_TOKEN = "tok"
+            d = addon.api_call("POST", "/wefeed-mobile-bff/subject-api/search/v2", "{}")
+        assert d == {"x": 9}
+        assert picks == ["http://p1:1", "http://p2:2"]   # died on p1, rotated, won on p2
+    finally:
+        addon._PROXY_POOL = saved_pool
+        addon._PROXY_URLS = saved_urls
+        addon._PLAT_FAILS = 0
+
+def test_bootstrap_uses_pool():
+    addon._PLAT_CB_UNTIL = 0.0
+    addon._PLAT_FAILS = 0
+    saved_pool, saved_urls = addon._PROXY_POOL, list(addon._PROXY_URLS)
+    try:
+        addon._PROXY_POOL = True
+        addon._PROXY_URLS = ["http://p1:1", "http://p2:2"]
+        picked = []
+        def fake_get(url, **kw):
+            px = kw.get("proxies") or {}
+            picked.append(px.get("http"))
+            resp = mock.Mock(status_code=403 if px.get("http") == "http://p1:1" else 200)
+            resp.headers = {}
+            return resp
+        with mock.patch.object(addon, "_pool_pick",
+                               side_effect=[{"http": "http://p1:1", "https": "http://p1:1"},
+                                           {"http": "http://p2:2", "https": "http://p2:2"}]), \
+             mock.patch.object(addon.requests, "get", side_effect=fake_get):
+            addon._AUTH_TOKEN = None
+            addon._bootstrap_token()
+        assert picked == ["http://p1:1", "http://p2:2"]  # rotated past the 403
+    finally:
+        addon._PROXY_POOL = saved_pool
+        addon._PROXY_URLS = saved_urls
+
+def test_warm_skipped_while_pool_active():
+    saved_pool, saved_urls = addon._PROXY_POOL, list(addon._PROXY_URLS)
+    try:
+        addon._PROXY_POOL = True
+        addon._PROXY_URLS = ["http://p:1"]
+        saved = addon._WARM_TS[0]
+        addon._WARM_TS[0] = 0.0
+        try:
+            addon._spawn_warm([], None, None, "movie")
+            assert addon._WARM_TS[0] == 0.0    # untouched -> skipped pre-throttle
+        finally:
+            addon._WARM_TS[0] = saved
+    finally:
+        addon._PROXY_POOL = saved_pool
+        addon._PROXY_URLS = saved_urls
 
 def main():
     global PASS, FAIL
