@@ -1461,15 +1461,12 @@ def test_pool_parsing():
         importlib.reload(addon)
         assert addon._PLAT_PROXIES == {"http": "http://u:p@h:1",
                                        "https": "http://u:p@h:1"}
-        assert addon._PROXY_POOL is False
         os.environ.pop("MOVIEBOX_PROXY")
         importlib.reload(addon)
         assert addon._PLAT_PROXIES is None
-        assert addon._PROXY_POOL is False
         os.environ["MOVIEBOX_PROXY_LIST"] = "http://u:p@h:1,http://u:p@h:2"
         importlib.reload(addon)
         assert addon._PROXY_URLS == ["http://u:p@h:1", "http://u:p@h:2"]
-        assert addon._PROXY_POOL is True
         assert addon._PLAT_PROXIES is None      # single-URL var not set
         # whitespace + trailing comma tolerated
         os.environ["MOVIEBOX_PROXY_LIST"] = " http://a:1 , http://b:2 ,"
@@ -1480,16 +1477,14 @@ def test_pool_parsing():
         os.environ.pop("MOVIEBOX_PROXY_LIST", None)
         importlib.reload(addon)
     assert addon._PLAT_PROXIES is None
-    assert addon._PROXY_POOL is False
 
 def test_api_call_rotates_proxy_on_pool_failure():
     # v1.6.8: direct first; on the 403 IP-flag the pool engages and rotates
     # exits until one answers.
     addon._PLAT_CB_UNTIL = 0.0
     addon._PLAT_FAILS = 0
-    saved_pool, saved_urls = addon._PROXY_POOL, list(addon._PROXY_URLS)
+    saved_urls = list(addon._PROXY_URLS)
     try:
-        addon._PROXY_POOL = True
         addon._PROXY_URLS = ["http://p1:1", "http://p2:2"]
         addon._SD_FALLBACK.clear()
         picks = []
@@ -1517,7 +1512,6 @@ def test_api_call_rotates_proxy_on_pool_failure():
         assert d == {"x": 9}
         assert picks == [None, "http://p1:1", "http://p2:2"]  # direct 403 -> pool: died on p1, won on p2
     finally:
-        addon._PROXY_POOL = saved_pool
         addon._PROXY_URLS = saved_urls
         addon._SD_FALLBACK.clear()
         addon._PLAT_FAILS = 0
@@ -1527,9 +1521,8 @@ def test_bootstrap_uses_pool():
     # rotation (p1 403 -> p2 ok).
     addon._PLAT_CB_UNTIL = 0.0
     addon._PLAT_FAILS = 0
-    saved_pool, saved_urls = addon._PROXY_POOL, list(addon._PROXY_URLS)
+    saved_urls = list(addon._PROXY_URLS)
     try:
-        addon._PROXY_POOL = True
         addon._PROXY_URLS = ["http://p1:1", "http://p2:2"]
         picked = []
         def fake_get(url, **kw):
@@ -1546,15 +1539,13 @@ def test_bootstrap_uses_pool():
             addon._bootstrap_token()
         assert picked == [None, None, "http://p1:1", "http://p2:2"]  # 2 direct hosts, then pool rotation
     finally:
-        addon._PROXY_POOL = saved_pool
         addon._PROXY_URLS = saved_urls
 
 def test_warm_skipped_while_pool_active():
     # v1.6.8: pool is fallback-only, so warm is skipped only while the
     # search family is flagged (warm calls would ride the pool).
-    saved_pool, saved_urls = addon._PROXY_POOL, list(addon._PROXY_URLS)
+    saved_urls = list(addon._PROXY_URLS)
     try:
-        addon._PROXY_POOL = True
         addon._PROXY_URLS = ["http://p:1"]
         addon._SD_FALLBACK.clear()
         addon._sd_mark(SD_PATH)
@@ -1567,7 +1558,6 @@ def test_warm_skipped_while_pool_active():
             addon._WARM_TS[0] = saved
             addon._SD_FALLBACK.clear()
     finally:
-        addon._PROXY_POOL = saved_pool
         addon._PROXY_URLS = saved_urls
 
 def main():
@@ -1623,17 +1613,17 @@ def test_free_pool_refresh_probes_and_caches():
     finally:
         addon._FREE_POOL_TS[0] = saved_ts
         addon._FREE_POOL[0] = saved_pool
+        for u in ("http://a:1", "http://c:3"):
+            addon._POOL_STATS.pop(u, None)
 
 def test_api_call_falls_back_to_free_pool():
     # free pool only (no env pool): direct 403 -> free-pool retry succeeds
     addon._PLAT_CB_UNTIL = 0.0
     addon._PLAT_FAILS = 0
     saved_urls = list(addon._PROXY_URLS)
-    saved_pool = addon._PROXY_POOL
     saved_fp = list(addon._FREE_POOL[0])
     try:
         addon._PROXY_URLS = []
-        addon._PROXY_POOL = False
         addon._FREE_POOL[0] = ["http://f1:1"]
         addon._SD_FALLBACK.clear()
         picks = []
@@ -1657,7 +1647,6 @@ def test_api_call_falls_back_to_free_pool():
         assert addon._sd_forced(SD_PATH)            # family remembered for 30 min
     finally:
         addon._PROXY_URLS = saved_urls
-        addon._PROXY_POOL = saved_pool
         addon._FREE_POOL[0] = saved_fp
         addon._SD_FALLBACK.clear()
         addon._PLAT_FAILS = 0
@@ -1773,32 +1762,37 @@ def test_circuit_not_tripped_by_pool_failures():
         addon._FREE_POOL[0] = saved_fp
         addon._SD_FALLBACK.clear()
 
-def test_transient_negative_cache_heals_fast():
-    # empty/None answers are cached only 60s (not 10-30 min): after the
-    # negative entry expires the next call re-queries instead of serving
-    # the stale blank
+def test_transient_answers_never_cached():
+    # v1.7.0: None (transient transport failure) is NEVER cached — the next
+    # call retries immediately; [] (definitive "not in catalog") keeps the
+    # full TTL.
     addon._SEARCH_CACHE.clear()
     addon._DUB_CACHE.clear()
+    addon._PLAY_CACHE.clear()
     calls = {"n": 0}
     def fake_search(kw, stype):
         calls["n"] += 1
-        return [] if calls["n"] == 1 else [{"subjectId": "1", "title": kw}]
+        return None if calls["n"] == 1 else [{"subjectId": "1", "title": kw}]
     with mock.patch.object(addon, "search_subjects", side_effect=fake_search):
-        assert addon._cached_search("kw", 1) == []          # transient empty
-        _, exp = addon._SEARCH_CACHE[("kw", 1)]
-        assert 0 < exp - time.time() <= 61                  # short negative TTL
-        addon._SEARCH_CACHE[("kw", 1)] = ([], time.time() - 1)   # force expiry
+        assert addon._cached_search("kw", 1) is None        # transient
+        assert ("kw", 1) not in addon._SEARCH_CACHE         # not cached at all
         assert addon._cached_search("kw", 1) == [{"subjectId": "1", "title": "kw"}]
+        assert calls["n"] == 2                              # re-queried
+    with mock.patch.object(addon, "search_subjects", return_value=[]):
+        assert addon._cached_search("kw2", 1) == []         # definitive
+        _, exp = addon._SEARCH_CACHE[("kw2", 1)]
+        assert exp - time.time() > 300                      # full TTL
     dcalls = {"n": 0}
     def fake_dubs(sid):
         dcalls["n"] += 1
-        return [] if dcalls["n"] == 1 else [{"subjectId": "9"}]
+        return None if dcalls["n"] == 1 else [{"subjectId": "9"}]
     with mock.patch.object(addon, "subject_dubs", side_effect=fake_dubs):
-        assert addon._cached_dubs("7") == []
-        _, dexp = addon._DUB_CACHE["7"]
-        assert 0 < dexp - time.time() <= 61
-        addon._DUB_CACHE["7"] = ([], time.time() - 1)
+        assert addon._cached_dubs("7") is None
+        assert "7" not in addon._DUB_CACHE
         assert addon._cached_dubs("7") == [{"subjectId": "9"}]
+    with mock.patch.object(addon, "play_info", return_value=None):
+        assert addon._cached_play("3", None, None) is None
+        assert ("3", None, None) not in addon._PLAY_CACHE
 
 
 # --- v1.6.11: free-pool primary + hvc1 + reqlog ------------------------------
@@ -1841,6 +1835,128 @@ def test_reqlog_records_served_requests():
     finally:
         del addon._REQLOG[:]
         addon._REQLOG.extend(saved)
+
+
+# --- v1.7.0: trained proxy environment + transient/definitive semantics -----
+
+def test_search_transient_vs_definitive():
+    # every strategy hits a transient failure -> None (never a fake [])
+    with mock.patch.object(addon, "api_call", return_value=None):
+        assert addon.search_subjects("kw", 1) is None
+    # platform answers definitively (empty results) -> []
+    with mock.patch.object(addon, "api_call",
+                           return_value={"results": [{"subjects": []}]}):
+        assert addon.search_subjects("kw", 1) == []
+    # platform answers with a subject -> filtered list
+    sub = {"subjectId": "1", "title": "X", "subjectType": 1}
+    with mock.patch.object(addon, "api_call",
+                           return_value={"results": [{"subjects": [sub]}]}):
+        assert addon.search_subjects("kw", 1) == [sub]
+
+def test_dubs_transient_vs_definitive():
+    with mock.patch.object(addon, "api_call", return_value=None):
+        assert addon.subject_dubs("7") is None
+    with mock.patch.object(addon, "api_call", return_value={"__error__": "x"}):
+        assert addon.subject_dubs("7") == []
+    with mock.patch.object(addon, "api_call", return_value={"dubs": []}):
+        assert addon.subject_dubs("7") == []
+
+def test_pool_pick_prefers_trained_exits():
+    # among 5 healthy exits the worst-trained one must never be picked
+    # (pick samples only the top-3 by score)
+    saved_urls, saved_fp = list(addon._PROXY_URLS), list(addon._FREE_POOL[0])
+    saved_stats = dict(addon._POOL_STATS)
+    try:
+        _pool_state_reset()
+        addon._PROXY_URLS = []
+        addon._FREE_POOL[0] = ["http://a:1", "http://b:1", "http://c:1",
+                               "http://d:1", "http://e:1"]
+        addon._POOL_STATS.clear()
+        for u in ("http://a:1", "http://b:1", "http://c:1", "http://d:1"):
+            addon._POOL_STATS[u] = {"ok": 10, "fail": 0, "lat": 500}
+        addon._POOL_STATS["http://e:1"] = {"ok": 0, "fail": 10, "lat": 5000}
+        for _ in range(40):
+            assert addon._pool_pick()["http"] != "http://e:1"
+        # latency feeds the blend: among 4 well-trained exits the slow one
+        # (b, 4000ms EWMA) drops out of the top-3 and is never picked
+        addon._POOL_STATS["http://a:1"] = {"ok": 10, "fail": 0, "lat": 200}
+        addon._POOL_STATS["http://b:1"] = {"ok": 10, "fail": 0, "lat": 4000}
+        addon._POOL_STATS["http://e:1"] = {"ok": 10, "fail": 0, "lat": 500}
+        picked = set()
+        for _ in range(60):
+            picked.add(addon._pool_pick()["http"])
+        assert "http://a:1" in picked            # fastest is in the top-3
+        assert "http://b:1" not in picked        # slowest well-trained is not
+    finally:
+        _pool_state_reset()
+        addon._PROXY_URLS = saved_urls
+        addon._FREE_POOL[0] = saved_fp
+        addon._POOL_STATS.clear()
+        addon._POOL_STATS.update(saved_stats)
+
+def test_pool_note_updates_training_record():
+    saved_stats = dict(addon._POOL_STATS)
+    try:
+        _pool_state_reset()
+        addon._POOL_STATS.clear()
+        addon._POOL_TLS.url = "http://x:1"
+        addon._POOL_TLS.t_req = time.time() - 0.25
+        addon._pool_note("good")
+        st = addon._POOL_STATS["http://x:1"]
+        assert st["ok"] == 1 and 100 <= st["lat"] <= 2000
+        assert addon._POOL_STICKY[0] == "http://x:1"
+        addon._POOL_TLS.url = "http://x:1"
+        addon._pool_note("good", 300)                 # explicit latency
+        st = addon._POOL_STATS["http://x:1"]
+        assert st["ok"] == 2 and st["lat"] <= 1000    # EWMA blended
+        addon._POOL_TLS.url = "http://x:1"
+        addon._pool_note("dead")
+        st = addon._POOL_STATS["http://x:1"]
+        assert st["fail"] == 1
+        assert "http://x:1" in addon._POOL_BAD
+    finally:
+        _pool_state_reset()
+        addon._POOL_STATS.clear()
+        addon._POOL_STATS.update(saved_stats)
+
+def test_pool_train_once_updates_stats_and_benches():
+    saved_urls, saved_fp = list(addon._PROXY_URLS), list(addon._FREE_POOL[0])
+    saved_stats = dict(addon._POOL_STATS)
+    try:
+        _pool_state_reset()
+        addon._POOL_STATS.clear()
+        addon._PROXY_URLS = []
+        addon._FREE_POOL[0] = ["http://g:1", "http://b:1", "http://d:1"]
+        results = {"http://g:1": ("good", 250),
+                   "http://b:1": ("block", None),
+                   "http://d:1": ("dead", None)}
+        with mock.patch.object(addon, "_platform_probe",
+                               side_effect=lambda u, timeout=4: results[u]):
+            addon._pool_train_once()
+        assert addon._POOL_STATS["http://g:1"]["ok"] == 1
+        assert addon._POOL_STICKY[0] == "http://g:1"
+        assert "http://b:1" in addon._POOL_BAD        # blocked: 30-min bench
+        assert "http://d:1" in addon._POOL_BAD        # dead: 10-min bench
+    finally:
+        _pool_state_reset()
+        addon._PROXY_URLS = saved_urls
+        addon._FREE_POOL[0] = saved_fp
+        addon._POOL_STATS.clear()
+        addon._POOL_STATS.update(saved_stats)
+
+def test_build_streams_transient_message_not_cached():
+    addon._STREAM_CACHE.clear()
+    key = ("movie", "tt9990001", None, None)
+    try:
+        with mock.patch.object(addon, "cinemeta",
+                               return_value={"name": "Foo", "year": "2020"}), \
+             mock.patch.object(addon, "_cached_search", return_value=None):
+            r = addon.build_streams("movie", "tt9990001", None, None, _prewarm_next=False)
+        assert r["streams"] == []
+        assert "busy" in r.get("message", "")
+        assert key not in addon._STREAM_CACHE       # transient: not cached
+    finally:
+        addon._STREAM_CACHE.clear()
 
 if __name__ == "__main__":
     main()

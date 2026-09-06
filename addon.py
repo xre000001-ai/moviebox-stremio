@@ -49,7 +49,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION = "1.6.11"
+VERSION = "1.7.0"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -74,8 +74,6 @@ _PROXY_RAW_LIST = os.environ.get("MOVIEBOX_PROXY_LIST", "").strip()
 _PROXY_URLS = [u.strip() for u in _PROXY_RAW_LIST.split(",") if u.strip()] if _PROXY_RAW_LIST else []
 _PROXY_URL = os.environ.get("MOVIEBOX_PROXY", "").strip()
 _PLAT_PROXIES = ({"http": _PROXY_URL, "https": _PROXY_URL} if _PROXY_URL else None)
-_PROXY_POOL = len(_PROXY_URLS) > 1
-
 # v1.6.8: auto-refreshed FREE proxy pool — no signup, no key, no bandwidth
 # cap. MOVIEBOX_PROXY_SOURCE is a public plain-text list URL (default:
 # ProxyScrape v4, ~1800 mixed-protocol proxies the provider refreshes
@@ -100,8 +98,12 @@ _FREE_POOL_ON = [False]             # enabled only when run as a server
 # good exit instead of re-rolling dead dice on every call.
 _POOL_BAD = {}                      # url -> benched-until ts
 _POOL_STICKY = [None, 0.0]          # last good url, sticky-until ts
-_POOL_TLS = threading.local()       # per-thread current pool url
+_POOL_TLS = threading.local()       # per-thread current pool url + req t0
 _POOL_REBUILD_TS = [0.0]            # last dry-pool rebuild spawn
+# v1.7.0 trained environment: every exit carries a running record —
+# success/fail counts + EWMA latency (ms). Picks prefer reliable-and-fast
+# exits; the background trainer keeps records fresh even without traffic.
+_POOL_STATS = {}                     # url -> {"ok": n, "fail": n, "lat": ms}
 
 def _pool_all():
     """Fallback pool: the auto-refreshed FREE pool is PRIMARY (user
@@ -122,39 +124,57 @@ def _pool_healthy():
     return [u for u in _pool_all() if _POOL_BAD.get(u, 0.0) <= now]
 
 def _pool_pick():
-    """Pool URL as a requests proxies= dict. Prefers the sticky good exit,
-    avoids benched (dead/blocked) URLs, falls back to anything when the
-    whole pool is benched."""
+    """Pool URL as a requests proxies= dict, TRAINED: prefers the sticky
+    good exit, then the best-scored healthy exits (Laplace-smoothed
+    success rate blended with EWMA latency), avoids benched URLs, falls
+    back to anything when the whole pool is benched."""
     now = time.time()
     with _FREE_POOL_LOCK:
         sticky = _POOL_STICKY[0] if _POOL_STICKY[1] > now else None
-    healthy = _pool_healthy()
+        bad = {u for u, t in _POOL_BAD.items() if t > now}
     allp = _pool_all()
+    healthy = [u for u in allp if u not in bad]
+
+    def _score(u):
+        st = _POOL_STATS.get(u) or {}
+        ok, fail = st.get("ok", 0), st.get("fail", 0)
+        lat = st.get("lat") or 4000
+        quality = (ok + 1.0) / (ok + fail + 2.0)
+        return quality * (4000.0 / max(lat, 250))
+
     u = None
     if sticky and (sticky in healthy or (sticky in allp and not healthy)):
         u = sticky
     elif healthy:
-        u = random.choice(healthy)
+        ranked = sorted(healthy, key=_score, reverse=True)
+        u = ranked[0] if len(ranked) == 1 else random.choice(ranked[:3])
     elif allp:
         u = random.choice(allp)     # everything benched: try anyway
     else:
         u = "http://127.0.0.1:9"
     _POOL_TLS.url = u
+    _POOL_TLS.t_req = time.time()
     return {"http": u, "https": u}
 
-def _pool_note(kind):
-    """Learn from the outcome of this thread's last pool transport.
-    kind: "good" | "dead" (connect failed) | "block" (403/406)."""
+def _pool_note(kind, ms=None):
+    """Learn from the outcome of this thread's last pool transport and
+    update its training record. kind: "good" | "dead" | "block"."""
     u = getattr(_POOL_TLS, "url", None)
     if not u:
         return
+    if ms is None:
+        ms = int((time.time() - getattr(_POOL_TLS, "t_req", time.time())) * 1000)
     _POOL_TLS.url = None
     now = time.time()
+    st = _POOL_STATS.setdefault(u, {"ok": 0, "fail": 0, "lat": None})
     if kind == "good":
+        st["ok"] += 1
+        st["lat"] = ms if st["lat"] is None else int(0.6 * st["lat"] + 0.4 * ms)
         with _FREE_POOL_LOCK:
             _POOL_BAD.pop(u, None)
             _POOL_STICKY[0], _POOL_STICKY[1] = u, now + 120
         return
+    st["fail"] += 1
     dur = 600 if kind == "dead" else 1800   # blocked exits: 30 min
     with _FREE_POOL_LOCK:
         _POOL_BAD[u] = max(_POOL_BAD.get(u, 0.0), now + dur)
@@ -166,51 +186,93 @@ def _pool_note(kind):
         _POOL_REBUILD_TS[0] = now
         threading.Thread(target=_free_pool_refresh, daemon=True).start()
 
+def _platform_probe(u, timeout=4):
+    """Light signed tab-operating GET through candidate exit `u`.
+    Returns (kind, latency_ms): ("good", ms) | ("block", None) |
+    ("dead", None) | (None, None = answered but unusable status)."""
+    t0 = time.time()
+    try:
+        purl = API_HOSTS[0] + "/wefeed-mobile-bff/tab-operating?page=1&tabId=0&version="
+        ts = int(time.time() * 1000)
+        rr = requests.get(purl, timeout=timeout, proxies={"http": u, "https": u},
+                          headers={
+                              "User-Agent": UA_APP,
+                              "Accept": "application/json",
+                              "Content-Type": "application/json",
+                              "X-Client-Token": _x_client_token(ts),
+                              "x-tr-signature": _x_tr_signature("GET", purl, None, ts),
+                              "X-Client-Info": _client_info(),
+                              "X-Client-Status": "0",
+                              "X-M-Version": "11.7.0",
+                          })
+        if rr.status_code < 400:
+            return "good", int((time.time() - t0) * 1000)
+        if rr.status_code in (403, 406):
+            return "block", None
+        return None, None
+    except Exception:
+        return "dead", None
+
 def _free_pool_refresh():
-    """Fetch the public list, sample http:// entries, probe, cache alive."""
+    """Fetch the public list, sample http:// entries, platform-probe them,
+    cache the 20 FASTEST platform-good exits and seed their training
+    records with the measured probe latency."""
     now = time.time()
-    if (not _FREE_POOL_SRC) or (now - _FREE_POOL_TS[0] < 360):
+    if (not _FREE_POOL_SRC) or (now - _FREE_POOL_TS[0] < 240):
         return
     _FREE_POOL_TS[0] = now
     try:
         r = requests.get(_FREE_POOL_SRC, timeout=20)
         cand = [u.strip() for u in r.text.replace("\r", "").splitlines()
                 if u.strip().startswith("http://")]
-        cand = random.sample(cand, min(80, len(cand))) if cand else []
-
-        def _probe(u):
-            # v1.6.10: probe the PLATFORM itself (light signed tab-operating
-            # GET) — an exit that is CONNECT-alive but platform-blocked
-            # (403/406) is useless to us, so it must not enter the pool.
-            try:
-                purl = API_HOSTS[0] + "/wefeed-mobile-bff/tab-operating?page=1&tabId=0&version="
-                pts = int(time.time() * 1000)
-                rr = requests.get(purl, timeout=5, proxies={"http": u, "https": u},
-                                  headers={
-                                      "User-Agent": UA_APP,
-                                      "Accept": "application/json",
-                                      "Content-Type": "application/json",
-                                      "X-Client-Token": _x_client_token(pts),
-                                      "x-tr-signature": _x_tr_signature("GET", purl, None, pts),
-                                      "X-Client-Info": _client_info(),
-                                      "X-Client-Status": "0",
-                                      "X-M-Version": "11.7.0",
-                                  })
-                if rr.status_code < 400:
-                    return u
-            except Exception:
-                pass
-            return None
-
-        alive = []
-        with ThreadPoolExecutor(max_workers=20) as ex:
-            for u in ex.map(_probe, cand):
-                if u and u not in alive:
-                    alive.append(u)
+        cand = random.sample(cand, min(150, len(cand))) if cand else []
+        alive, seen = [], set()
+        with ThreadPoolExecutor(max_workers=25) as ex:
+            for u, res in zip(cand, ex.map(lambda x: _platform_probe(x, 5), cand)):
+                kind, ms = res
+                if kind == "good" and u not in seen:
+                    seen.add(u)
+                    alive.append((u, ms))
+        alive.sort(key=lambda x: x[1])          # fastest first
         with _FREE_POOL_LOCK:
-            _FREE_POOL[0] = alive[:12]
+            _FREE_POOL[0] = [u for u, _ in alive[:20]]
+            for u, ms in alive[:20]:
+                st = _POOL_STATS.setdefault(u, {"ok": 0, "fail": 0, "lat": None})
+                st["ok"] += 1
+                st["lat"] = ms if st["lat"] is None else int(0.6 * st["lat"] + 0.4 * ms)
+                _POOL_BAD.pop(u, None)
     except Exception:
         pass                            # keep the previous pool; retry next cycle
+
+def _pool_train_once():
+    """One training pass: platform-probe every current pool member in
+    parallel, update stats, bench the dead/blocked. Keeps records fresh
+    and the pick order improving even with zero user traffic."""
+    members = _pool_all()
+    if not members:
+        return
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        for u, res in zip(members, ex.map(_platform_probe, members)):
+            kind, ms = res
+            if not kind:
+                continue
+            _POOL_TLS.url = u
+            _POOL_TLS.t_req = time.time()
+            try:
+                _pool_note(kind, ms)
+            except Exception:
+                pass
+            _POOL_TLS.url = None
+
+def _pool_train_loop():
+    """Trainer daemon: one pass every 90s."""
+    while True:
+        try:
+            if _FREE_POOL_ON[0] and _FREE_POOL_SRC:
+                _pool_train_once()
+        except Exception:
+            pass
+        time.sleep(90)
 
 def _free_pool_loop():
     while True:
@@ -583,6 +645,7 @@ def api_call(method, path, body=None, timeout=10):
                     continue          # same call again, now with a fresh token
                 # definitive API-level error (bad id, not found, ...) — the
                 # service answered, so this is not an IP-health problem
+                _pool_note("good")     # transport itself proved healthy
                 return {"__error__": msg}
             except requests.RequestException as e:
                 last = type(e).__name__
@@ -615,8 +678,10 @@ def search_subjects(kw, subject_type):
         d = api_call("POST", "/wefeed-mobile-bff/subject-api/search/v2",
                      json.dumps({"keyword": keyword, "page": 1, "perPage": 20,
                                  "subjectType": subject_type, "tabId": "All"}))
-        if not (d and "__error__" not in d):
-            return []
+        if d is None:
+            return None                     # transient (transport) failure
+        if "__error__" in d:
+            return []                       # platform answered: not found
         res = d.get("results") or []
         return _filtered(res[0].get("subjects", []) if res else [])
 
@@ -624,27 +689,40 @@ def search_subjects(kw, subject_type):
         d = api_call("POST", "/wefeed-mobile-bff/subject-api/search",
                      json.dumps({"keyword": keyword, "page": 1, "perPage": 20,
                                  "subjectType": subject_type}))
-        if not (d and "__error__" not in d):
+        if d is None:
+            return None
+        if "__error__" in d:
             return []
         return _filtered(d.get("items") or [])
 
-    subs = _v2(kw)
-    if subs:
-        return subs
-    subs = _v1(kw)
-    if subs:
-        return subs
+    # v1.7.0: returns None when every strategy hit a transient transport
+    # failure (callers must NOT cache that), [] only when the platform
+    # definitively answered "no results".
+    answered = False
+    for strat in (lambda: _v2(kw), lambda: _v1(kw)):
+        subs = strat()
+        if subs is None:
+            continue          # flaky exit — next strategy rolls a fresh one
+        answered = True
+        if subs:
+            return subs
     words = [w for w in re.split(r"\W+", kw) if len(w) > 1]
     if len(words) > 1:
         w = max(words, key=len)
-        subs = _v1(w) or _v2(w)
-        if subs:
-            return subs
-    return []
+        for strat in (lambda: _v1(w), lambda: _v2(w)):
+            subs = strat()
+            if subs is None:
+                continue
+            answered = True
+            if subs:
+                return subs
+    return [] if answered else None
 
 def subject_dubs(sid):
     d = api_call("GET", "/wefeed-mobile-bff/subject-api/get?subjectId=%s&update=0&status=0" % sid)
-    if d is None or "__error__" in d:
+    if d is None:
+        return None                     # transient — caller must not cache
+    if "__error__" in d:
         return []
     return [x for x in (d.get("dubs") or []) if x.get("subjectId")]
 
@@ -1346,10 +1424,12 @@ def _cached_search(kw, subject_type):
     if hit:
         return val
     val = search_subjects(kw, subject_type)
-    # v1.6.9: an EMPTY answer may be a transient proxy failure (not a real
-    # "not found") — cache it for only 60s so a flaky moment can't blank a
-    # title for 10 minutes. Real results keep the full TTL.
-    _cache_put(_SEARCH_CACHE, key, val, 600 if val else 60)
+    # v1.7.0: None = transient transport failure — NEVER cached (the next
+    # request retries). [] = the platform definitively answered "not in
+    # catalog" — safe to cache for the full TTL.
+    if val is None:
+        return None
+    _cache_put(_SEARCH_CACHE, key, val, 600)
     return val
 
 def _cached_dubs(sid):
@@ -1357,8 +1437,9 @@ def _cached_dubs(sid):
     if hit:
         return val
     val = subject_dubs(sid)
-    # v1.6.9: same guard — transient [] must not kill the dub list for 30 min
-    _cache_put(_DUB_CACHE, sid, val, 1800 if val else 60)
+    if val is None:
+        return None
+    _cache_put(_DUB_CACHE, sid, val, 1800)
     return val
 
 def _cached_play(sid, se, ep):
@@ -1367,8 +1448,9 @@ def _cached_play(sid, se, ep):
     if hit:
         return val
     val = play_info(sid, se, ep)
-    # v1.6.9: transient None must not shadow a playable stream for 1 hour
-    _cache_put(_PLAY_CACHE, key, val, 3600 if val else 60)
+    if val is None:
+        return None
+    _cache_put(_PLAY_CACHE, key, val, 3600)
     return val
 
 # --------------------------------------------------------------------------
@@ -1705,14 +1787,16 @@ def build_streams(ctype, imdb, se, ep, _prewarm_next=True):
     title, year = meta["name"], meta["year"]
     stype = 1 if ctype == "movie" else 2
     subs = _cached_search(title, stype)
+    if subs is None:
+        # transient egress failure — NOT cached; the player may retry at once
+        return {"streams": [], "message": "platform busy — try again"}
     if not subs:
-        # v1.6.9: empty search may be transient (proxy flake) — heal in 60s
-        _cache_put(_STREAM_CACHE, key, [], 60)
-        return {"streams": []}
+        _cache_put(_STREAM_CACHE, key, [], 600)
+        return {"streams": [], "message": "not in platform catalog"}
     matched = match_subjects(subs, title, year, stype, season=se)
     if not matched:
         _cache_put(_STREAM_CACHE, key, [], 600)
-        return {"streams": []}
+        return {"streams": [], "message": "no matching subject"}
     # dub lists for the top matches, fetched in parallel
     with ThreadPoolExecutor(max_workers=2) as ex:
         dub_lists = list(ex.map(lambda m: _cached_dubs(str(m[0].get("subjectId"))),
@@ -1726,6 +1810,8 @@ def build_streams(ctype, imdb, se, ep, _prewarm_next=True):
             seen_labels.add(label)
             entries.append((sid, label))
     for dubs in dub_lists:
+        if not dubs:                # None (transient) or [] — nothing to add
+            continue
         for d in dubs[:6]:
             dsid = str(d.get("subjectId"))
             nm = (d.get("lanName") or "").replace(" dub", "").replace(" Audio", "").strip()
@@ -2247,6 +2333,7 @@ def _keepalive_loop():
 def main():
     _FREE_POOL_ON[0] = True
     threading.Thread(target=_free_pool_loop, daemon=True).start()
+    threading.Thread(target=_pool_train_loop, daemon=True).start()
     if PUBLIC_URL:
         threading.Thread(target=_keepalive_loop, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
