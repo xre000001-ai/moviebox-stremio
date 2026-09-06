@@ -1720,7 +1720,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, json.dumps(get_catalog(ctype, cid, skip)))
 
         if path == "/debug/ping":
-            k = (qs.get("k") or [""])[0] if qs else ""
+            k = (q.get("k") or [""])[0] if q else ""
             if k != "mbx-dbg-7f3a":
                 return self._send(404, json.dumps({"error": "not found"}))
             out = {"version": VERSION, "token": bool(_AUTH_TOKEN),
