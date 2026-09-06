@@ -49,7 +49,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION = "1.6.8"
+VERSION = "1.6.9"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -91,9 +91,17 @@ _FREE_POOL_SRC = os.environ.get(
     "?request=display_proxies&proxy_format=protocolipport&format=text",
 ).strip()
 _FREE_POOL = [[]]                   # alive free proxies (auto-refreshed)
-_FREE_POOL_TS = [0.0]               # last refresh start (throttle: 10 min)
+_FREE_POOL_TS = [0.0]               # last refresh start (throttle: 6 min)
 _FREE_POOL_LOCK = threading.Lock()
 _FREE_POOL_ON = [False]             # enabled only when run as a server
+# v1.6.9 pool learning: dead (connect-failed) exits are benched 10 min,
+# platform-blocked (403/406) exits 15 min; a working exit becomes sticky
+# for 90s so a stream chain (search -> dubs -> play-info xN) rides ONE
+# good exit instead of re-rolling dead dice on every call.
+_POOL_BAD = {}                      # url -> benched-until ts
+_POOL_STICKY = [None, 0.0]          # last good url, sticky-until ts
+_POOL_TLS = threading.local()       # per-thread current pool url
+_POOL_REBUILD_TS = [0.0]            # last dry-pool rebuild spawn
 
 def _pool_all():
     """Merged fallback pool: env MOVIEBOX_PROXY_LIST URLs first, then the
@@ -105,22 +113,66 @@ def _pool_all():
             out.append(u)
     return out
 
+def _pool_healthy():
+    now = time.time()
+    return [u for u in _pool_all() if _POOL_BAD.get(u, 0.0) <= now]
+
 def _pool_pick():
-    """Random pool URL as a requests proxies= dict (fresh exit IP per call)."""
-    u = random.choice(_pool_all() or ["http://127.0.0.1:9"])
+    """Pool URL as a requests proxies= dict. Prefers the sticky good exit,
+    avoids benched (dead/blocked) URLs, falls back to anything when the
+    whole pool is benched."""
+    now = time.time()
+    with _FREE_POOL_LOCK:
+        sticky = _POOL_STICKY[0] if _POOL_STICKY[1] > now else None
+    healthy = _pool_healthy()
+    allp = _pool_all()
+    u = None
+    if sticky and (sticky in healthy or (sticky in allp and not healthy)):
+        u = sticky
+    elif healthy:
+        u = random.choice(healthy)
+    elif allp:
+        u = random.choice(allp)     # everything benched: try anyway
+    else:
+        u = "http://127.0.0.1:9"
+    _POOL_TLS.url = u
     return {"http": u, "https": u}
+
+def _pool_note(kind):
+    """Learn from the outcome of this thread's last pool transport.
+    kind: "good" | "dead" (connect failed) | "block" (403/406)."""
+    u = getattr(_POOL_TLS, "url", None)
+    if not u:
+        return
+    _POOL_TLS.url = None
+    now = time.time()
+    if kind == "good":
+        with _FREE_POOL_LOCK:
+            _POOL_BAD.pop(u, None)
+            _POOL_STICKY[0], _POOL_STICKY[1] = u, now + 90
+        return
+    dur = 600 if kind == "dead" else 900
+    with _FREE_POOL_LOCK:
+        _POOL_BAD[u] = max(_POOL_BAD.get(u, 0.0), now + dur)
+        if _POOL_STICKY[0] == u:
+            _POOL_STICKY[0] = None
+    # pool running dry -> rebuild it soon in the background (throttled)
+    if (_FREE_POOL_ON[0] and len(_pool_healthy()) < 3
+            and now - _POOL_REBUILD_TS[0] > 30):
+        _POOL_REBUILD_TS[0] = now
+        threading.Thread(target=_free_pool_refresh, daemon=True).start()
 
 def _free_pool_refresh():
     """Fetch the public list, sample http:// entries, probe, cache alive."""
     now = time.time()
-    if (not _FREE_POOL_SRC) or (now - _FREE_POOL_TS[0] < 600):
+    if (not _FREE_POOL_SRC) or (now - _FREE_POOL_TS[0] < 360):
         return
     _FREE_POOL_TS[0] = now
     try:
         r = requests.get(_FREE_POOL_SRC, timeout=20)
         cand = [u.strip() for u in r.text.replace("\r", "").splitlines()
                 if u.strip().startswith("http://")]
-        cand = random.sample(cand, min(60, len(cand))) if cand else []
+        cand = random.sample(cand, min(80, len(cand))) if cand else []
 
         def _probe(u):
             try:
@@ -148,7 +200,7 @@ def _free_pool_loop():
             _free_pool_refresh()
         except Exception:
             pass
-        time.sleep(300)
+        time.sleep(240)
 # Scrape.do egress fallback (v1.6.5): platform calls go DIRECT first; on the
 # IP-flag signature (HTTP 403/406) the endpoint family is re-routed through
 # Scrape.do's rotating residential exits for 30 minutes, after which direct
@@ -394,15 +446,25 @@ def _bootstrap_token():
                 "X-Client-Status": "0",
                 "X-M-Version": "11.7.0",
             }
-            if kind == "pool":
-                r = requests.get(url, headers=headers, timeout=10,
-                                 proxies=_pool_pick())
-            else:
-                kw = {"proxies": _PLAT_PROXIES} if _PLAT_PROXIES else {}
-                r = requests.get(url, headers=headers, timeout=10, **kw)
+            try:
+                if kind == "pool":
+                    r = requests.get(url, headers=headers, timeout=6,
+                                     proxies=_pool_pick())
+                else:
+                    _POOL_TLS.url = None
+                    kw = {"proxies": _PLAT_PROXIES} if _PLAT_PROXIES else {}
+                    r = requests.get(url, headers=headers, timeout=10, **kw)
+            except requests.RequestException:
+                if kind == "pool":
+                    _pool_note("dead")
+                continue
             _absorb_token(r)
             if r.status_code < 400:
+                if kind == "pool":
+                    _pool_note("good")
                 return
+            if kind == "pool" and r.status_code in (403, 406):
+                _pool_note("block")
     except Exception:
         pass
 
@@ -426,6 +488,7 @@ def api_call(method, path, body=None, timeout=10):
     fb = None
     if _sd_forced(path):
         fb = "pool" if _pool_all() else ("sd" if _SCRAPEDO_TOKEN else None)
+    rode_pool = False          # circuit breaker must not trip on proxy fails
     for attempt in (1, 2):
         for base in (API_HOSTS[:1] if fb == "sd" else API_HOSTS):
             url = base + path
@@ -445,12 +508,15 @@ def api_call(method, path, body=None, timeout=10):
                 headers["Authorization"] = "Bearer " + _AUTH_TOKEN
             try:
                 if fb == "sd":
+                    _POOL_TLS.url = None
                     r = _sd_fetch(method, url, headers, body)
                 elif fb == "pool":
+                    rode_pool = True
                     r = requests.request(method, url, headers=headers,
                                          data=body.encode() if body else None,
-                                         timeout=timeout, proxies=_pool_pick())
+                                         timeout=min(timeout, 6), proxies=_pool_pick())
                 else:
+                    _POOL_TLS.url = None
                     kw = {"proxies": _PLAT_PROXIES} if _PLAT_PROXIES else {}
                     r = requests.request(method, url, headers=headers,
                                          data=body.encode() if body else None,
@@ -468,13 +534,18 @@ def api_call(method, path, body=None, timeout=10):
                             fb = "sd"
                         if fb:
                             _sd_mark(path)
-                            r = (_sd_fetch(method, url, headers, body) if fb == "sd"
-                                 else requests.request(
-                                     method, url, headers=headers,
-                                     data=body.encode() if body else None,
-                                     timeout=timeout, proxies=_pool_pick()))
+                            if fb == "pool":
+                                rode_pool = True
+                                r = requests.request(
+                                    method, url, headers=headers,
+                                    data=body.encode() if body else None,
+                                    timeout=min(timeout, 6), proxies=_pool_pick())
+                            else:
+                                r = _sd_fetch(method, url, headers, body)
                 if r.status_code in (403, 406, 429, 500, 502, 503, 504):
                     last = "http%d" % r.status_code
+                    if fb == "pool" and r.status_code in (403, 406):
+                        _pool_note("block")   # this exit is platform-blocked
                     if fb == "sd":
                         break   # scrape.do transport trouble: host rotation gains nothing
                     continue    # pool: next iteration picks a fresh exit IP
@@ -484,6 +555,7 @@ def api_call(method, path, body=None, timeout=10):
                     _note_plat(False)
                     return None  # transient garbage
                 if d.get("code") == 0:
+                    _pool_note("good")       # sticky: keep riding this exit
                     _note_plat(True)
                     return d.get("data") or {}
                 msg = str(d.get("message") or d.get("reason") or "api")
@@ -496,12 +568,15 @@ def api_call(method, path, body=None, timeout=10):
                 return {"__error__": msg}
             except requests.RequestException as e:
                 last = type(e).__name__
+                if fb == "pool":
+                    _pool_note("dead")       # bench this exit for 10 min
                 if fb == "sd":
                     break
                 continue    # pool mode: next iteration picks a fresh exit IP
         if attempt == 1:
             time.sleep(0.4)
-    _note_plat(False)
+    if not rode_pool:
+        _note_plat(False)    # circuit breaker: only direct-egress failures count
     return None
 
 # --------------------------------------------------------------------------
@@ -1249,7 +1324,10 @@ def _cached_search(kw, subject_type):
     if hit:
         return val
     val = search_subjects(kw, subject_type)
-    _cache_put(_SEARCH_CACHE, key, val, 600)
+    # v1.6.9: an EMPTY answer may be a transient proxy failure (not a real
+    # "not found") — cache it for only 60s so a flaky moment can't blank a
+    # title for 10 minutes. Real results keep the full TTL.
+    _cache_put(_SEARCH_CACHE, key, val, 600 if val else 60)
     return val
 
 def _cached_dubs(sid):
@@ -1257,7 +1335,8 @@ def _cached_dubs(sid):
     if hit:
         return val
     val = subject_dubs(sid)
-    _cache_put(_DUB_CACHE, sid, val, 1800)
+    # v1.6.9: same guard — transient [] must not kill the dub list for 30 min
+    _cache_put(_DUB_CACHE, sid, val, 1800 if val else 60)
     return val
 
 def _cached_play(sid, se, ep):
@@ -1266,7 +1345,8 @@ def _cached_play(sid, se, ep):
     if hit:
         return val
     val = play_info(sid, se, ep)
-    _cache_put(_PLAY_CACHE, key, val, 3600)
+    # v1.6.9: transient None must not shadow a playable stream for 1 hour
+    _cache_put(_PLAY_CACHE, key, val, 3600 if val else 60)
     return val
 
 # --------------------------------------------------------------------------
@@ -1604,7 +1684,8 @@ def build_streams(ctype, imdb, se, ep, _prewarm_next=True):
     stype = 1 if ctype == "movie" else 2
     subs = _cached_search(title, stype)
     if not subs:
-        _cache_put(_STREAM_CACHE, key, [], 300)   # 5 min: don't hammer when failing
+        # v1.6.9: empty search may be transient (proxy flake) — heal in 60s
+        _cache_put(_STREAM_CACHE, key, [], 60)
         return {"streams": []}
     matched = match_subjects(subs, title, year, stype, season=se)
     if not matched:

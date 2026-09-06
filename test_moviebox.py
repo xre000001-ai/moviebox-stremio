@@ -1674,5 +1674,131 @@ def test_health_reports_free_pool():
     finally:
         addon._FREE_POOL[0] = saved_fp
 
+
+# --- v1.6.9: pool learning + transient-cache healing ----------------------
+
+def _pool_state_reset():
+    addon._POOL_BAD.clear()
+    addon._POOL_STICKY[0], addon._POOL_STICKY[1] = None, 0.0
+    addon._POOL_TLS.url = None
+
+def test_pool_learning_benches_and_sticks():
+    saved_urls, saved_fp = list(addon._PROXY_URLS), list(addon._FREE_POOL[0])
+    try:
+        _pool_state_reset()
+        addon._PROXY_URLS = ["http://a:1", "http://b:2", "http://c:3"]
+        addon._FREE_POOL[0] = []
+        # all healthy: any pick
+        p = addon._pool_pick()
+        assert p["http"] in ("http://a:1", "http://b:2", "http://c:3")
+        # bench a dead + a blocked exit -> never picked again
+        addon._POOL_BAD["http://a:1"] = time.time() + 600
+        addon._POOL_BAD["http://b:2"] = time.time() + 900
+        for _ in range(20):
+            assert addon._pool_pick()["http"] == "http://c:3"
+        # good note -> sticky for subsequent picks
+        addon._POOL_TLS.url = "http://c:3"
+        addon._pool_note("good")
+        assert addon._POOL_STICKY[0] == "http://c:3"
+        assert addon._pool_pick()["http"] == "http://c:3"   # sticky preferred
+        # block note on the sticky -> cleared + benched
+        addon._POOL_TLS.url = "http://c:3"
+        addon._pool_note("block")
+        assert addon._POOL_STICKY[0] is None
+        assert "http://c:3" in addon._POOL_BAD
+        # everything benched -> still returns something (try anyway)
+        pick = addon._pool_pick()["http"]
+        assert pick in ("http://a:1", "http://b:2", "http://c:3")
+    finally:
+        _pool_state_reset()
+        addon._PROXY_URLS = saved_urls
+        addon._FREE_POOL[0] = saved_fp
+
+def test_api_call_pool_notes_block_on_406():
+    addon._PLAT_CB_UNTIL = 0.0
+    addon._PLAT_FAILS = 0
+    saved_urls, saved_fp = list(addon._PROXY_URLS), list(addon._FREE_POOL[0])
+    try:
+        _pool_state_reset()
+        addon._PROXY_URLS = []
+        addon._FREE_POOL[0] = ["http://f1:1"]
+        addon._SD_FALLBACK.clear()
+        calls = []
+        def fake_request(method, url, **kw):
+            px = kw.get("proxies") or {}
+            u = px.get("http")
+            calls.append(u)
+            resp = mock.Mock(status_code=403 if u in (None, "http://f1:1") else 200)
+            resp.headers = {}
+            resp.json = lambda: {}
+            return resp
+        with mock.patch.object(addon, "_bootstrap_token"), \
+             mock.patch.object(addon.requests, "request", side_effect=fake_request):
+            addon._AUTH_TOKEN = "tok"
+            d = addon.api_call("POST", SD_PATH, "{}")
+        assert d is None                                # everything 403'd
+        assert calls[0] is None                         # direct tried first
+        assert "http://f1:1" in calls                   # pool engaged after 403
+        assert "http://f1:1" in addon._POOL_BAD         # benched after its 403
+    finally:
+        _pool_state_reset()
+        addon._PROXY_URLS = saved_urls
+        addon._FREE_POOL[0] = saved_fp
+        addon._SD_FALLBACK.clear()
+        addon._PLAT_FAILS = 0
+
+def test_circuit_not_tripped_by_pool_failures():
+    # 4 consecutive pool-exhausted calls must NOT open the platform circuit
+    saved_cb, saved_f = addon._PLAT_CB_UNTIL, addon._PLAT_FAILS
+    saved_urls, saved_fp = list(addon._PROXY_URLS), list(addon._FREE_POOL[0])
+    try:
+        _pool_state_reset()
+        addon._PLAT_CB_UNTIL = 0.0
+        addon._PLAT_FAILS = 0
+        addon._PROXY_URLS = ["http://p:1"]
+        addon._FREE_POOL[0] = []
+        addon._SD_FALLBACK.clear()
+        addon._sd_mark(SD_PATH)          # family flagged -> rides the pool
+        with mock.patch.object(addon, "_bootstrap_token"), \
+             mock.patch.object(addon.requests, "request",
+                               side_effect=addon.requests.ConnectionError("dead")):
+            addon._AUTH_TOKEN = "tok"
+            for _ in range(4):
+                assert addon.api_call("POST", SD_PATH, "{}") is None
+        assert addon._PLAT_CB_UNTIL == 0.0             # circuit stayed closed
+    finally:
+        _pool_state_reset()
+        addon._PLAT_CB_UNTIL, addon._PLAT_FAILS = saved_cb, saved_f
+        addon._PROXY_URLS = saved_urls
+        addon._FREE_POOL[0] = saved_fp
+        addon._SD_FALLBACK.clear()
+
+def test_transient_negative_cache_heals_fast():
+    # empty/None answers are cached only 60s (not 10-30 min): after the
+    # negative entry expires the next call re-queries instead of serving
+    # the stale blank
+    addon._SEARCH_CACHE.clear()
+    addon._DUB_CACHE.clear()
+    calls = {"n": 0}
+    def fake_search(kw, stype):
+        calls["n"] += 1
+        return [] if calls["n"] == 1 else [{"subjectId": "1", "title": kw}]
+    with mock.patch.object(addon, "search_subjects", side_effect=fake_search):
+        assert addon._cached_search("kw", 1) == []          # transient empty
+        _, exp = addon._SEARCH_CACHE[("kw", 1)]
+        assert 0 < exp - time.time() <= 61                  # short negative TTL
+        addon._SEARCH_CACHE[("kw", 1)] = ([], time.time() - 1)   # force expiry
+        assert addon._cached_search("kw", 1) == [{"subjectId": "1", "title": "kw"}]
+    dcalls = {"n": 0}
+    def fake_dubs(sid):
+        dcalls["n"] += 1
+        return [] if dcalls["n"] == 1 else [{"subjectId": "9"}]
+    with mock.patch.object(addon, "subject_dubs", side_effect=fake_dubs):
+        assert addon._cached_dubs("7") == []
+        _, dexp = addon._DUB_CACHE["7"]
+        assert 0 < dexp - time.time() <= 61
+        addon._DUB_CACHE["7"] = ([], time.time() - 1)
+        assert addon._cached_dubs("7") == [{"subjectId": "9"}]
+
 if __name__ == "__main__":
     main()
