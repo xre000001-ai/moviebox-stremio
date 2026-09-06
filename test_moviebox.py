@@ -1225,6 +1225,36 @@ def test_stream_stale_while_revalidate():
     addon._STREAM_CACHE.clear(); addon._STREAM_STALE.clear()
     addon._STREAM_REFRESHING.clear()
 
+def test_api_call_refreshes_stale_token():
+    """Server-side token expiry must self-heal: drop, re-bootstrap, retry."""
+    addon._AUTH_TOKEN = "stale"
+    addon._AUTH_REAUTH_TS = 0.0
+    made = {"n": 0}
+    class Resp:
+        status_code = 200
+        headers = {}
+        def __init__(self, payload):
+            self._p = payload
+        def json(self):
+            return self._p
+    def fake_request(method, url, headers=None, data=None, timeout=None):
+        made["n"] += 1
+        if (headers or {}).get("Authorization", "").endswith("stale"):
+            return Resp({"code": -1, "message": "Token is invalid"})
+        return Resp({"code": 0, "data": {"ok": True}})
+    def fake_bootstrap():
+        addon._AUTH_TOKEN = "fresh"
+    try:
+        with mock.patch.object(addon.requests, "request", side_effect=fake_request), \
+             mock.patch.object(addon, "_bootstrap_token", side_effect=fake_bootstrap):
+            d = addon.api_call("GET", "/wefeed-mobile-bff/subject-api/get?subjectId=1")
+        assert d == {"ok": True}                 # recovered with the fresh token
+        assert made["n"] >= 2                    # the stale attempt + the retry
+        assert addon._AUTH_TOKEN == "fresh"
+    finally:
+        addon._AUTH_TOKEN = None
+        addon._AUTH_REAUTH_TS = 0.0
+
 def test_gzip_response():
     import gzip as gz
     captured, buf = {}, __import__("io").BytesIO()

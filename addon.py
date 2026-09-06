@@ -49,7 +49,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -155,6 +155,20 @@ def _client_info():
 # --------------------------------------------------------------------------
 _AUTH_TOKEN = None
 _AUTH_LOCK = threading.RLock()
+_AUTH_REAUTH_TS = 0.0          # last forced re-auth (throttle: 1 per 30s)
+_AUTH_ERR_RE = re.compile(r"token|auth|login|expire|sign", re.I)
+
+def _force_reauth():
+    """Drop a server-side-expired token and pull a fresh one (throttled)."""
+    global _AUTH_REAUTH_TS, _AUTH_TOKEN
+    with _AUTH_LOCK:
+        now = time.time()
+        if now - _AUTH_REAUTH_TS < 30:
+            return False
+        _AUTH_REAUTH_TS = now
+        _AUTH_TOKEN = None
+        _bootstrap_token()
+        return bool(_AUTH_TOKEN)
 
 def _absorb_token(resp):
     global _AUTH_TOKEN
@@ -232,8 +246,13 @@ def api_call(method, path, body=None, timeout=10):
                     return None  # transient garbage
                 if d.get("code") == 0:
                     return d.get("data") or {}
+                msg = str(d.get("message") or d.get("reason") or "api")
+                # server-side token expiry ("Token is invalid") self-heals:
+                # drop the stale token, bootstrap a fresh one, retry
+                if _AUTH_TOKEN and _AUTH_ERR_RE.search(msg) and _force_reauth():
+                    continue          # same call again, now with a fresh token
                 # definitive API-level error
-                return {"__error__": d.get("message") or d.get("reason") or "api"}
+                return {"__error__": msg}
             except requests.RequestException as e:
                 last = type(e).__name__
                 continue
