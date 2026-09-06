@@ -554,7 +554,7 @@ def test_build_streams_series_happy_path():
     addon._STREAM_CACHE.clear(); addon._STREAM_STALE.clear(); addon._PLAY_CACHE.clear(); addon._DUB_CACHE.clear(); addon._SEARCH_CACHE.clear()
     dubs = [{"subjectId": "973041525783496480", "lanName": "Hindi dub"},
             {"subjectId": "3089349649006742360", "lanName": "Original"}]
-    with mock.patch.object(addon, "cinemeta",
+    with mock.patch.object(addon, "_meta_any",
                            return_value={"name": "Squid Game", "year": "2021"}), \
          mock.patch.object(addon, "search_subjects",
                            return_value=[SUBJ_SQUID_ORIG, SUBJ_SQUID_HI]), \
@@ -587,7 +587,7 @@ def test_build_streams_series_happy_path():
 def test_build_streams_movie_no_dubs():
     addon._MPD_CACHE.clear()
     addon._STREAM_CACHE.clear(); addon._STREAM_STALE.clear(); addon._PLAY_CACHE.clear(); addon._DUB_CACHE.clear(); addon._SEARCH_CACHE.clear()
-    with mock.patch.object(addon, "cinemeta",
+    with mock.patch.object(addon, "_meta_any",
                            return_value={"name": "Inception", "year": "2010"}), \
          mock.patch.object(addon, "search_subjects",
                            return_value=[SUBJ_INCEPTION]), \
@@ -615,7 +615,7 @@ def test_build_streams_result_cached():
     def counting_search(kw, st):
         calls["search"] += 1
         return [SUBJ_INCEPTION]
-    with mock.patch.object(addon, "cinemeta",
+    with mock.patch.object(addon, "_meta_any",
                            return_value={"name": "Inception", "year": "2010"}), \
          mock.patch.object(addon, "search_subjects", side_effect=counting_search), \
          mock.patch.object(addon, "subject_dubs", return_value=[]), \
@@ -704,7 +704,7 @@ def test_lazy_hls_route_404_when_no_stream():
 def test_stream_route_accepts_encoded_colons():
     # many Stremio clients send series ids percent-encoded: tt...%3A1%3A1
     addon._STREAM_CACHE.clear(); addon._STREAM_STALE.clear(); addon._PLAY_CACHE.clear(); addon._DUB_CACHE.clear(); addon._SEARCH_CACHE.clear()
-    with mock.patch.object(addon, "cinemeta",
+    with mock.patch.object(addon, "_meta_any",
                            return_value={"name": "Squid Game", "year": "2021"}), \
          mock.patch.object(addon, "search_subjects",
                            return_value=[SUBJ_SQUID_ORIG]), \
@@ -724,7 +724,7 @@ def test_stream_route_accepts_encoded_colons():
 
 def test_build_streams_no_match():
     addon._STREAM_CACHE.clear(); addon._STREAM_STALE.clear(); addon._PLAY_CACHE.clear(); addon._DUB_CACHE.clear(); addon._SEARCH_CACHE.clear()
-    with mock.patch.object(addon, "cinemeta",
+    with mock.patch.object(addon, "_meta_any",
                            return_value={"name": "Zzz Nothing", "year": "1990"}), \
          mock.patch.object(addon, "search_subjects", return_value=[SUBJ_INCEPTION]):
         res = addon.build_streams("movie", "tt0000001", 1, 1)
@@ -733,7 +733,7 @@ def test_build_streams_no_match():
 def test_build_streams_play_info_transparent_on_none():
     addon._STREAM_CACHE.clear(); addon._STREAM_STALE.clear(); addon._PLAY_CACHE.clear(); addon._DUB_CACHE.clear(); addon._SEARCH_CACHE.clear()
     addon._MPD_CACHE.clear()
-    with mock.patch.object(addon, "cinemeta",
+    with mock.patch.object(addon, "_meta_any",
                            return_value={"name": "Inception", "year": "2010"}), \
          mock.patch.object(addon, "search_subjects", return_value=[SUBJ_INCEPTION]), \
          mock.patch.object(addon, "subject_dubs", return_value=[]), \
@@ -1155,7 +1155,7 @@ def test_cross_dub_subtitle_rescue():
     def caps_by_sid(sid, stream_id):
         return caps if sid == "6391474290696802080" else [{"lan": "ar", "url": "https://c/a.srt"}]
     dubs = [{"subjectId": "973041525783496480", "lanName": "Hindi dub"}]
-    with mock.patch.object(addon, "cinemeta",
+    with mock.patch.object(addon, "_meta_any",
                            return_value={"name": "Inception", "year": "2010"}), \
          mock.patch.object(addon, "search_subjects", return_value=[SUBJ_INCEPTION]), \
          mock.patch.object(addon, "subject_dubs", return_value=dubs), \
@@ -1183,7 +1183,7 @@ def test_captions_fetched_once_per_title():
         return nine
     dubs = [{"subjectId": "973041525783496480", "lanName": "Hindi dub"},
             {"subjectId": "1111111111111111111", "lanName": "Tamil dub"}]
-    with mock.patch.object(addon, "cinemeta",
+    with mock.patch.object(addon, "_meta_any",
                            return_value={"name": "Inception", "year": "2010"}), \
          mock.patch.object(addon, "search_subjects", return_value=[SUBJ_INCEPTION]), \
          mock.patch.object(addon, "subject_dubs", return_value=dubs), \
@@ -1203,7 +1203,7 @@ def test_captions_fetched_once_per_title():
 def test_stream_stale_while_revalidate():
     addon._MPD_CACHE.clear(); addon._STREAM_CACHE.clear(); addon._STREAM_STALE.clear()
     addon._PLAY_CACHE.clear(); addon._DUB_CACHE.clear(); addon._SEARCH_CACHE.clear()
-    with mock.patch.object(addon, "cinemeta",
+    with mock.patch.object(addon, "_meta_any",
                            return_value={"name": "Inception", "year": "2010"}), \
          mock.patch.object(addon, "search_subjects", return_value=[SUBJ_INCEPTION]), \
          mock.patch.object(addon, "subject_dubs", return_value=[]), \
@@ -1948,7 +1948,7 @@ def test_build_streams_transient_message_not_cached():
     addon._STREAM_CACHE.clear()
     key = ("movie", "tt9990001", None, None)
     try:
-        with mock.patch.object(addon, "cinemeta",
+        with mock.patch.object(addon, "_meta_any",
                                return_value={"name": "Foo", "year": "2020"}), \
              mock.patch.object(addon, "_cached_search", return_value=None):
             r = addon.build_streams("movie", "tt9990001", None, None, _prewarm_next=False)
@@ -2005,7 +2005,7 @@ def test_build_streams_alt_title_rescue():
     sub = {"subjectId": "777", "title": "See You at Work Tomorrow! [Hindi]",
            "subjectType": 2, "releaseDate": "2026-06-22", "corner": "Hindi"}
     try:
-        with mock.patch.object(addon, "cinemeta",
+        with mock.patch.object(addon, "_meta_any",
                                return_value={"name": "Back to Work!", "year": "2026",
                                              "tmdb": "289763"}), \
              mock.patch.object(addon, "_cached_search",
@@ -2023,6 +2023,48 @@ def test_build_streams_alt_title_rescue():
     finally:
         addon._STREAM_CACHE.clear()
         addon._SEARCH_CACHE.clear()
+
+
+# --- v1.7.3: metadata race (cinemeta / TMDB / IMDb-suggest) ------------------
+
+def test_meta_any_race_fastest_wins():
+    addon._CINEMETA_CACHE.clear()
+    calls = {"c": 0, "t": 0, "i": 0}
+    def slow_cinemeta(ctype, imdb):
+        calls["c"] += 1
+        time.sleep(0.5)
+        return {"name": "FromCinemeta", "year": "2020", "tmdb": "111"}
+    def fast_tmdb(ctype, imdb):
+        calls["t"] += 1
+        return {"name": "FromTMDB", "year": "2021", "tmdb": "222"}
+    def imdb_sug(imdb):
+        calls["i"] += 1
+        return {"name": "FromIMDb", "year": "2022"}
+    try:
+        with mock.patch.object(addon, "cinemeta", side_effect=slow_cinemeta), \
+             mock.patch.object(addon, "_tmdb_find_id", side_effect=fast_tmdb), \
+             mock.patch.object(addon, "_imdb_suggest_id", side_effect=imdb_sug):
+            t0 = time.time()
+            v = addon._meta_any("movie", "tt99990001")
+            dt = time.time() - t0
+            v2 = addon._meta_any("movie", "tt99990001")   # cached
+        assert v["name"] == "FromTMDB"           # fastest valid answer won
+        assert dt < 0.45                          # did not wait for cinemeta
+        assert v2 == v
+        assert calls == {"c": 1, "t": 1, "i": 1}  # second call: cache hit, no calls
+    finally:
+        addon._CINEMETA_CACHE.clear()
+
+def test_meta_any_all_fail_transient():
+    addon._CINEMETA_CACHE.clear()
+    try:
+        with mock.patch.object(addon, "cinemeta", return_value=None), \
+             mock.patch.object(addon, "_tmdb_find_id", return_value=None), \
+             mock.patch.object(addon, "_imdb_suggest_id", return_value=None):
+            assert addon._meta_any("movie", "tt99990002") is None
+            assert ("movie", "tt99990002") not in addon._CINEMETA_CACHE  # retry next time
+    finally:
+        addon._CINEMETA_CACHE.clear()
 
 if __name__ == "__main__":
     main()

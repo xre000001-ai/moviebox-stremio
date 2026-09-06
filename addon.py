@@ -40,7 +40,7 @@ import time
 import uuid
 import random
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, urlencode, quote, unquote
 
@@ -49,7 +49,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION = "1.7.2"
+VERSION = "1.7.3"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -828,7 +828,7 @@ def cinemeta(ctype, imdb):
     if hit:
         return val
     try:
-        r = requests.get("%s/meta/%s/%s.json" % (CINEMETA, ctype, imdb), timeout=10)
+        r = requests.get("%s/meta/%s/%s.json" % (CINEMETA, ctype, imdb), timeout=4)
         if r.status_code == 200:
             m = (r.json().get("meta") or {})
             name = m.get("name")
@@ -857,7 +857,7 @@ def _imdb_suggest_id(imdb):
         return val
     try:
         u = "%s/%s/%s.json" % (IMDB_SUGGEST, quote(imdb[:1]), quote(imdb))
-        r = requests.get(u, timeout=8)
+        r = requests.get(u, timeout=4)
         if r.status_code == 200:
             for e in (r.json().get("d") or []):
                 if e.get("id") == imdb and e.get("l"):
@@ -872,7 +872,7 @@ def _imdb_suggest_id(imdb):
 def _imdb_suggest(title, year, ctype):
     try:
         u = "%s/%s/%s.json" % (IMDB_SUGGEST, quote(title.lower()[:1]), quote(title))
-        r = requests.get(u, timeout=8)
+        r = requests.get(u, timeout=4)
         if r.status_code != 200:
             return None
         want = clean_title(title).lower()
@@ -919,6 +919,67 @@ def _tmdb_find(title, year, ctype):
     except Exception:
         return None
     return None
+
+def _tmdb_find_id(ctype, imdb):
+    """id -> {name, year, tmdb} via TMDB /find (external_source=imdb_id).
+    Fastest of the three sources and returns the tmdb id we need for the
+    alt-title rescue for free."""
+    try:
+        r = requests.get("https://api.themoviedb.org/3/find/%s" % imdb,
+                         params={"api_key": TMDB_API_KEY,
+                                 "external_source": "imdb_id"}, timeout=4)
+        if r.status_code != 200:
+            return None
+        d = r.json()
+        rec = ((d.get("movie_results") or [None])[0] if ctype == "movie"
+               else (d.get("tv_results") or [None])[0])
+        if not rec:
+            return None
+        name = rec.get("title") or rec.get("name")
+        if not name:
+            return None
+        date = rec.get("release_date") or rec.get("first_air_date") or ""
+        return {"name": name, "year": date[:4], "tmdb": str(rec.get("id") or "")}
+    except Exception:
+        return None
+
+_META_EX = ThreadPoolExecutor(max_workers=6)
+
+def _meta_any(ctype, imdb):
+    """id -> {name, year, tmdb}: CINEMETA / TMDB / IMDb-suggest race in
+    parallel, first valid answer wins (each is ~0.1-0.4s warm, but any of
+    them can hit a slow spell — the old serial chain could block a cold
+    stream build for 18s). Result cached 12h; a total loss caches nothing
+    so the next request retries."""
+    hit, val = _cache_get(_CINEMETA_CACHE, (ctype, imdb))
+    if hit:
+        return val
+    futs = [_META_EX.submit(cinemeta, ctype, imdb),
+            _META_EX.submit(_tmdb_find_id, ctype, imdb),
+            _META_EX.submit(_imdb_suggest_id, imdb)]
+    winner = None
+    deadline = time.time() + 7
+    while futs and not winner:
+        wait(futs, timeout=max(0.2, deadline - time.time()),
+             return_when=FIRST_COMPLETED)
+        for f in list(futs):
+            if not f.done():
+                continue
+            futs.remove(f)
+            try:
+                v = f.result()
+            except Exception:
+                v = None
+            if v and v.get("name"):
+                winner = v
+                break
+    if winner:
+        winner.setdefault("tmdb", "")
+        _cache_put(_CINEMETA_CACHE, (ctype, imdb), winner, 12 * 3600)
+        return winner
+    # definitive miss (cinemeta 404 caches None itself); otherwise transient
+    hit2, val2 = _cache_get(_CINEMETA_CACHE, (ctype, imdb))
+    return val2 if hit2 else None
 
 def resolve_imdb(title, year, ctype):
     key = (title.lower(), year, ctype)
@@ -1859,7 +1920,7 @@ def build_streams(ctype, imdb, se, ep, _prewarm_next=True):
                     threading.Thread(target=_bg_refresh, daemon=True,
                                      args=(ctype, imdb, se, ep, key)).start()
             return {"streams": stale[1]}
-    meta = cinemeta(ctype, imdb) or _imdb_suggest_id(imdb)
+    meta = _meta_any(ctype, imdb)
     if not meta:
         return {"streams": [], "message": "no metadata"}
     title, year = meta["name"], meta["year"]
