@@ -573,7 +573,8 @@ def test_build_streams_series_happy_path():
     # multi-line card: bold "title (dub)" name + 3 description lines
     assert s0["name"].startswith("𖤍 Squid Game (")
     assert s0["description"].count("\n") == 2
-    assert "480p–1080p" in s0["description"]      # real resolution range
+    assert "1080p" in s0["description"]           # v1.8.0: MAX quality only
+    assert "–" not in s0["description"].split("\n")[0]   # no more 480p–1080p range
     assert "HEVC" in s0["description"] and "863.7 MB" in s0["description"]
     assert "▣ S01E01" in s0["description"] and "▣ MovieBox" in s0["description"]
     assert "NO SUB" in s0["description"]          # captions mocked empty
@@ -813,14 +814,13 @@ def test_api_call_bootstraps_when_no_token():
     addon._AUTH_TOKEN = "tok"
 
 def test_manifest_shape():
-    cats = [c["id"] for c in addon.MANIFEST["catalogs"]]
-    assert "netnaija-movies" in cats and "moviebox-movies" in cats
-    assert "netnaija-series" in cats and "moviebox-series" in cats
-    assert cats.count("netnaija-animated") == 2  # movie + series entries
+    # v1.8.0 (user directive): STREAM-ONLY — no catalogs of its own; the
+    # addon supplies streams for titles opened from other catalog addons.
+    assert addon.MANIFEST["catalogs"] == []
     assert set(addon.MANIFEST["types"]) == {"movie", "series"}
     assert "type" not in addon.MANIFEST           # must be 'types' (Stremio protocol)
     assert addon.MANIFEST["idPrefixes"] == ["tt"]
-    assert "stream" in addon.MANIFEST["resources"]
+    assert addon.MANIFEST["resources"] == ["stream"]
 
 def test_listing_paths_covered():
     for site in addon.SITES:

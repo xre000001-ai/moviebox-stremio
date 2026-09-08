@@ -50,7 +50,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION = "1.7.9"
+VERSION = "1.8.0"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -1970,7 +1970,8 @@ def _fmt_dur(secs):
     return "%d min" % (secs // 60)
 
 def _res_range(pi, pl):
-    """'480p-1080p' style label from play-info resolutions."""
+    """Max quality only (user directive): '480p-1080p' used to be shown —
+    the card now carries just the top resolution the entry serves."""
     raw = pi.get("displayResolutions") or (pl or {}).get("resolutions") or ""
     try:
         heights = sorted({int(x) for x in re.findall(r"\d{3,4}", str(raw))})
@@ -1978,9 +1979,7 @@ def _res_range(pi, pl):
         heights = []
     if not heights:
         return "MULTI"
-    if len(heights) == 1:
-        return "%dp" % heights[0]
-    return "%dp–%dp" % (heights[0], heights[-1])
+    return "%dp" % heights[-1]
 
 def _sub_line(subs):
     """Third card line: subtitle count + languages."""
@@ -2486,40 +2485,19 @@ MANIFEST = {
     "id": "com.movbox.stremio",
     "version": VERSION,
     "name": "MovieBox",
-    "description": ("Netnaija.film + MovieBoxOnline.net in Stremio — movies & series "
-                    "in up to 1080p, multi-language dubs. HEVC/H.265 streams "
-                    "(best on Stremio desktop / Android TV)."),
+    "description": ("Stream-only addon for Netnaija.film + MovieBoxOnline.net — "
+                    "open any movie or series (up to 1080p, multi-language "
+                    "dubs, HEVC) and direct CDN streams appear. No catalogs."),
     "types": ["movie", "series"],
     "idPrefixes": ["tt"],
     "logo": "/logo.png",
     "behaviorHints": {"configurable": False},
-    "catalogs": [
-        {"type": "movie", "id": "netnaija-movies", "name": "Netnaija • Movies",
-         "extra": [{"name": "search", "isRequired": False},
-                            {"name": "skip", "isRequired": False}]},
-        {"type": "movie", "id": "moviebox-movies", "name": "MovieBox • Movies",
-         "extra": [{"name": "search", "isRequired": False},
-                            {"name": "skip", "isRequired": False}]},
-        {"type": "movie", "id": "netnaija-animated", "name": "Netnaija • Animation",
-         "extra": [{"name": "search", "isRequired": False},
-                            {"name": "skip", "isRequired": False}]},
-        {"type": "movie", "id": "moviebox-animated", "name": "MovieBox • Animation",
-         "extra": [{"name": "search", "isRequired": False},
-                            {"name": "skip", "isRequired": False}]},
-        {"type": "series", "id": "netnaija-series", "name": "Netnaija • Series",
-         "extra": [{"name": "search", "isRequired": False},
-                            {"name": "skip", "isRequired": False}]},
-        {"type": "series", "id": "moviebox-series", "name": "MovieBox • Series",
-         "extra": [{"name": "search", "isRequired": False},
-                            {"name": "skip", "isRequired": False}]},
-        {"type": "series", "id": "netnaija-animated", "name": "Netnaija • Animation",
-         "extra": [{"name": "search", "isRequired": False},
-                            {"name": "skip", "isRequired": False}]},
-        {"type": "series", "id": "moviebox-animated", "name": "MovieBox • Animation",
-         "extra": [{"name": "search", "isRequired": False},
-                            {"name": "skip", "isRequired": False}]},
-    ],
-    "resources": ["stream", "catalog"],
+    # v1.8.0 (user directive): STREAM-ONLY. No catalogs — the addon now
+    # supplies streams for whatever the user opens from their own catalogs
+    # (IMDb, Trakt, ...), Torrentio-style. Less platform volume at boot
+    # (no six-catalog prewarm) = less IP flagging = faster stream builds.
+    "catalogs": [],
+    "resources": ["stream"],
 }
 
 # --------------------------------------------------------------------------
@@ -2571,10 +2549,11 @@ _LANDING_HTML = """<!doctype html>
 </header>
 
 <div class="grid">
-  <div class="card"><h3>🎞 8 Catalogs</h3>
-    <p>Netnaija &amp; MovieBox &mdash; each with <span class="b">Movies</span>,
-    <span class="b">Series</span> and <span class="b">Animation</span> shelves,
-    searchable straight from Stremio's Discover.</p></div>
+  <div class="card"><h3>⚡ Stream-only</h3>
+    <p>Install it next to any catalog addon (IMDb, Trakt&hellip;) and open any
+    movie or series &mdash; direct CDN streams appear, Torrentio-style.
+    No catalogs of its own (v1.8.0) = less platform traffic = faster
+    stream builds.</p></div>
   <div class="card"><h3>🗣 Multi-Dub</h3>
     <p>Every title shows one card per language track. Hindi, Original, English,
     Tamil, Telugu, Bengali, Spanish, Portuguese&hellip; whatever the platform hosts.</p></div>
@@ -2582,8 +2561,8 @@ _LANDING_HTML = """<!doctype html>
     <p>This server only serves tiny text (JSON + m3u8). All video segments stream
     <span class="b">straight from the CDN to your player</span> &mdash; fast and private.</p></div>
   <div class="card"><h3>📅 Always Fresh</h3>
-    <p>Catalogs refresh every 6 hours and results are cached 10 minutes,
-    so playback starts instantly on repeat.</p></div>
+    <p>Stream lists are cached and replay in ~0.3s; slow builds answer
+    honestly and finish in the background for the retry.</p></div>
 </div>
 
 <div class="steps">
@@ -2997,22 +2976,17 @@ def _keepalive_loop():
         time.sleep(240)
 
 def _boot_prewarm():
-    """Background warm-up after boot: wait for the first pool, bootstrap
-    the token, then build all six catalogs — so the first real user
-    request never pays the cold cost (free-tier CPU + fresh caches)."""
+    """Background warm-up after boot: wait for the first pool and bootstrap
+    the token, so the first real /stream request never pays the cold cost.
+    v1.8.0: the six-catalog prewarm is GONE (stream-only manifest) — it was
+    the biggest source of platform call volume on a fresh boot, which fed
+    the very IP flagging that made stream builds slow."""
     try:
         for _ in range(8):                 # up to ~80s for the first pool
             if _pool_all():
                 break
             time.sleep(10)
         _bootstrap_token()
-        for ctype, cat in (("movie", "moviebox-movies"), ("movie", "netnaija-movies"),
-                           ("movie", "moviebox-animated"), ("movie", "netnaija-animated"),
-                           ("series", "moviebox-series"), ("series", "netnaija-series")):
-            try:
-                get_catalog(ctype, cat, 0)
-            except Exception:
-                pass
     except Exception:
         pass
 
