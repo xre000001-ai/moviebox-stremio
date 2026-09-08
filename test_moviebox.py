@@ -1310,6 +1310,7 @@ def test_api_call_uses_proxy_when_configured():
 
 def test_bootstrap_uses_proxy_when_configured():
     addon._PLAT_CB_UNTIL = 0.0
+    addon._DIRECT_AUTH_FLAG[0] = 0.0     # v1.7.5: don't inherit other tests' flag
     captured = {}
     def fake_get(url, **kw):
         captured["proxies"] = kw.get("proxies")
@@ -1540,6 +1541,7 @@ def test_bootstrap_uses_pool():
         assert picked == [None, None, "http://p1:1", "http://p2:2"]  # 2 direct hosts, then pool rotation
     finally:
         addon._PROXY_URLS = saved_urls
+        addon._DIRECT_AUTH_FLAG[0] = 0.0   # v1.7.5: direct 403 now sets the flag
 
 def test_warm_skipped_while_pool_active():
     # v1.6.8: pool is fallback-only, so warm is skipped only while the
@@ -1600,10 +1602,15 @@ def test_free_pool_refresh_probes_and_caches():
                 r.text = list_text
                 return r
             # v1.6.10: platform probe (tab-operating via the candidate)
+            # v1.7.5: the probe also captures the exit's own x-user token —
+            # exits that drop the header are no longer "good".
             assert "tab-operating" in url
             px = kw.get("proxies") or {}
             u = px.get("http")
-            return mock.Mock(status_code=200 if u in ("http://a:1", "http://c:3") else 403)
+            good = u in ("http://a:1", "http://c:3")
+            r = mock.Mock(status_code=200 if good else 403)
+            r.headers = {"x-user": '{"token": "T"}'} if good else {}
+            return r
         with mock.patch.object(addon.requests, "get", side_effect=fake_get):
             addon._free_pool_refresh()
         assert sorted(addon._FREE_POOL[0]) == ["http://a:1", "http://c:3"]  # socks skipped, platform-blocked dropped
@@ -2090,3 +2097,270 @@ def test_match_leading_article_insensitive():
 
 if __name__ == "__main__":
     main()
+
+
+# --- v1.7.5: per-exit tokens, direct-auth flag, chain budget, search route --
+
+SD_PATH = "/wefeed-mobile-bff/subject-api/search/v2"
+
+def _v175_reset():
+    addon._PLAT_CB_UNTIL = 0.0
+    addon._PLAT_FAILS = 0
+    addon._DIRECT_AUTH_FLAG[0] = 0.0
+    addon._EXIT_TOKENS.clear()
+    addon._SD_FALLBACK.clear()
+    _pool_state_reset()
+    _CHAIN_CLEAN()
+
+def _CHAIN_CLEAN():
+    for attr in ("t",):
+        try:
+            delattr(addon._CHAIN_DDL, attr)
+        except Exception:
+            pass
+    try:
+        delattr(addon._EGRESS, "pool")
+    except Exception:
+        pass
+
+def test_catalog_search_path_route():
+    # v1.7.5: Stremio's canonical /catalog/{type}/{id}/search={q}.json form
+    _v175_reset()
+    got = {}
+    def fake_search(ctype, q):
+        got["ctype"], got["q"] = ctype, q
+        return {"metas": []}
+    def fake_cat(ctype, cid, skip):
+        got["cat"] = (ctype, cid, skip)
+        return {"metas": []}
+    with mock.patch.object(addon, "search_catalog", fake_search), \
+         mock.patch.object(addon, "get_catalog", fake_cat):
+        c = _http_get("/catalog/movie/moviebox-movies/search=dead%20lover.json")
+        assert c["code"] == 200
+        assert got["ctype"] == "movie" and got["q"] == "dead lover"
+        c = _http_get("/catalog/series/netnaija-series/search=naagin.json")
+        assert c["code"] == 200
+        assert got["ctype"] == "series" and got["q"] == "naagin"
+        # plain catalog + query-param search still work
+        c = _http_get("/catalog/movie/moviebox-movies.json?skip=10")
+        assert c["code"] == 200 and got["cat"] == ("movie", "moviebox-movies", 10)
+        c = _http_get("/catalog/movie/moviebox-movies.json?search=moana")
+        assert c["code"] == 200 and got["q"] == "moana"
+
+def test_api_call_deadline_exhausted():
+    _v175_reset()
+    called = {"n": 0}
+    def fake_request(*a, **k):
+        called["n"] += 1
+        raise AssertionError("no network after budget spent")
+    try:
+        addon._CHAIN_DDL.t = time.time() - 1        # budget gone
+        with mock.patch.object(addon, "_bootstrap_token"), \
+             mock.patch.object(addon.requests, "request", side_effect=fake_request):
+            addon._AUTH_TOKEN = "tok"
+            assert addon.api_call("GET", "/x") is None
+        assert called["n"] == 0
+    finally:
+        _CHAIN_CLEAN()
+
+def test_api_call_direct_auth_flag_rides_pool_with_exit_token():
+    _v175_reset()
+    saved_urls, saved_fp = list(addon._PROXY_URLS), list(addon._FREE_POOL[0])
+    try:
+        addon._PROXY_URLS = []
+        addon._FREE_POOL[0] = ["http://f1:1"]
+        addon._EXIT_TOKENS["http://f1:1"] = ("EXT", time.time())
+        addon._DIRECT_AUTH_FLAG[0] = time.time() + 60    # direct flagged
+        picks, auths = [], []
+        def fake_request(method, url, **kw):
+            px = kw.get("proxies") or {}
+            picks.append(px.get("http"))
+            auths.append((kw.get("headers") or {}).get("Authorization"))
+            resp = mock.Mock(status_code=200)
+            resp.headers = {}
+            resp.json = lambda: {"code": 0, "message": "ok", "data": {"x": 1}}
+            return resp
+        with mock.patch.object(addon, "_bootstrap_token"), \
+             mock.patch.object(addon.requests, "request", side_effect=fake_request):
+            addon._AUTH_TOKEN = "GLOBAL"
+            d = addon.api_call("POST", SD_PATH, "{}")
+        assert d == {"x": 1}
+        assert picks and picks[0] == "http://f1:1"   # direct skipped entirely
+        assert auths[0] == "Bearer EXT"              # exit's own token
+        assert getattr(addon._EGRESS, "pool", False) is True
+    finally:
+        addon._PROXY_URLS, addon._FREE_POOL[0] = saved_urls, saved_fp
+        _v175_reset()
+
+def test_api_call_direct_401_marks_flag_and_pool():
+    _v175_reset()
+    saved_urls, saved_fp = list(addon._PROXY_URLS), list(addon._FREE_POOL[0])
+    try:
+        addon._PROXY_URLS = []
+        addon._FREE_POOL[0] = ["http://f1:1"]
+        addon._EXIT_TOKENS["http://f1:1"] = ("EXT", time.time())
+        addon._AUTH_REAUTH_TS = time.time()          # throttle reauth
+        picks = []
+        def fake_request(method, url, **kw):
+            px = kw.get("proxies") or {}
+            picks.append(px.get("http"))
+            if px.get("http") is None:
+                resp = mock.Mock(status_code=401)    # the NEW flag signature
+                resp.headers = {}
+                resp.json = lambda: {"code": 401, "reason": "AUTH_FAIL"}
+                return resp
+            resp = mock.Mock(status_code=200)
+            resp.headers = {}
+            resp.json = lambda: {"code": 0, "message": "ok", "data": {"x": 2}}
+            return resp
+        with mock.patch.object(addon, "_bootstrap_token"), \
+             mock.patch.object(addon.requests, "request", side_effect=fake_request):
+            addon._AUTH_TOKEN = "tok"
+            d = addon.api_call("POST", SD_PATH, "{}")
+        assert d == {"x": 2}
+        assert picks[0] is None and picks[1] == "http://f1:1"
+        assert addon._DIRECT_AUTH_FLAG[0] > time.time()   # direct benched 10 min
+        assert addon._sd_forced(SD_PATH)                  # family rides pool now
+    finally:
+        addon._PROXY_URLS, addon._FREE_POOL[0] = saved_urls, saved_fp
+        addon._AUTH_REAUTH_TS = 0.0
+        _v175_reset()
+
+def test_api_call_pool_401_benches_exit_and_rotates():
+    _v175_reset()
+    saved_urls, saved_fp = list(addon._PROXY_URLS), list(addon._FREE_POOL[0])
+    try:
+        addon._PROXY_URLS = []
+        addon._FREE_POOL[0] = ["http://f1:1", "http://f2:2"]
+        addon._EXIT_TOKENS["http://f1:1"] = ("T1", time.time())
+        addon._EXIT_TOKENS["http://f2:2"] = ("T2", time.time())
+        addon._DIRECT_AUTH_FLAG[0] = time.time() + 60    # straight to pool
+        seq = []
+        def fake_request(method, url, **kw):
+            px = kw.get("proxies") or {}
+            u = px.get("http")
+            seq.append(u)
+            if u == "http://f1:1":
+                resp = mock.Mock(status_code=401)        # f1's token is dead
+            else:
+                resp = mock.Mock(status_code=200)
+                resp.json = lambda: {"code": 0, "message": "ok", "data": {"x": 3}}
+            resp.headers = {}
+            if u == "http://f1:1":
+                resp.json = lambda: {"code": 401, "reason": "AUTH_FAIL"}
+            return resp
+        def fake_via_exit(u, timeout=6):
+            return None                                  # refresh fails
+        with mock.patch.object(addon, "_bootstrap_token"), \
+             mock.patch.object(addon, "_bootstrap_via_exit", fake_via_exit), \
+             mock.patch.object(addon.requests, "request", side_effect=fake_request):
+            addon._AUTH_TOKEN = "tok"
+            d = addon.api_call("POST", SD_PATH, "{}")
+        assert d == {"x": 3}
+        assert "http://f1:1" in seq and "http://f2:2" in seq
+        assert addon._POOL_BAD.get("http://f1:1", 0) > time.time()  # benched
+    finally:
+        addon._PROXY_URLS, addon._FREE_POOL[0] = saved_urls, saved_fp
+        _v175_reset()
+
+def test_platform_probe_captures_exit_token():
+    _v175_reset()
+    try:
+        def hdr_resp(status, xuser=None):
+            r = mock.Mock(status_code=status)
+            r.headers = {"x-user": xuser} if xuser else {}
+            return r
+        with mock.patch.object(addon.requests, "get",
+                               side_effect=[hdr_resp(200, '{"token": "T1"}'),
+                                            hdr_resp(200),
+                                            hdr_resp(401)]):
+            k1 = addon._platform_probe("http://e1:1")
+            k2 = addon._platform_probe("http://e2:2")
+            k3 = addon._platform_probe("http://e3:3")
+        assert k1[0] == "good" and addon._EXIT_TOKENS["http://e1:1"][0] == "T1"
+        assert k2 == (None, None)          # header dropped -> unusable exit
+        assert k3 == ("block", None)       # 401 -> exit IP auth-flagged
+    finally:
+        _v175_reset()
+
+def test_exit_token_cache_and_stale_fallback():
+    _v175_reset()
+    try:
+        now = time.time()
+        addon._EXIT_TOKENS["http://e:1"] = ("FRESH", now)
+        assert addon._exit_token("http://e:1") == "FRESH"     # cached, no HTTP
+        with mock.patch.object(addon, "_bootstrap_via_exit", return_value="NEW"):
+            assert addon._exit_token("http://e:1", refresh=True) == "NEW"
+        addon._EXIT_TOKENS["http://e:1"] = ("OLD", now - 7 * 3600)
+        with mock.patch.object(addon, "_bootstrap_via_exit", return_value=None):
+            assert addon._exit_token("http://e:1") == "OLD"   # stale beats none
+        assert addon._exit_token(None) is None
+    finally:
+        _v175_reset()
+
+def test_bootstrap_via_exit_stores_token():
+    _v175_reset()
+    try:
+        r = mock.Mock(status_code=200)
+        r.headers = {"x-user": '{"token": "VIAX"}'}
+        with mock.patch.object(addon.requests, "get", return_value=r):
+            assert addon._bootstrap_via_exit("http://e:9") == "VIAX"
+        assert addon._EXIT_TOKENS["http://e:9"][0] == "VIAX"
+    finally:
+        _v175_reset()
+
+def test_neg_ttl_pool_vs_direct():
+    _v175_reset()
+    try:
+        addon._EGRESS.pool = False
+        assert addon._neg_ttl() == 600
+        addon._EGRESS.pool = True
+        assert addon._neg_ttl() == 60        # pool answers may be proxy lies
+    finally:
+        _CHAIN_CLEAN()
+
+def test_build_streams_sets_and_clears_budget():
+    _v175_reset()
+    saved_cache = dict(addon._STREAM_CACHE)
+    saved_stale = dict(addon._STREAM_STALE)
+    try:
+        addon._STREAM_CACHE.clear()
+        addon._STREAM_STALE.clear()
+        seen = {}
+        def fake_inner(*a, **k):
+            seen["ddl"] = getattr(addon._CHAIN_DDL, "t", None)
+            return {"streams": [], "message": "x"}
+        with mock.patch.object(addon, "_build_streams_inner", side_effect=fake_inner):
+            r = addon.build_streams("movie", "tt0000001", 1, 1)
+        assert r == {"streams": [], "message": "x"}
+        assert seen["ddl"] is not None and seen["ddl"] > time.time() + 20
+        assert getattr(addon._CHAIN_DDL, "t", "cleared") == "cleared"
+    finally:
+        addon._STREAM_CACHE.clear()
+        addon._STREAM_CACHE.update(saved_cache)
+        addon._STREAM_STALE.clear()
+        addon._STREAM_STALE.update(saved_stale)
+        _v175_reset()
+
+def test_debug_search_endpoint_gated_and_shaped():
+    _v175_reset()
+    try:
+        assert _http_get("/debug/search")["code"] == 404
+        assert _http_get("/debug/search?k=wrong")["code"] == 404
+        saved_fp = list(addon._FREE_POOL[0])
+        addon._FREE_POOL[0] = []                    # no exits -> direct only
+        def fake_post(url, **kw):
+            r = mock.Mock(status_code=200)
+            r.headers = {}
+            r.json = lambda: {"code": 0, "message": "ok",
+                              "data": {"results": [{"subjects": [
+                                  {"subjectId": 1}, {"subjectId": 2}]}]}}
+            return r
+        with mock.patch.object(addon.requests, "post", side_effect=fake_post):
+            c = _http_get("/debug/search?k=mbx-dbg-7f3a&kw=moana")
+        assert c["code"] == 200
+        d = json.loads(c["body"])
+        assert d["kw"] == "moana" and d["direct"]["hits"] == 2
+        assert "exits" in d and "exit_tokens" in d
+    finally:
+        _v175_reset()

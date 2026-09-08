@@ -49,7 +49,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION = "1.7.4"
+VERSION = "1.7.5"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -104,6 +104,75 @@ _POOL_REBUILD_TS = [0.0]            # last dry-pool rebuild spawn
 # success/fail counts + EWMA latency (ms). Picks prefer reliable-and-fast
 # exits; the background trainer keeps records fresh even without traffic.
 _POOL_STATS = {}                     # url -> {"ok": n, "fail": n, "lat": ms}
+# v1.7.5 per-exit auth: the platform now flags IPs at the AUTH level
+# (tab-operating/search answer 401 AUTH_FAIL from a flagged IP even with
+# a token bootstrapped elsewhere) — a single global token can no longer
+# serve every egress. Each pool exit gets its own token, bootstrapped
+# THROUGH that exit, so token and egress IP always match.
+_EXIT_TOKENS = {}                    # exit url -> (token, ts)
+_EXIT_TOKENS_LOCK = threading.Lock()
+_DIRECT_AUTH_FLAG = [0.0]            # direct egress auth-flagged until ts
+# v1.7.5 chain budget: one /stream build gets a hard deadline — a slow
+# egress must never hold the player hostage (measured: 296s hangs).
+_CHAIN_DDL = threading.local()       # per-thread chain deadline (ts)
+_EGRESS = threading.local()          # per-thread "this chain rode the pool"
+_STREAM_BUDGET = 25.0                # seconds for one /stream build
+
+
+def _ddl_left():
+    """Remaining chain-budget seconds (None = no deadline set)."""
+    ddl = getattr(_CHAIN_DDL, "t", None)
+    return None if ddl is None else ddl - time.time()
+
+
+def _direct_auth_ok():
+    return time.time() >= _DIRECT_AUTH_FLAG[0]
+
+
+def _exit_token(u, refresh=False):
+    """Auth token bound to THIS pool exit. Cached 6h; on demand the token
+    is bootstrapped through the exit itself (tab-operating -> x-user)."""
+    if not u:
+        return None
+    now = time.time()
+    got = _EXIT_TOKENS.get(u)
+    if got and not refresh and now - got[1] < 6 * 3600:
+        return got[0]
+    tok = _bootstrap_via_exit(u)
+    return tok or (got[0] if got else None)
+
+
+def _bootstrap_via_exit(u, timeout=6):
+    """tab-operating GET through exit u -> its own anonymous token."""
+    try:
+        url = API_HOSTS[0] + \
+            "/wefeed-mobile-bff/tab-operating?page=1&tabId=0&version="
+        ts = int(time.time() * 1000)
+        r = requests.get(url, timeout=timeout,
+                         proxies={"http": u, "https": u},
+                         headers={
+                             "User-Agent": UA_APP,
+                             "Accept": "application/json",
+                             "Content-Type": "application/json",
+                             "X-Client-Token": _x_client_token(ts),
+                             "x-tr-signature": _x_tr_signature("GET", url, None, ts),
+                             "X-Client-Info": _client_info(),
+                             "X-Client-Status": "0",
+                             "X-M-Version": "11.7.0",
+                         })
+        if r.status_code < 400:
+            xu = r.headers.get("x-user", "")
+            try:
+                tok = json.loads(xu).get("token") if xu else None
+            except Exception:
+                tok = None
+            if tok:
+                with _EXIT_TOKENS_LOCK:
+                    _EXIT_TOKENS[u] = (tok, time.time())
+                return tok
+    except Exception:
+        pass
+    return None
 
 def _pool_all():
     """Fallback pool: the auto-refreshed FREE pool is PRIMARY (user
@@ -205,7 +274,18 @@ def _platform_probe(u, timeout=4):
                               "X-Client-Status": "0",
                               "X-M-Version": "11.7.0",
                           })
+        if rr.status_code == 401:
+            return "block", None            # exit IP is auth-flagged too
         if rr.status_code < 400:
+            xu = rr.headers.get("x-user", "")
+            try:
+                tok = json.loads(xu).get("token") if xu else None
+            except Exception:
+                tok = None
+            if not tok:
+                return None, None           # header dropped: unusable exit
+            with _EXIT_TOKENS_LOCK:
+                _EXIT_TOKENS[u] = (tok, time.time())
             return "good", int((time.time() - t0) * 1000)
         if rr.status_code in (403, 406):
             return "block", None
@@ -522,8 +602,11 @@ def _bootstrap_token():
         # direct first; if no direct attempt yields a token, rotate pool
         # exits (up to 4 picks — free proxies are often dead). On an
         # IP-flagged host the pool is what actually yields the token.
-        attempts = ([("direct", b) for b in API_HOSTS[:2]] +
-                    ([("pool", None)] * 4 if _pool_all() else []))
+        # v1.7.5: while the direct egress is AUTH-flagged (401 on
+        # tab-operating), don't waste time on direct attempts at all.
+        attempts = ([("direct", b) for b in API_HOSTS[:2]]
+                    if _direct_auth_ok() else []) + \
+                   ([("pool", None)] * 4 if _pool_all() else [])
         for kind, pbase in attempts:
             url = (pbase or API_HOSTS[0]) + "/wefeed-mobile-bff/tab-operating?page=1&tabId=0&version="
             ts = int(time.time() * 1000)
@@ -554,7 +637,11 @@ def _bootstrap_token():
                 if kind == "pool":
                     _pool_note("good")
                 return
-            if kind == "pool" and r.status_code in (403, 406):
+            if kind == "direct" and r.status_code in (401, 403):
+                # v1.7.5: the IP flag now shows up as 401 AUTH_FAIL —
+                # remember it so direct attempts stop for 10 min.
+                _DIRECT_AUTH_FLAG[0] = time.time() + 600
+            if kind == "pool" and r.status_code in (401, 403, 406):
                 _pool_note("block")
     except Exception:
         pass
@@ -565,6 +652,11 @@ def api_call(method, path, body=None, timeout=10):
     global _AUTH_TOKEN
     if not _plat_ok():
         return None                    # circuit breaker: stay quiet, let the IP cool
+    # v1.7.5 chain budget: once the deadline is spent, stop the whole
+    # chain honestly (None = transient) instead of grinding for minutes.
+    left = _ddl_left()
+    if left is not None and left < 0.5:
+        return None
     if not _AUTH_TOKEN and not path.startswith("/wefeed-mobile-bff/tab-operating"):
         with _AUTH_LOCK:
             if not _AUTH_TOKEN:
@@ -579,6 +671,8 @@ def api_call(method, path, body=None, timeout=10):
     fb = None
     if _sd_forced(path):
         fb = "pool" if _pool_all() else ("sd" if _SCRAPEDO_TOKEN else None)
+    elif not _direct_auth_ok() and _pool_all():
+        fb = "pool"    # v1.7.5: direct egress auth-flagged — ride the pool
     rode_pool = False          # circuit breaker must not trip on proxy fails
     for attempt in (1, 2):
         for base in (API_HOSTS[:1] if fb == "sd" else API_HOSTS):
@@ -603,22 +697,37 @@ def api_call(method, path, body=None, timeout=10):
                     r = _sd_fetch(method, url, headers, body)
                 elif fb == "pool":
                     rode_pool = True
+                    _EGRESS.pool = True          # pool answers may be proxy lies
+                    px = _pool_pick()
+                    etok = _exit_token(getattr(_POOL_TLS, "url", None))
+                    if etok:
+                        # v1.7.5: the token must come from THIS exit's IP
+                        headers["Authorization"] = "Bearer " + etok
+                    _to = min(timeout, 6)
+                    if left is not None:
+                        _to = min(_to, max(0.5, left))
                     r = requests.request(method, url, headers=headers,
                                          data=body.encode() if body else None,
-                                         timeout=min(timeout, 6), proxies=_pool_pick())
+                                         timeout=_to, proxies=px)
                 else:
                     _POOL_TLS.url = None
                     kw = {"proxies": _PLAT_PROXIES} if _PLAT_PROXIES else {}
+                    _to = timeout if left is None else min(timeout, max(0.5, left))
                     r = requests.request(method, url, headers=headers,
                                          data=body.encode() if body else None,
-                                         timeout=timeout, **kw)
+                                         timeout=_to, **kw)
                     _absorb_token(r)
-                    if (r.status_code in (403, 406) and fb is None
+                    if (r.status_code in (401, 403, 406) and fb is None
                             and not path.startswith("/wefeed-mobile-bff/tab-operating")):
                         # IP-flag signature on our direct egress: route this
                         # endpoint family through the fallback for 30 min and
                         # retry the call immediately — free pool preferred,
                         # scrape.do when no pool is available.
+                        # v1.7.5: the platform switched the flag signature
+                        # to 401 AUTH_FAIL — treat it exactly like 403/406
+                        # and bench the direct egress for 10 minutes.
+                        if r.status_code == 401:
+                            _DIRECT_AUTH_FLAG[0] = time.time() + 600
                         if _pool_all():
                             fb = "pool"
                         elif _SCRAPEDO_TOKEN:
@@ -627,12 +736,31 @@ def api_call(method, path, body=None, timeout=10):
                             _sd_mark(path)
                             if fb == "pool":
                                 rode_pool = True
+                                _EGRESS.pool = True
+                                px = _pool_pick()
+                                etok = _exit_token(getattr(_POOL_TLS, "url", None))
+                                if etok:
+                                    headers["Authorization"] = "Bearer " + etok
+                                _to2 = min(timeout, 6)
+                                if left is not None:
+                                    _to2 = min(_to2, max(0.5, left))
                                 r = requests.request(
                                     method, url, headers=headers,
                                     data=body.encode() if body else None,
-                                    timeout=min(timeout, 6), proxies=_pool_pick())
+                                    timeout=_to2, proxies=px)
                             else:
                                 r = _sd_fetch(method, url, headers, body)
+                if r.status_code == 401 and fb == "pool":
+                    # v1.7.5: exit token stale/flagged — refresh it through
+                    # the same exit once; if that fails, bench and rotate.
+                    last = "http401"
+                    exu = getattr(_POOL_TLS, "url", None)
+                    if exu:
+                        with _EXIT_TOKENS_LOCK:
+                            _EXIT_TOKENS.pop(exu, None)
+                        if not _bootstrap_via_exit(exu):
+                            _pool_note("block")
+                    continue
                 if r.status_code in (403, 406, 429, 500, 502, 503, 504):
                     last = "http%d" % r.status_code
                     if fb == "pool" and r.status_code in (403, 406):
@@ -652,6 +780,15 @@ def api_call(method, path, body=None, timeout=10):
                 msg = str(d.get("message") or d.get("reason") or "api")
                 # server-side token expiry ("Token is invalid") self-heals:
                 # drop the stale token, bootstrap a fresh one, retry
+                if _AUTH_ERR_RE.search(msg) and fb == "pool":
+                    # exit-token trouble: drop this exit's token and rotate
+                    exu = getattr(_POOL_TLS, "url", None)
+                    if exu:
+                        with _EXIT_TOKENS_LOCK:
+                            _EXIT_TOKENS.pop(exu, None)
+                        if not _bootstrap_via_exit(exu):
+                            _pool_note("block")
+                    continue
                 if _AUTH_TOKEN and _AUTH_ERR_RE.search(msg) and _force_reauth():
                     continue          # same call again, now with a fresh token
                 # definitive API-level error (bad id, not found, ...) — the
@@ -1923,6 +2060,28 @@ def build_streams(ctype, imdb, se, ep, _prewarm_next=True):
     hit, val = _cache_get(_STREAM_CACHE, key)
     if hit:
         return {"streams": val}
+    # v1.7.5: hard budget for the whole chain (metadata race -> search ->
+    # alt-title rescue -> dubs -> play-info). A slow egress must fail fast
+    # and honestly (None-transience), never hang the player for minutes.
+    _prev_ddl = getattr(_CHAIN_DDL, "t", None)
+    _CHAIN_DDL.t = time.time() + _STREAM_BUDGET
+    _EGRESS.pool = False
+    try:
+        return _build_streams_inner(ctype, imdb, se, ep, key, _prewarm_next)
+    finally:
+        _CHAIN_DDL.t = _prev_ddl
+        _EGRESS.pool = False
+
+
+def _neg_ttl():
+    """How long an EMPTY stream answer may be cached. Answers that rode
+    the free-proxy pool can be proxy lies (mangled body / geo catalog /
+    flagged exit) — never let one blank a title for long (v1.6.9 lesson,
+    tightened for pool egress in v1.7.5)."""
+    return 60 if getattr(_EGRESS, "pool", False) else 600
+
+
+def _build_streams_inner(ctype, imdb, se, ep, key, _prewarm_next):
     if not _prewarm_next:          # background rebuild (SWR / prewarm path)
         _STREAM_STALE.pop(key, None)
     else:                          # stale-while-revalidate: instant answer,
@@ -1958,10 +2117,10 @@ def build_streams(ctype, imdb, se, ep, _prewarm_next=True):
             if matched:
                 break
     if not subs and not matched:
-        _cache_put(_STREAM_CACHE, key, [], 600)
+        _cache_put(_STREAM_CACHE, key, [], _neg_ttl())
         return {"streams": [], "message": "not in platform catalog"}
     if not matched:
-        _cache_put(_STREAM_CACHE, key, [], 600)
+        _cache_put(_STREAM_CACHE, key, [], _neg_ttl())
         return {"streams": [], "message": "no matching subject"}
     # dub lists for the top matches, fetched in parallel
     with ThreadPoolExecutor(max_workers=2) as ex:
@@ -2329,6 +2488,8 @@ class Handler(BaseHTTPRequestHandler):
                                  ("+%d env" % len(_PROXY_URLS)) if _PROXY_URLS else "")
                                  if _pool_all() else bool(_PLAT_PROXIES)),
                 "free_pool": len(_FREE_POOL[0]),
+                "exit_tokens": len(_EXIT_TOKENS),
+                "direct_auth_flag_s": round(max(0.0, _DIRECT_AUTH_FLAG[0] - time.time())),
                 "scrape_do": bool(_SCRAPEDO_TOKEN),
                 "scrape_do_credits": _SD_CREDITS[0],
                 "video_proxy": False, "egress": "text-only (json/playlists/manifests/subtitles, gzip)",
@@ -2351,10 +2512,18 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 return self._send(404, "no logo", "text/plain")
 
-        m = re.match(r"^/catalog/([a-z]+)/([a-z0-9-]+)\.json$", path)
+        # v1.7.5: Stremio's canonical search URL is
+        # /catalog/{type}/{id}/search={query}.json (path segment!) — the
+        # router only knew the ?search= query form and 404'd every
+        # in-app catalog search (seen in /debug/reqlog).
+        m = re.match(r"^/catalog/([a-z]+)/([a-z0-9-]+?)(?:/search=([^/]*))?\.json$",
+                     path)
         if m:
             ctype, cid = m.group(1), m.group(2)
-            search = (q.get("search") or [""])[0].strip()
+            search = m.group(3)
+            if search is None:
+                search = (q.get("search") or [""])[0]
+            search = (search or "").strip()
             skip = int((q.get("skip") or ["0"])[0] or 0)
             if search:
                 return self._send(200, json.dumps(search_catalog(ctype, search)))
@@ -2367,6 +2536,85 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, json.dumps({"version": VERSION,
                                                "free_pool": len(_FREE_POOL[0]),
                                                "entries": _REQLOG[-120:]}))
+
+        if path == "/debug/search":
+            k = (q.get("k") or [""])[0] if q else ""
+            if k != "mbx-dbg-7f3a":
+                return self._send(404, json.dumps({"error": "not found"}))
+            kw = ((q.get("kw") or ["moana"])[0] or "moana")[:40]
+            out = {"version": VERSION, "kw": kw,
+                   "token_head": (_AUTH_TOKEN or "")[:14],
+                   "direct_auth_flag_s": round(max(0.0, _DIRECT_AUTH_FLAG[0] - time.time())),
+                   "exit_tokens": len(_EXIT_TOKENS),
+                   "pool": len(_pool_all()),
+                   "direct": None, "exits": []}
+
+            def _dbg_search(proxies, token):
+                sp = "/wefeed-mobile-bff/subject-api/search/v2"
+                sbody = json.dumps({"keyword": kw, "page": 1, "perPage": 20,
+                                    "subjectType": 1, "tabId": "All"})
+                surl = API_HOSTS[0] + sp
+                ts = int(time.time() * 1000)
+                hd = {"User-Agent": UA_APP, "Accept": "application/json",
+                      "Content-Type": "application/json",
+                      "X-Client-Token": _x_client_token(ts),
+                      "x-tr-signature": _x_tr_signature("POST", surl, sbody, ts),
+                      "X-Client-Info": _client_info(), "X-Client-Status": "0",
+                      "X-M-Version": "11.7.0"}
+                if token:
+                    hd["Authorization"] = "Bearer " + token
+                t0 = time.time()
+                try:
+                    r = requests.post(surl, headers=hd, data=sbody, timeout=10,
+                                      proxies=proxies or {})
+                    res = {"s": r.status_code,
+                           "ms": int((time.time() - t0) * 1000),
+                           "xuser": bool(r.headers.get("x-user"))}
+                    try:
+                        d = r.json()
+                        res["code"] = d.get("code")
+                        res["msg"] = str(d.get("message") or d.get("reason") or "")[:50]
+                        rr = ((d.get("data") or {}).get("results") or [{}])[0]
+                        res["hits"] = len(rr.get("subjects") or [])
+                    except Exception:
+                        res["body"] = (r.text or "")[:60]
+                    return res
+                except Exception as e:
+                    return {"exc": type(e).__name__,
+                            "ms": int((time.time() - t0) * 1000)}
+
+            def _dbg_exit_token(u):
+                turl = API_HOSTS[0] + "/wefeed-mobile-bff/tab-operating?page=1&tabId=0&version="
+                ts = int(time.time() * 1000)
+                hd = {"User-Agent": UA_APP, "Accept": "application/json",
+                      "Content-Type": "application/json",
+                      "X-Client-Token": _x_client_token(ts),
+                      "x-tr-signature": _x_tr_signature("GET", turl, None, ts),
+                      "X-Client-Info": _client_info(), "X-Client-Status": "0",
+                      "X-M-Version": "11.7.0"}
+                try:
+                    r = requests.get(turl, timeout=8, proxies={"http": u, "https": u},
+                                     headers=hd)
+                    xu = r.headers.get("x-user", "")
+                    tok = ""
+                    if xu:
+                        try:
+                            tok = json.loads(xu).get("token") or ""
+                        except Exception:
+                            pass
+                    return {"tab_s": r.status_code, "xuser": bool(tok)}, tok
+                except Exception as e:
+                    return {"tab_exc": type(e).__name__}, ""
+
+            out["direct"] = _dbg_search(None, _AUTH_TOKEN)
+            for u in _pool_all()[:4]:
+                diag, tok = _dbg_exit_token(u)
+                own = _dbg_search({"http": u, "https": u}, tok) if tok \
+                    else {"note": "no x-user through this exit"}
+                glob = _dbg_search({"http": u, "https": u}, _AUTH_TOKEN)
+                out["exits"].append({"exit": u, "tab": diag,
+                                     "own_token": own, "global_token": glob})
+            return self._send(200, json.dumps(out))
 
         if path == "/debug/ping":
             k = (q.get("k") or [""])[0] if q else ""
