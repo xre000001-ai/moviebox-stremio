@@ -40,7 +40,8 @@ import time
 import uuid
 import random
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from concurrent.futures import (ThreadPoolExecutor, wait, FIRST_COMPLETED,
+                                TimeoutError as FuturesTimeoutError)
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, urlencode, quote, unquote
 
@@ -49,7 +50,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION = "1.7.7"
+VERSION = "1.7.8"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -117,6 +118,20 @@ _DIRECT_AUTH_FLAG = [0.0]            # direct egress auth-flagged until ts
 _CHAIN_DDL = threading.local()       # per-thread chain deadline (ts)
 _EGRESS = threading.local()          # per-thread "this chain rode the pool"
 _STREAM_BUDGET = 25.0                # seconds for one /stream build
+_STREAM_WALL = 24.0                  # v1.7.8: HARD player-facing wall — the
+                                     # budget is thread-local and the fan-out
+                                     # waves (alt-search/dubs/play/resolve)
+                                     # run on OTHER threads, so a grinding
+                                     # egress compounded unbounded off-thread
+                                     # waits into 6.5min+ hangs on prod.
+                                     # The player always gets an answer now.
+_API_CALL_WALL = 14.0                # v1.7.8: per-api_call wall cap — even
+                                     # deadline-less threads stop rotating
+                                     # hosts after this (2 attempts x 7 hosts
+                                     # x (6s req + 6s token bootstrap) used
+                                     # to be ~250s per call).
+_PLAY_WAIT = 12.0                    # v1.7.8: max wait on a single-flight
+                                     # play-info future (was: unbounded)
 
 
 def _ddl_left():
@@ -209,7 +224,15 @@ def _pool_pick():
         ok, fail = st.get("ok", 0), st.get("fail", 0)
         lat = st.get("lat") or 4000
         quality = (ok + 1.0) / (ok + fail + 2.0)
-        return quality * (4000.0 / max(lat, 250))
+        s = quality * (4000.0 / max(lat, 250))
+        # v1.7.8: prefer exits that already carry a fresh platform token —
+        # a tokenless exit pays a ~6s tab-operating bootstrap on its first
+        # call, and the pool refreshes every 240s (faster than the 120s
+        # stickiness), so cold exits kept re-paying it on prod.
+        got = _EXIT_TOKENS.get(u)
+        if got and time.time() - got[1] < 6 * 3600:
+            s *= 1.5
+        return s
 
     u = None
     if sticky and (sticky in healthy or (sticky in allp and not healthy)):
@@ -711,6 +734,11 @@ def api_call(method, path, body=None, timeout=10):
     rode_pool = False          # circuit breaker must not trip on proxy fails
     for attempt in (1, 2):
         for base in (API_HOSTS[:1] if fb == "sd" else _api_hosts()):
+            # v1.7.8: per-call wall — bound the host-rotation grind even on
+            # threads that carry no chain deadline (executor workers).
+            if time.time() - _att_t0 > _API_CALL_WALL:
+                last = "wall"
+                break
             url = base + path
             ts = int(time.time() * 1000)
             _to = timeout          # per-iteration default (sd branch sets none)
@@ -845,6 +873,8 @@ def api_call(method, path, body=None, timeout=10):
                 if fb == "sd":
                     break
                 continue    # pool mode: next iteration picks a fresh exit IP
+        if last == "wall":
+            break                    # v1.7.8: budget spent, stop the grind
         if attempt == 1:
             if time.time() - _att_t0 > 3.5 and not rode_pool:
                 break             # slow attempt: host sick, retry doubles the stall
@@ -1730,10 +1760,13 @@ def _cached_play(sid, se, ep):
             fut = _META_EX.submit(play_info, sid, se, ep)
             _PLAY_INFLIGHT[key] = fut
             fut.add_done_callback(lambda _f, _k=key: _PLAY_INFLIGHT.pop(_k, None))
-    try:
-        val = fut.result()
+    try:       # v1.7.8: bounded wait — a grinding play-info must never hold
+        # a /stream build hostage (was: unbounded fut.result(), one of the
+        # two compounding causes of the 6.5min+ prod hangs).
+        val = fut.result(timeout=max(0.25, min(_PLAY_WAIT,
+                                              _ddl_left() or _PLAY_WAIT)))
     except Exception:
-        val = None
+        val = None            # transient (timeout included): not cached
     if val is None:
         return None
     _cache_put(_PLAY_CACHE, key, val, 3600)
@@ -2136,23 +2169,82 @@ def _ph(label, t0):
         pass
 
 
+_PHASE_RING = []                     # v1.7.8: last build phase records
+_BUILD_EX = ThreadPoolExecutor(max_workers=4, thread_name_prefix="build")
+
+
 def build_streams(ctype, imdb, se, ep, _prewarm_next=True):
     key = (ctype, imdb, se, ep)
     _PHASES.rec = []             # fresh record (thread may be reused)
     hit, val = _cache_get(_STREAM_CACHE, key)
     if hit:
         return {"streams": val}
-    # v1.7.5: hard budget for the whole chain (metadata race -> search ->
-    # alt-title rescue -> dubs -> play-info). A slow egress must fail fast
-    # and honestly (None-transience), never hang the player for minutes.
+    if _prewarm_next:
+        # v1.7.8: the WALL. The 25s chain budget is thread-local, but the
+        # build fans out to executor threads (alt searches, dubs, play-info
+        # single-flight, resolve wave) that never see it — on prod a
+        # grinding egress compounded those unbounded waits into 6.5min+
+        # HANGS with no answer at all (only cached titles responded). The
+        # player now always gets an answer within _STREAM_WALL; the build
+        # keeps running in the background and lands in the cache, so a
+        # retry a minute later usually hits the finished result.
+        fut = _BUILD_EX.submit(_build_guarded, ctype, imdb, se, ep, key,
+                               _prewarm_next)
+        try:
+            res, rec = fut.result(timeout=_STREAM_WALL)
+            _PHASES.rec = rec      # v1.7.8: keep the reqlog phase breakdown
+            return res
+        except FuturesTimeoutError:
+            _PHASE_RING.append({"t": time.strftime("%H:%M:%S"),
+                                "wall": "hit",
+                                "phases": list(getattr(_PHASES, "rec", None)
+                                               or [])})
+            del _PHASE_RING[:-24]
+            return {"streams": [],
+                    "message": "platform slow — tap streams again in a "
+                               "minute (the list is being built)"}
+    res, rec = _build_guarded(ctype, imdb, se, ep, key, _prewarm_next)
+    _PHASES.rec = rec
+    return res
+
+
+def _build_guarded(ctype, imdb, se, ep, key, _prewarm_next):
+    """v1.7.5 hard chain budget, armed on WHICHEVER thread runs the build.
+    Returns (result, phase-record) so the caller can mirror the record."""
     _prev_ddl = getattr(_CHAIN_DDL, "t", None)
     _CHAIN_DDL.t = time.time() + _STREAM_BUDGET
     _EGRESS.pool = False
     try:
-        return _build_streams_inner(ctype, imdb, se, ep, key, _prewarm_next)
+        return _build_streams_inner(ctype, imdb, se, ep, key, _prewarm_next), \
+            list(getattr(_PHASES, "rec", None) or [])
     finally:
+        try:
+            rec = getattr(_PHASES, "rec", None)
+            if rec:
+                _PHASE_RING.append({"t": time.strftime("%H:%M:%S"),
+                                    "phases": list(rec)})
+                del _PHASE_RING[:-24]
+        except Exception:
+            pass
         _CHAIN_DDL.t = _prev_ddl
         _EGRESS.pool = False
+
+
+def _ddl_inherit(fn):
+    """v1.7.8: run fn on another thread with THIS thread's chain deadline.
+
+    The budget lives in a thread-local; executor workers submitted from a
+    request used to run deadline-less, which is how off-thread grinds
+    escaped the 25s budget entirely."""
+    ddl = getattr(_CHAIN_DDL, "t", None)
+
+    def _w(*a, **kw):
+        _CHAIN_DDL.t = ddl
+        try:
+            return fn(*a, **kw)
+        finally:
+            _CHAIN_DDL.t = None
+    return _w
 
 
 def _neg_ttl():
@@ -2212,9 +2304,14 @@ def _build_streams_inner(ctype, imdb, se, ep, key, _prewarm_next):
                 if a and clean_title(a).lower() != clean_title(title).lower()][:6]
         if alts:
             with ThreadPoolExecutor(max_workers=min(3, len(alts))) as aex:
-                afuts = [aex.submit(_cached_search, a, stype) for a in alts]
+                afuts = [aex.submit(_ddl_inherit(_cached_search), a, stype)
+                         for a in alts]
                 for alt, af in zip(alts, afuts):     # priority order
-                    alt_subs = af.result()
+                    try:            # v1.7.8: bounded wait, deadline-aware
+                        alt_subs = af.result(
+                            timeout=max(0.5, min(8.0, _ddl_left() or 8.0)))
+                    except FuturesTimeoutError:
+                        continue
                     if not alt_subs:
                         continue
                     matched = _fuzzy_match(alt_subs, alt, year, stype)
@@ -2241,8 +2338,8 @@ def _build_streams_inner(ctype, imdb, se, ep, key, _prewarm_next):
                         se if ctype == "series" else None,
                         ep if ctype == "series" else None)
     with ThreadPoolExecutor(max_workers=2) as ex:
-        dub_f = [ex.submit(_cached_dubs, s) for s in m_sids[:2]]
-        dub_lists = [f.result() for f in dub_f]
+        dub_f = [ex.submit(_ddl_inherit(_cached_dubs), s) for s in m_sids[:2]]
+        dub_lists = [f.result() for f in dub_f]   # bounded by _API_CALL_WALL
     _ph("dubs+play", _t)
     # dedupe by subjectId AND label (clean card list)
     entries, seen, seen_labels = [], set(), set()
@@ -2290,11 +2387,11 @@ def _build_streams_inner(ctype, imdb, se, ep, key, _prewarm_next):
     # round trips any more), while the shared captions are fetched once
     _t = time.time()
     with ThreadPoolExecutor(max_workers=8) as ex:
-        cap_fut = ex.submit(_title_caps)
-        results = list(ex.map(lambda p: _resolve_entry(p, se, ep, ctype, title, year,
-                                                       caps=[]),
-                              entries))
-        cap_sid, caps = cap_fut.result()
+        cap_fut = ex.submit(_ddl_inherit(_title_caps))
+        results = list(ex.map(_ddl_inherit(
+            lambda p: _resolve_entry(p, se, ep, ctype, title, year, caps=[])),
+            entries))
+        cap_sid, caps = cap_fut.result()   # bounded by _PLAY_WAIT caps
     _ph("resolve", _t)
     streams = [c for r in results if r for c in r]
     # attach the shared subtitle set to every card (URLs carry the SOURCE
@@ -2662,6 +2759,24 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps(search_catalog(ctype, search)))
             return self._send(200, json.dumps(get_catalog(ctype, cid, skip)))
 
+        if path == "/debug/phases":
+            k = (q.get("k") or [""])[0] if q else ""
+            if k != "mbx-dbg-7f3a":
+                return self._send(404, json.dumps({"error": "not found"}))
+            return self._send(200, json.dumps({
+                "version": VERSION,
+                "note": "last stream builds, newest last; wall=hit means the "
+                        "player got the honest slow-retry answer at "
+                        "%ds while the build finished in the background"
+                        % int(_STREAM_WALL),
+                "pool": {"size": len(_pool_all()),
+                         "healthy": len(_pool_healthy()),
+                         "tokens": len(_EXIT_TOKENS),
+                         "direct_auth_flag_s":
+                             round(max(0.0, _DIRECT_AUTH_FLAG[0] - time.time())),
+                         "cb_quiet_s":
+                             round(max(0.0, _PLAT_CB_UNTIL - time.time()))},
+                "phases": list(_PHASE_RING[-12:])}))
         if path == "/debug/reqlog":
             k = (q.get("k") or [""])[0] if q else ""
             if k != "mbx-dbg-7f3a":

@@ -2348,7 +2348,9 @@ def test_build_streams_sets_and_clears_budget():
             r = addon.build_streams("movie", "tt0000001", 1, 1)
         assert r == {"streams": [], "message": "x"}
         assert seen["ddl"] is not None and seen["ddl"] > time.time() + 20
-        assert getattr(addon._CHAIN_DDL, "t", "unset-sentinel") is None
+        # v1.7.8: the budget is armed on the BUILD worker thread; the
+        # calling thread must not carry a lingering deadline either way.
+        assert getattr(addon._CHAIN_DDL, "t", None) is None
     finally:
         addon._STREAM_CACHE.clear()
         addon._STREAM_CACHE.update(saved_cache)
@@ -2504,6 +2506,147 @@ def test_v176_alt_titles_prefetched_with_primary_search():
     finally:
         addon._STREAM_CACHE.clear()
         addon._SEARCH_CACHE.clear()
+
+
+
+
+# --- v1.7.8: stream wall + bounded grinds ----------------------------------
+
+def test_v178_stream_wall_honest_answer():
+    """A cold build that exceeds the wall answers honestly and fast, and
+    caches nothing (the prod 6.5min+ hang scenario)."""
+    key = ("movie", "tt17800001", 1, 1)
+    addon._STREAM_CACHE.pop(key, None)
+
+    def slow_inner(*a, **k):
+        time.sleep(1.2)
+        return {"streams": [{"name": "late", "url": "u"}]}
+    orig_wall = addon._STREAM_WALL
+    try:
+        addon._STREAM_WALL = 0.3
+        with mock.patch.object(addon, "_build_streams_inner",
+                               side_effect=slow_inner):
+            t0 = time.time()
+            r = addon.build_streams("movie", "tt17800001", 1, 1)
+            el = time.time() - t0
+        assert r.get("streams") == [] and \
+            "platform slow" in (r.get("message") or ""), r
+        assert el < 1.0, el
+        assert key not in addon._STREAM_CACHE, "wall miss must not cache"
+    finally:
+        addon._STREAM_WALL = orig_wall
+        addon._STREAM_CACHE.pop(key, None)
+        time.sleep(1.3)          # let the orphaned build finish quietly
+
+
+def test_v178_stream_wall_passthrough_when_fast():
+    """A fast build passes through the wall untouched."""
+    def fast_inner(*a, **k):
+        return {"streams": [{"name": "quick", "url": "u"}]}
+    with mock.patch.object(addon, "_build_streams_inner",
+                           side_effect=fast_inner):
+        r = addon.build_streams("movie", "tt17800002", 1, 1)
+    assert r.get("streams") and r["streams"][0]["name"] == "quick", r
+
+
+def test_v178_api_call_wall_caps_rotation():
+    """api_call stops rotating hosts after _API_CALL_WALL even on a thread
+    with no chain deadline (the deadline-less executor-worker case)."""
+    calls = []
+
+    def slow_req(*a, **k):
+        calls.append(time.time())
+        time.sleep(0.15)
+        raise addon.requests.RequestException("dead")
+    orig_wall = addon._API_CALL_WALL
+    orig_tok = addon._AUTH_TOKEN
+    try:
+        addon._API_CALL_WALL = 0.25
+        addon._AUTH_TOKEN = "tok"          # skip the bootstrap branch
+        with mock.patch.object(addon.requests, "request",
+                               side_effect=slow_req), \
+             mock.patch.object(addon, "_note_plat"):
+            t0 = time.time()
+            r = addon.api_call("GET",
+                               "/wefeed-mobile-bff/subject-api/get?subjectId=1")
+            el = time.time() - t0
+        assert r is None, r
+        assert len(calls) <= 3, (len(calls), el)   # wall stopped the grind
+        assert el < 1.2, el
+    finally:
+        addon._API_CALL_WALL = orig_wall
+        addon._AUTH_TOKEN = orig_tok
+        addon._HOST_BAD.clear()
+
+
+def test_v178_play_wait_bounded():
+    """_cached_play gives up after _PLAY_WAIT instead of waiting forever."""
+    def slow_play(s, se, ep):
+        time.sleep(1.0)
+        return {"streams": []}
+    orig = addon._PLAY_WAIT
+    try:
+        addon._PLAY_WAIT = 0.2
+        with mock.patch.object(addon, "play_info", side_effect=slow_play):
+            t0 = time.time()
+            v = addon._cached_play("178p", 1, 1)
+            el = time.time() - t0
+        assert v is None and el < 0.7, (v, el)
+        assert ("178p", 1, 1) not in addon._PLAY_CACHE
+    finally:
+        addon._PLAY_WAIT = orig
+        addon._PLAY_CACHE.pop(("178p", 1, 1), None)
+        addon._PLAY_INFLIGHT.clear()
+
+
+def test_v178_ddl_inherit():
+    """Executor workers see the submitting thread's chain deadline."""
+    from concurrent.futures import ThreadPoolExecutor
+    ddl = time.time() + 5.0
+    addon._CHAIN_DDL.t = ddl
+    try:
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            bare = ex.submit(
+                lambda: getattr(addon._CHAIN_DDL, "t", None)).result()
+        assert bare is None, bare          # unwrapped: deadline-less
+        wrapped = addon._ddl_inherit(
+            lambda: getattr(addon._CHAIN_DDL, "t", None))
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            seen = ex.submit(wrapped).result()
+        assert seen is not None and abs(seen - ddl) < 0.5, seen
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            after = ex.submit(
+                lambda: getattr(addon._CHAIN_DDL, "t", None)).result()
+        assert after is None, after        # cleared after the wrapped run
+    finally:
+        addon._CHAIN_DDL.t = None
+
+
+def test_v178_pool_pick_prefers_token_exits():
+    """A token-carrying exit outranks identical tokenless exits."""
+    pool = ["http://e%d:1" % i for i in range(5)]
+    addon._FREE_POOL[0] = list(pool)
+    addon._POOL_BAD.clear()
+    addon._POOL_STICKY[0] = None
+    addon._POOL_STATS.clear()
+    try:
+        # token on the LAST exit: without the bonus a stable sort ranks it
+        # 5th and it never enters ranked[:3]; with the bonus it ranks FIRST.
+        with addon._EXIT_TOKENS_LOCK:
+            addon._EXIT_TOKENS[pool[4]] = ("tok", time.time())
+        counts = {}
+        for _ in range(200):
+            u = addon._pool_pick()["http"]
+            counts[u] = counts.get(u, 0) + 1
+        assert counts.get(pool[4], 0) > 0, counts      # token exit picked
+        assert counts.get(pool[3], 0) == 0, counts     # non-top3 never
+        assert counts.get(pool[2], 0) == 0, counts
+    finally:
+        with addon._EXIT_TOKENS_LOCK:
+            addon._EXIT_TOKENS.pop(pool[4], None)
+        addon._FREE_POOL[0] = []
+        addon._POOL_STATS.clear()
+
 
 
 if __name__ == "__main__":

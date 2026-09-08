@@ -17,6 +17,28 @@
   URLs are CloudFront *query-signed* and point straight at the CDN
   (no video proxying, `Access-Control-Allow-Origin: *`, Range supported)
 
+## Stream hang fixed (v1.7.8)
+
+Cold `/stream` requests on prod hung **6.5+ minutes with no answer at all**
+(only cached titles responded — the reqlog showed zero `/stream` entries
+because hung requests never complete). Root cause chain:
+
+- Render's IP is platform-flagged: all 7 API hosts answer `401 AUTH_FAIL`
+  direct, so every platform call rides the free proxy pool;
+- the 25s chain budget lived in a **thread-local** the fan-out waves
+  (alt searches, dubs, play-info single-flight, resolve) never saw;
+- `_cached_play` waited on its future **unbounded**;
+- one `api_call` could rotate 2 attempts x 7 hosts x (6s request + 6s
+  token bootstrap) ≈ 250s per call on a deadline-less thread.
+
+Fixes: a **hard 24s player-facing wall** (the build keeps running in the
+background and lands in the cache — a retry a minute later hits it), a
+**14s per-`api_call` wall cap** on every thread, **deadline inheritance**
+for all fan-out waves, bounded play-info waits, and pool picks now
+**prefer exits that already carry a platform token** (the 240s pool
+refresh kept re-paying the ~6s token bootstrap). New `/debug/phases`
+endpoint shows recent build phase records + pool state.
+
 ## Cold-path speed (v1.7.7)
 
 A cold `/stream` build (nothing cached) used to take 5–30s on prod. Phase
@@ -83,7 +105,7 @@ Measured locally (sandbox, unthrottled): **median cold ≈ 3.7s, p90 ≈ 5.3s**
 ## Tests
 
 ```
-python3 test_moviebox.py   # 48 unit tests
+python3 test_moviebox.py   # 155 offline tests
 ```
 
 ---
