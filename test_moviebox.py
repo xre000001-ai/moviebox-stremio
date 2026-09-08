@@ -2433,7 +2433,7 @@ def test_v176_dubs_and_play_share_one_wave():
            "releaseDate": "2026-01-01", "corner": "Original"}
 
     def slow_dubs(sid):
-        time.sleep(0.5)
+        time.sleep(0.7)
         return []
 
     _pmemo = {}
@@ -2441,7 +2441,9 @@ def test_v176_dubs_and_play_share_one_wave():
     def slow_play(sid, se=None, ep=None):
         k = (str(sid), se, ep)
         if k not in _pmemo:                    # memoize like the real cache
-            time.sleep(0.5)
+            time.sleep(0.5)                     # (shorter than dubs: the
+                                               #  unjoined prefetch finishes
+                                               #  while the dubs wave runs)
             _pmemo[k] = {"streams": [{"id": "s9", "signCookie": FAKE_COOKIE,
                                        "size": 1000, "duration": 3600}]}
         return _pmemo[k]

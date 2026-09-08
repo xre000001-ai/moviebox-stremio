@@ -49,7 +49,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION = "1.7.6"
+VERSION = "1.7.7"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -449,6 +449,38 @@ API_HOSTS = ["https://api6.aoneroom.com", "https://api5.aoneroom.com",
              "https://api4.aoneroom.com", "https://api3.aoneroom.com",
              "https://api4sg.aoneroom.com", "https://api6sg.aoneroom.com",
              "https://api.inprovider.com"]
+
+# v1.7.7: direct-host health. api_call used to walk ALL 7 hosts per
+# attempt (a sick host = its full timeout, several sick hosts = 10s+ for
+# ONE call — measured: 8.8s dubs+play wave for Parasite, 13.8s before the
+# timeout clamp). Now: the last host that answered code=0 is tried FIRST
+# (sticky), and a host that threw a transport exception is benched 3 min.
+_HOST_LOCK = threading.Lock()
+_HOST_STICKY = [None]            # last host that answered code=0
+_HOST_BAD = {}                   # host -> benched-until timestamp
+
+
+def _api_hosts():
+    """API_HOSTS reordered: benched hosts skipped, sticky host first."""
+    now = time.time()
+    with _HOST_LOCK:
+        bad = {h for h, t in _HOST_BAD.items() if t > now}
+        sticky = _HOST_STICKY[0]
+    hosts = [h for h in API_HOSTS if h not in bad] or list(API_HOSTS)
+    if sticky in hosts:
+        hosts.remove(sticky)
+        hosts.insert(0, sticky)
+    return hosts
+
+
+def _host_note_ok(base):
+    with _HOST_LOCK:
+        _HOST_STICKY[0] = base
+
+
+def _host_note_bad(base):
+    with _HOST_LOCK:
+        _HOST_BAD[base] = time.time() + 180
 CINEMETA = "https://v3-cinemeta.strem.io"
 IMDB_SUGGEST = "https://v2.sg.media-imdb.com/suggestion"
 SITES = {
@@ -662,6 +694,9 @@ def api_call(method, path, body=None, timeout=10):
             if not _AUTH_TOKEN:
                 _bootstrap_token()
     last = None
+    _att_t0 = time.time()        # v1.7.7: a SLOW first attempt means the
+    # host is sick — retrying just doubles the stall (measured: one bad
+    # api host put a 13.8s dent in the dubs+play wave for Parasite).
     # v1.6.8 fallback-only egress: calls go DIRECT first. On the IP-flag
     # signature (403/406) the endpoint family is re-routed through the
     # rotating proxy pool (env MOVIEBOX_PROXY_LIST + the auto-refreshed
@@ -675,9 +710,10 @@ def api_call(method, path, body=None, timeout=10):
         fb = "pool"    # v1.7.5: direct egress auth-flagged — ride the pool
     rode_pool = False          # circuit breaker must not trip on proxy fails
     for attempt in (1, 2):
-        for base in (API_HOSTS[:1] if fb == "sd" else API_HOSTS):
+        for base in (API_HOSTS[:1] if fb == "sd" else _api_hosts()):
             url = base + path
             ts = int(time.time() * 1000)
+            _to = timeout          # per-iteration default (sd branch sets none)
             headers = {
                 "User-Agent": UA_APP,
                 "Accept": "application/json",
@@ -775,6 +811,8 @@ def api_call(method, path, body=None, timeout=10):
                     return None  # transient garbage
                 if d.get("code") == 0:
                     _pool_note("good")       # sticky: keep riding this exit
+                    if fb != "pool":
+                        _host_note_ok(base)  # v1.7.7: sticky healthy host
                     _note_plat(True)
                     return d.get("data") or {}
                 msg = str(d.get("message") or d.get("reason") or "api")
@@ -799,10 +837,17 @@ def api_call(method, path, body=None, timeout=10):
                 last = type(e).__name__
                 if fb == "pool":
                     _pool_note("dead")       # bench this exit for 10 min
+                elif _to >= 2.0:
+                    # v1.7.7: bench sick direct host — but never for a
+                    # budget-clamped sub-2s timeout (that's OUR deadline
+                    # expiring, not the host being sick)
+                    _host_note_bad(base)
                 if fb == "sd":
                     break
                 continue    # pool mode: next iteration picks a fresh exit IP
         if attempt == 1:
+            if time.time() - _att_t0 > 3.5 and not rode_pool:
+                break             # slow attempt: host sick, retry doubles the stall
             time.sleep(0.4)
     if not rode_pool:
         _note_plat(False)    # circuit breaker: only direct-egress failures count
@@ -825,7 +870,8 @@ def search_subjects(kw, subject_type):
     def _v2(keyword):
         d = api_call("POST", "/wefeed-mobile-bff/subject-api/search/v2",
                      json.dumps({"keyword": keyword, "page": 1, "perPage": 20,
-                                 "subjectType": subject_type, "tabId": "All"}))
+                                 "subjectType": subject_type, "tabId": "All"}),
+                     timeout=4)
         if d is None:
             return None                     # transient (transport) failure
         if "__error__" in d:
@@ -836,7 +882,7 @@ def search_subjects(kw, subject_type):
     def _v1(keyword):
         d = api_call("POST", "/wefeed-mobile-bff/subject-api/search",
                      json.dumps({"keyword": keyword, "page": 1, "perPage": 20,
-                                 "subjectType": subject_type}))
+                                 "subjectType": subject_type}), timeout=4)
         if d is None:
             return None
         if "__error__" in d:
@@ -867,7 +913,8 @@ def search_subjects(kw, subject_type):
     return [] if answered else None
 
 def subject_dubs(sid):
-    d = api_call("GET", "/wefeed-mobile-bff/subject-api/get?subjectId=%s&update=0&status=0" % sid)
+    d = api_call("GET", "/wefeed-mobile-bff/subject-api/get?subjectId=%s&update=0&status=0" % sid,
+                 timeout=6)
     if d is None:
         return None                     # transient — caller must not cache
     if "__error__" in d:
@@ -878,7 +925,7 @@ def play_info(sid, se=None, ep=None):
     p = "/wefeed-mobile-bff/subject-api/play-info/v2?subjectId=%s&host=%s" % (sid, API_HOSTS[0])
     if se and ep:
         p += "&se=%s&ep=%s" % (se, ep)
-    d = api_call("GET", p)
+    d = api_call("GET", p, timeout=4)
     if d is None or "__error__" in d:
         return None
     return d
@@ -1668,12 +1715,25 @@ def _cached_dubs(sid):
     _cache_put(_DUB_CACHE, sid, val, 1800)
     return val
 
+_PLAY_INFLIGHT = {}                 # v1.7.7: single-flight play-info
+_PLAY_INFLIGHT_LOCK = threading.Lock()
+
+
 def _cached_play(sid, se, ep):
     key = (str(sid), se, ep)
     hit, val = _cache_get(_PLAY_CACHE, key)
     if hit:
         return val
-    val = play_info(sid, se, ep)
+    with _PLAY_INFLIGHT_LOCK:
+        fut = _PLAY_INFLIGHT.get(key)
+        if fut is None:
+            fut = _META_EX.submit(play_info, sid, se, ep)
+            _PLAY_INFLIGHT[key] = fut
+            fut.add_done_callback(lambda _f, _k=key: _PLAY_INFLIGHT.pop(_k, None))
+    try:
+        val = fut.result()
+    except Exception:
+        val = None
     if val is None:
         return None
     _cache_put(_PLAY_CACHE, key, val, 3600)
@@ -1753,15 +1813,22 @@ def fetch_captions(sid, stream_id):
         return val
     def _mobile():
         d = api_call("GET", "/wefeed-mobile-bff/subject-api/get-stream-captions"
-                     "?subjectId=%s&streamId=%s" % (sid, stream_id))
+                     "?subjectId=%s&streamId=%s" % (sid, stream_id), timeout=4)
         return (d.get("extCaptions") or []) if (d and "__error__" not in d) else []
+    _t0 = time.time()
     caps = _mobile()
-    if len(caps) < 2:            # flaky endpoint — one quick retry
-        time.sleep(0.15)         # v1.7.6: 0.4 -> 0.15 (runs inside the
-        retry = _mobile()        # parallel wave; shorter stall, same recall)
+    if len(caps) < 2 and time.time() - _t0 < 2.0:
+        # flaky endpoint — one quick retry, but only when the first call
+        # FAILED FAST (a slow call means the family is sick: retrying
+        # would just stack a second multi-second stall)
+        time.sleep(0.15)
+        retry = _mobile()
         if len(retry) > len(caps):
             caps = retry
-    if len(caps) < 2:            # still thin — try the web endpoint, keep the longer list
+    if len(caps) < 2 and time.time() - _t0 < 2.5:
+        # still thin — try the web endpoint, but only when the mobile
+        # family answered FAST (a slow mobile call means platform-side
+        # sickness; the web fallback would just stack another stall)
         web = _web_captions(sid, stream_id)
         if len(web) > len(caps):
             caps = web
@@ -1783,7 +1850,7 @@ def _web_captions(sid, stream_id):
                                       "Authorization": "Bearer " + tok,
                                       "User-Agent": _WEB_UA,
                                       "Referer": "https://netnaija.film/"},
-                             timeout=6)
+                             timeout=4)
         except requests.RequestException:
             return []
         if r.status_code in (401, 403):
@@ -2055,8 +2122,23 @@ def _fuzzy_match(subjects, query, year, subject_type):
         hits.append((s, label))
     return hits[:2]
 
+# ---------------------------------------------------------------- stream build
+_PHASES = threading.local()      # v1.7.7: per-thread phase timing recorder
+
+
+def _ph(label, t0):
+    """Append 'label ms' to this thread's phase record (best effort)."""
+    try:
+        rec = getattr(_PHASES, "rec", None)
+        if rec is not None:
+            rec.append("%s %d" % (label, int((time.time() - t0) * 1000)))
+    except Exception:
+        pass
+
+
 def build_streams(ctype, imdb, se, ep, _prewarm_next=True):
     key = (ctype, imdb, se, ep)
+    _PHASES.rec = []             # fresh record (thread may be reused)
     hit, val = _cache_get(_STREAM_CACHE, key)
     if hit:
         return {"streams": val}
@@ -2093,7 +2175,9 @@ def _build_streams_inner(ctype, imdb, se, ep, key, _prewarm_next):
                     threading.Thread(target=_bg_refresh, daemon=True,
                                      args=(ctype, imdb, se, ep, key)).start()
             return {"streams": stale[1]}
+    _t = time.time()
     meta = _meta_any(ctype, imdb)
+    _ph("meta", _t)
     if not meta:
         return {"streams": [], "message": "no metadata"}
     title, year = meta["name"], meta["year"]
@@ -2104,11 +2188,16 @@ def _build_streams_inner(ctype, imdb, se, ep, key, _prewarm_next):
     # localized-name titles before any card appeared.
     alt_fut = (_META_EX.submit(_alt_titles, ctype, meta.get("tmdb"))
                if meta.get("tmdb") else None)
+    _t = time.time()
     subs = _cached_search(title, stype)
+    _ph("search", _t)
     if subs is None:
         # transient egress failure — NOT cached; the player may retry at once
         return {"streams": [], "message": "platform busy — try again"}
+    _t = time.time()
     matched = match_subjects(subs, title, year, stype, season=se) if subs else []
+    _ph("match", _t)
+    _rt = time.time()            # rescue span (≈0 when the primary matched)
     if not matched:
         # v1.7.2 localised-name rescue: IMDb/cinemeta and the platform often
         # use different English names for the same show. v1.7.6: alt-title
@@ -2131,6 +2220,7 @@ def _build_streams_inner(ctype, imdb, se, ep, key, _prewarm_next):
                     matched = _fuzzy_match(alt_subs, alt, year, stype)
                     if matched:
                         break
+    _ph("rescue", _rt)
     if not subs and not matched:
         _cache_put(_STREAM_CACHE, key, [], _neg_ttl())
         return {"streams": [], "message": "not in platform catalog"}
@@ -2140,15 +2230,20 @@ def _build_streams_inner(ctype, imdb, se, ep, key, _prewarm_next):
     # v1.7.6: dub lists AND play-info for the top matches run in the SAME
     # wave — play-info results land in the shared cache, so _resolve_entry
     # below picks them up for free (was: dubs wave, then a play-info wave).
+    _t = time.time()
     m_sids = [str(m[0].get("subjectId")) for m in matched[:4]]
-    with ThreadPoolExecutor(max_workers=6) as ex:
+    # v1.7.7: play-info prefetch is fire-and-forget on the shared pool —
+    # _cached_play is single-flight, so the resolve wave below joins the
+    # very same in-flight future; a slow prefetch can no longer hold the
+    # dubs wave (measured: 7.3s dubs+play outliers from one sick host).
+    for s in m_sids:
+        _META_EX.submit(_cached_play, s,
+                        se if ctype == "series" else None,
+                        ep if ctype == "series" else None)
+    with ThreadPoolExecutor(max_workers=2) as ex:
         dub_f = [ex.submit(_cached_dubs, s) for s in m_sids[:2]]
-        play_f = [ex.submit(_cached_play, s,
-                            se if ctype == "series" else None,
-                            ep if ctype == "series" else None)
-                  for s in m_sids]
         dub_lists = [f.result() for f in dub_f]
-    # (leaving the with-block joins play_f too — primary play-info is warm)
+    _ph("dubs+play", _t)
     # dedupe by subjectId AND label (clean card list)
     entries, seen, seen_labels = [], set(), set()
     for s, label in matched:
@@ -2193,12 +2288,14 @@ def _build_streams_inner(ctype, imdb, se, ep, key, _prewarm_next):
 
     # resolve every dub in parallel (play-info only — no per-dub caption
     # round trips any more), while the shared captions are fetched once
+    _t = time.time()
     with ThreadPoolExecutor(max_workers=8) as ex:
         cap_fut = ex.submit(_title_caps)
         results = list(ex.map(lambda p: _resolve_entry(p, se, ep, ctype, title, year,
                                                        caps=[]),
                               entries))
         cap_sid, caps = cap_fut.result()
+    _ph("resolve", _t)
     streams = [c for r in results if r for c in r]
     # attach the shared subtitle set to every card (URLs carry the SOURCE
     # sid, so they resolve fine on the /sub/ route)
@@ -2432,14 +2529,20 @@ class Handler(BaseHTTPRequestHandler):
 
     def _log_req(self, code, nbytes):
         """Record served requests so player-side playback failures can be
-        diagnosed from the outside (/debug/reqlog)."""
+        diagnosed from the outside (/debug/reqlog). v1.7.7: /stream entries
+        carry the phase breakdown (meta/search/match/rescue/dubs+play/
+        resolve, in ms) so slow builds can be attributed from prod."""
         try:
             p = (self.path or "")[:160]
             if not p.startswith(("/health", "/debug")):
-                _REQLOG.append({"t": time.strftime("%H:%M:%S"), "path": p,
-                                "code": code, "ms": int((time.time() - getattr(self, "_t0", time.time())) * 1000),
-                                "ua": (self.headers.get("User-Agent") or "")[:70],
-                                "bytes": nbytes})
+                ent = {"t": time.strftime("%H:%M:%S"), "path": p,
+                       "code": code,
+                       "ms": int((time.time() - getattr(self, "_t0", time.time())) * 1000),
+                       "ua": (self.headers.get("User-Agent") or "")[:70],
+                       "bytes": nbytes}
+                if p.startswith("/stream/"):
+                    ent["phases"] = " | ".join(getattr(_PHASES, "rec", None) or [])
+                _REQLOG.append(ent)
                 if len(_REQLOG) > 400:
                     del _REQLOG[:200]
         except Exception:

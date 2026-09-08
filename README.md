@@ -17,6 +17,33 @@
   URLs are CloudFront *query-signed* and point straight at the CDN
   (no video proxying, `Access-Control-Allow-Origin: *`, Range supported)
 
+## Cold-path speed (v1.7.7)
+
+A cold `/stream` build (nothing cached) used to take 5–30s on prod. Phase
+telemetry (`/debug/reqlog?k=mbx-dbg-7f3a` now carries a `phases` breakdown
+per request: `meta | search | match | rescue | dubs+play | resolve`) found
+the fat; the fixes:
+
+- **parallel alt-title rescue** — localized-name titles ran one serial
+  platform search per TMDB alt title (up to ~10s); now 3 concurrent
+  searches, evaluated in EN-first priority order, and the alt-title list
+  is prefetched during the primary search
+- **dubs + play-info overlap** — play-info for the top matches is
+  prefetched fire-and-forget (single-flight, deduped with the resolve
+  wave), so a slow prefetch can't hold the dubs wave
+- **direct-host health** — `api_call` used to walk all 7 API hosts per
+  attempt (a sick host = its full timeout; measured 8.8–13.8s waves).
+  Now the last healthy host is sticky-first and transport-failed hosts
+  are benched 3 min
+- **hot-path timeouts** — search/dubs/play/captions calls capped at 4s
+  (was 10s), slow first attempts skip the retry, sick caption families
+  skip the web fallback
+- **single-flight `play-info`** — concurrent callers share one in-flight
+  future (no duplicate calls, no double waits)
+
+Measured locally (sandbox, unthrottled): **median cold ≈ 3.7s, p90 ≈ 5.3s**
+(was median 5.9–6.1s with 10–30s outliers). SWR replay stays ~0.3s.
+
 ## How it works
 
 1. Stremio asks for `stream/{movie|series}/{imdb}` (+ season/episode)
