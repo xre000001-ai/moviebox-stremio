@@ -2199,6 +2199,13 @@ def _build_streams_inner(ctype, imdb, se, ep, key, _prewarm_next):
         if _prewarm_next:
             # background-warm play-info + MPD so the first PLAY click is instant
             _spawn_warm(entries, se, ep, ctype)
+    if not streams:
+        # matched on the platform but no playable video came back — usually
+        # an unreleased film's placeholder entry (v1.7.5: say so honestly
+        # instead of a blank list)
+        _cache_put(_STREAM_CACHE, key, [], _neg_ttl())
+        return {"streams": [], "message":
+                "platform entry has no video yet (upcoming release?)"}
     return {"streams": streams}
 
 _WARM_TS = [0.0]                  # last prewarm batch (module-level, mutable)
