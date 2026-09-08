@@ -50,7 +50,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION = "1.7.8"
+VERSION = "1.7.9"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -2214,6 +2214,7 @@ def _build_guarded(ctype, imdb, se, ep, key, _prewarm_next):
     _prev_ddl = getattr(_CHAIN_DDL, "t", None)
     _CHAIN_DDL.t = time.time() + _STREAM_BUDGET
     _EGRESS.pool = False
+    _PHASES.rec = []       # arm the recorder on THIS (worker) thread too
     try:
         return _build_streams_inner(ctype, imdb, se, ep, key, _prewarm_next), \
             list(getattr(_PHASES, "rec", None) or [])
