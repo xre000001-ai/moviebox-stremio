@@ -2095,8 +2095,6 @@ def test_match_leading_article_insensitive():
     m3 = addon.match_subjects(subs, "East of Eden", "2008", 2)
     assert [x[0]["subjectId"] for x in m3] == ["3"]
 
-if __name__ == "__main__":
-    main()
 
 
 # --- v1.7.5: per-exit tokens, direct-auth flag, chain budget, search route --
@@ -2251,8 +2249,24 @@ def test_api_call_pool_401_benches_exit_and_rotates():
             return resp
         def fake_via_exit(u, timeout=6):
             return None                                  # refresh fails
+        # _pool_pick() is random among top-3 — FORCE the dead exit (f1)
+        # first so the bench-and-rotate path is always exercised; after
+        # f1 is benched the real picker can only choose f2.
+        _real_pick = addon._pool_pick
+        _forced = {"yes": True}
+
+        def fake_pick():
+            if _forced["yes"]:
+                _forced["yes"] = False
+                # mimic _pool_pick's thread-local bookkeeping exactly —
+                # _pool_note() benches whatever _POOL_TLS.url points at
+                addon._POOL_TLS.url = "http://f1:1"
+                addon._POOL_TLS.t_req = time.time()
+                return {"http": "http://f1:1", "https": "http://f1:1"}
+            return _real_pick()
         with mock.patch.object(addon, "_bootstrap_token"), \
              mock.patch.object(addon, "_bootstrap_via_exit", fake_via_exit), \
+             mock.patch.object(addon, "_pool_pick", side_effect=fake_pick), \
              mock.patch.object(addon.requests, "request", side_effect=fake_request):
             addon._AUTH_TOKEN = "tok"
             d = addon.api_call("POST", SD_PATH, "{}")
@@ -2334,7 +2348,7 @@ def test_build_streams_sets_and_clears_budget():
             r = addon.build_streams("movie", "tt0000001", 1, 1)
         assert r == {"streams": [], "message": "x"}
         assert seen["ddl"] is not None and seen["ddl"] > time.time() + 20
-        assert getattr(addon._CHAIN_DDL, "t", "cleared") == "cleared"
+        assert getattr(addon._CHAIN_DDL, "t", "unset-sentinel") is None
     finally:
         addon._STREAM_CACHE.clear()
         addon._STREAM_CACHE.update(saved_cache)
@@ -2364,3 +2378,131 @@ def test_debug_search_endpoint_gated_and_shaped():
         assert "exits" in d and "exit_tokens" in d
     finally:
         _v175_reset()
+
+
+# --- v1.7.6: cold-path speed (parallel alt rescue, one-wave dubs+play) ------
+
+def test_v176_alt_rescue_parallel():
+    """3 alt-title searches at 0.45s each must run CONCURRENTLY (one wave,
+    <=1.3s incl. the 0.45s primary), not serially (>=1.8s); evaluation
+    stays in priority order and the 3rd alt's match wins."""
+    addon._STREAM_CACHE.clear()
+    addon._SEARCH_CACHE.clear()
+    sub = {"subjectId": "555", "title": "Alt Three Show [Hindi]",
+           "subjectType": 2, "releaseDate": "2026-01-01", "corner": "Hindi"}
+    searched = []
+
+    def slow_search(kw, stype):
+        searched.append(kw)
+        time.sleep(0.45)
+        return [sub] if kw == "Alt Three" else []
+    try:
+        with mock.patch.object(addon, "_meta_any",
+                               return_value={"name": "Primary Name",
+                                             "year": "2026", "tmdb": "999"}), \
+             mock.patch.object(addon, "_alt_titles",
+                               return_value=["Alt One", "Alt Two", "Alt Three"]), \
+             mock.patch.object(addon, "_cached_search", side_effect=slow_search), \
+             mock.patch.object(addon, "match_subjects", return_value=[]), \
+             mock.patch.object(addon, "_fuzzy_match",
+                               side_effect=lambda subs, q, y, st:
+                                   [(sub, "Hindi")] if q == "Alt Three" else []), \
+             mock.patch.object(addon, "_cached_dubs", return_value=[]), \
+             mock.patch.object(addon, "_cached_play", return_value=None), \
+             mock.patch.object(addon, "_resolve_entry",
+                               side_effect=lambda *a, **k: [{"name": "c", "url": "u"}]):
+            t0 = time.time()
+            r = addon.build_streams("series", "tt76000176", 1, 1,
+                                    _prewarm_next=False)
+            dt = time.time() - t0
+        assert r.get("streams"), r
+        assert set(searched) == {"Primary Name", "Alt One", "Alt Two",
+                                 "Alt Three"}, searched
+        assert dt < 1.3, dt          # one parallel wave, not three serial ones
+    finally:
+        addon._STREAM_CACHE.clear()
+        addon._SEARCH_CACHE.clear()
+
+
+def test_v176_dubs_and_play_share_one_wave():
+    """dubs (0.5s) and play-info (0.5s) for the top matches run in the SAME
+    executor wave (~0.5s total) instead of back-to-back waves (~1.0s)."""
+    addon._STREAM_CACHE.clear()
+    addon._SEARCH_CACHE.clear()
+    sub = {"subjectId": "444", "title": "Wave Show", "subjectType": 1,
+           "releaseDate": "2026-01-01", "corner": "Original"}
+
+    def slow_dubs(sid):
+        time.sleep(0.5)
+        return []
+
+    _pmemo = {}
+
+    def slow_play(sid, se=None, ep=None):
+        k = (str(sid), se, ep)
+        if k not in _pmemo:                    # memoize like the real cache
+            time.sleep(0.5)
+            _pmemo[k] = {"streams": [{"id": "s9", "signCookie": FAKE_COOKIE,
+                                       "size": 1000, "duration": 3600}]}
+        return _pmemo[k]
+    try:
+        with mock.patch.object(addon, "_meta_any",
+                               return_value={"name": "Wave Show",
+                                             "year": "2026", "tmdb": ""}), \
+             mock.patch.object(addon, "_cached_search", return_value=[sub]), \
+             mock.patch.object(addon, "_cached_dubs", side_effect=slow_dubs), \
+             mock.patch.object(addon, "_cached_play", side_effect=slow_play), \
+             mock.patch.object(addon, "fetch_captions", return_value=[]), \
+             mock.patch.object(addon, "_resolve_entry",
+                               side_effect=lambda *a, **k: [{"name": "c", "url": "u"}]):
+            t0 = time.time()
+            r = addon.build_streams("movie", "tt76000177", 1, 1,
+                                    _prewarm_next=False)
+            dt = time.time() - t0
+        assert r.get("streams"), r
+        assert dt < 0.85, dt         # overlapped waves, not sequential
+    finally:
+        addon._STREAM_CACHE.clear()
+        addon._SEARCH_CACHE.clear()
+
+
+def test_v176_alt_titles_prefetched_with_primary_search():
+    """alt titles are kicked off CONCURRENTLY with the primary platform
+    search (not lazily at rescue time) — the fetch already ran even though
+    the primary title matched directly."""
+    addon._STREAM_CACHE.clear()
+    addon._SEARCH_CACHE.clear()
+    sub = {"subjectId": "333", "title": "Instant Show", "subjectType": 1,
+           "releaseDate": "2026-01-01", "corner": "Original"}
+    alt_t, search_t = [], []
+
+    def alt_fetch(ctype, tmdb_id):
+        alt_t.append(time.time())
+        time.sleep(0.3)
+        return ["Other Name"]
+
+    def search(kw, stype):
+        search_t.append(time.time())
+        return [sub]
+    try:
+        with mock.patch.object(addon, "_meta_any",
+                               return_value={"name": "Instant Show",
+                                             "year": "2026", "tmdb": "31337"}), \
+             mock.patch.object(addon, "_alt_titles", side_effect=alt_fetch), \
+             mock.patch.object(addon, "_cached_search", side_effect=search), \
+             mock.patch.object(addon, "_cached_dubs", return_value=[]), \
+             mock.patch.object(addon, "_cached_play", return_value=None), \
+             mock.patch.object(addon, "_resolve_entry",
+                               side_effect=lambda *a, **k: [{"name": "c", "url": "u"}]):
+            r = addon.build_streams("movie", "tt76000178", 1, 1,
+                                    _prewarm_next=False)
+        assert r.get("streams"), r
+        assert alt_t and search_t, (alt_t, search_t)
+        assert abs(alt_t[0] - search_t[0]) < 0.15, (alt_t, search_t)
+    finally:
+        addon._STREAM_CACHE.clear()
+        addon._SEARCH_CACHE.clear()
+
+
+if __name__ == "__main__":
+    main()

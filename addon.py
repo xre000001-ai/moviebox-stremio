@@ -49,7 +49,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION = "1.7.5"
+VERSION = "1.7.6"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -1757,8 +1757,8 @@ def fetch_captions(sid, stream_id):
         return (d.get("extCaptions") or []) if (d and "__error__" not in d) else []
     caps = _mobile()
     if len(caps) < 2:            # flaky endpoint — one quick retry
-        time.sleep(0.4)
-        retry = _mobile()
+        time.sleep(0.15)         # v1.7.6: 0.4 -> 0.15 (runs inside the
+        retry = _mobile()        # parallel wave; shorter stall, same recall)
         if len(retry) > len(caps):
             caps = retry
     if len(caps) < 2:            # still thin — try the web endpoint, keep the longer list
@@ -2098,6 +2098,12 @@ def _build_streams_inner(ctype, imdb, se, ep, key, _prewarm_next):
         return {"streams": [], "message": "no metadata"}
     title, year = meta["name"], meta["year"]
     stype = 1 if ctype == "movie" else 2
+    # v1.7.6: alt titles are fetched CONCURRENTLY with the primary search
+    # (TMDB is cheap, 24h-cached). The old flow paid a serial TMDB call at
+    # rescue time, then SERIAL per-alt platform searches — up to ~10s on
+    # localized-name titles before any card appeared.
+    alt_fut = (_META_EX.submit(_alt_titles, ctype, meta.get("tmdb"))
+               if meta.get("tmdb") else None)
     subs = _cached_search(title, stype)
     if subs is None:
         # transient egress failure — NOT cached; the player may retry at once
@@ -2105,27 +2111,44 @@ def _build_streams_inner(ctype, imdb, se, ep, key, _prewarm_next):
     matched = match_subjects(subs, title, year, stype, season=se) if subs else []
     if not matched:
         # v1.7.2 localised-name rescue: IMDb/cinemeta and the platform often
-        # use different English names for the same show. Retry the platform
-        # search with TMDB alternative titles and fuzzy-match the answers.
-        for alt in _alt_titles(ctype, meta.get("tmdb")):
-            if not alt or clean_title(alt).lower() == clean_title(title).lower():
-                continue
-            alt_subs = _cached_search(alt, stype)
-            if not alt_subs:
-                continue
-            matched = _fuzzy_match(alt_subs, alt, year, stype)
-            if matched:
-                break
+        # use different English names for the same show. v1.7.6: alt-title
+        # searches run in PARALLEL (3 at a time) and are evaluated in
+        # priority order (EN-market first) — was one search at a time.
+        try:
+            alts = (alt_fut.result(timeout=6) if alt_fut
+                    else _alt_titles(ctype, meta.get("tmdb"))) or []
+        except Exception:
+            alts = []
+        alts = [a for a in alts
+                if a and clean_title(a).lower() != clean_title(title).lower()][:6]
+        if alts:
+            with ThreadPoolExecutor(max_workers=min(3, len(alts))) as aex:
+                afuts = [aex.submit(_cached_search, a, stype) for a in alts]
+                for alt, af in zip(alts, afuts):     # priority order
+                    alt_subs = af.result()
+                    if not alt_subs:
+                        continue
+                    matched = _fuzzy_match(alt_subs, alt, year, stype)
+                    if matched:
+                        break
     if not subs and not matched:
         _cache_put(_STREAM_CACHE, key, [], _neg_ttl())
         return {"streams": [], "message": "not in platform catalog"}
     if not matched:
         _cache_put(_STREAM_CACHE, key, [], _neg_ttl())
         return {"streams": [], "message": "no matching subject"}
-    # dub lists for the top matches, fetched in parallel
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        dub_lists = list(ex.map(lambda m: _cached_dubs(str(m[0].get("subjectId"))),
-                                matched[:2]))
+    # v1.7.6: dub lists AND play-info for the top matches run in the SAME
+    # wave — play-info results land in the shared cache, so _resolve_entry
+    # below picks them up for free (was: dubs wave, then a play-info wave).
+    m_sids = [str(m[0].get("subjectId")) for m in matched[:4]]
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        dub_f = [ex.submit(_cached_dubs, s) for s in m_sids[:2]]
+        play_f = [ex.submit(_cached_play, s,
+                            se if ctype == "series" else None,
+                            ep if ctype == "series" else None)
+                  for s in m_sids]
+        dub_lists = [f.result() for f in dub_f]
+    # (leaving the with-block joins play_f too — primary play-info is warm)
     # dedupe by subjectId AND label (clean card list)
     entries, seen, seen_labels = [], set(), set()
     for s, label in matched:
