@@ -50,7 +50,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -144,17 +144,33 @@ def _direct_auth_ok():
     return time.time() >= _DIRECT_AUTH_FLAG[0]
 
 
+_EXIT_BOOT_LOCKS = {}
+_EXIT_BOOT_LOCKS_GUARD = threading.Lock()
+
+
 def _exit_token(u, refresh=False):
     """Auth token bound to THIS pool exit. Cached 6h; on demand the token
-    is bootstrapped through the exit itself (tab-operating -> x-user)."""
+    is bootstrapped through the exit itself (tab-operating -> x-user).
+
+    v1.8.1: SINGLE-FLIGHT per exit — a parallel wave (search + dubs +
+    play-info) that picks the same tokenless exit used to fire one 6s
+    bootstrap PER THREAD through the same free proxy, which then choked
+    and timed out all of them. Now the first thread bootstraps and the
+    rest wait for its result (double-checked under the exit's lock)."""
     if not u:
         return None
     now = time.time()
     got = _EXIT_TOKENS.get(u)
     if got and not refresh and now - got[1] < 6 * 3600:
         return got[0]
-    tok = _bootstrap_via_exit(u)
-    return tok or (got[0] if got else None)
+    with _EXIT_BOOT_LOCKS_GUARD:
+        lk = _EXIT_BOOT_LOCKS.setdefault(u, threading.Lock())
+    with lk:
+        got = _EXIT_TOKENS.get(u)          # re-check: another thread won
+        if got and not refresh and time.time() - got[1] < 6 * 3600:
+            return got[0]
+        tok = _bootstrap_via_exit(u)
+        return tok or (got[0] if got else None)
 
 
 def _bootstrap_via_exit(u, timeout=6):
@@ -235,11 +251,18 @@ def _pool_pick():
         return s
 
     u = None
-    if sticky and (sticky in healthy or (sticky in allp and not healthy)):
+    # v1.8.1: really ride the FASTEST exit. random.choice(ranked[:3])
+    # sent 2/3 of every parallel wave to slower exits and let one free
+    # proxy carry the whole wave (it then timed out at 6s). Now: prefer
+    # the sticky exit, then the best-scored exit with <2 requests in
+    # flight — the wave spreads across exits instead of piling up.
+    if sticky and (sticky in healthy or (sticky in allp and not healthy)) \
+            and _EXIT_BUSY.get(sticky, 0) < 2:
         u = sticky
     elif healthy:
         ranked = sorted(healthy, key=_score, reverse=True)
-        u = ranked[0] if len(ranked) == 1 else random.choice(ranked[:3])
+        u = next((x for x in ranked if _EXIT_BUSY.get(x, 0) < 2),
+                 None) or ranked[0]
     elif allp:
         u = random.choice(allp)     # everything benched: try anyway
     else:
@@ -247,6 +270,23 @@ def _pool_pick():
     _POOL_TLS.url = u
     _POOL_TLS.t_req = time.time()
     return {"http": u, "https": u}
+
+
+_EXIT_BUSY = {}                     # v1.8.1: url -> in-flight request count
+
+
+def _exit_busy_inc(u):
+    if u:
+        _EXIT_BUSY[u] = _EXIT_BUSY.get(u, 0) + 1
+
+
+def _exit_busy_dec(u):
+    if u:
+        n = _EXIT_BUSY.get(u, 0) - 1
+        if n > 0:
+            _EXIT_BUSY[u] = n
+        else:
+            _EXIT_BUSY.pop(u, None)
 
 def _pool_note(kind, ms=None):
     """Learn from the outcome of this thread's last pool transport and
@@ -339,22 +379,50 @@ def _free_pool_refresh():
                         got.append((u, ms))
             return got
 
+        # v1.8.1: MERGE, never replace. A refresh whose sample found few
+        # good exits used to SHRINK the pool wholesale (prod was seen at
+        # 8 members / 4 healthy) and throw away trained exits, their
+        # tokens and the sticky pick. Snapshot the known-healthy members
+        # FIRST — the wave-1 publish below must not eat them either.
+        with _FREE_POOL_LOCK:
+            prev = [u for u in _FREE_POOL[0]
+                    if _POOL_BAD.get(u, 0.0) <= now]
+
+        def _publish(members):
+            with _FREE_POOL_LOCK:
+                _FREE_POOL[0] = list(members)[:20]
+
         # v1.7.1 wave probing: publish the first wave's exits immediately
         # (a usable pool in ~half the time), then refine with wave 2.
         alive = _probe_batch(cand[:60])
         best = sorted(alive, key=lambda x: x[1])[:20]
-        with _FREE_POOL_LOCK:
-            _FREE_POOL[0] = [u for u, _ in best]
+        _publish(dict.fromkeys(prev + [u for u, _ in best]))
         if len(cand) > 60:
             alive += _probe_batch(cand[60:])
         alive.sort(key=lambda x: x[1])          # fastest first
+        probe_lat = {u: ms for u, ms in alive}
+
+        def _lat(u):
+            st = _POOL_STATS.get(u) or {}
+            return st.get("lat") or probe_lat.get(u, 9999)
+
+        merged = sorted(dict.fromkeys(prev + [u for u, _ in alive]), key=_lat)
+        _publish(merged)
         with _FREE_POOL_LOCK:
-            _FREE_POOL[0] = [u for u, _ in alive[:20]]
-            for u, ms in alive[:20]:
+            for u, ms in alive:
                 st = _POOL_STATS.setdefault(u, {"ok": 0, "fail": 0, "lat": None})
                 st["ok"] += 1
                 st["lat"] = ms if st["lat"] is None else int(0.6 * st["lat"] + 0.4 * ms)
                 _POOL_BAD.pop(u, None)
+            # v1.8.1: bound the learning dicts — a long-lived instance
+            # accumulated 1.5k tokens for exits that left the pool ages
+            # ago. Keep only current members + freshly benched ones.
+            now2 = time.time()
+            keep = set(_FREE_POOL[0]) | {u for u, t in _POOL_BAD.items()
+                                         if t > now2}
+            for d in (_EXIT_TOKENS, _POOL_STATS):
+                for k in [k for k in list(d) if k not in keep]:
+                    d.pop(k, None)
     except Exception:
         pass                            # keep the previous pool; retry next cycle
 
@@ -763,16 +831,21 @@ def api_call(method, path, body=None, timeout=10):
                     rode_pool = True
                     _EGRESS.pool = True          # pool answers may be proxy lies
                     px = _pool_pick()
-                    etok = _exit_token(getattr(_POOL_TLS, "url", None))
-                    if etok:
-                        # v1.7.5: the token must come from THIS exit's IP
-                        headers["Authorization"] = "Bearer " + etok
-                    _to = min(timeout, 6)
-                    if left is not None:
-                        _to = min(_to, max(0.5, left))
-                    r = requests.request(method, url, headers=headers,
-                                         data=body.encode() if body else None,
-                                         timeout=_to, proxies=px)
+                    _bu = getattr(_POOL_TLS, "url", None)
+                    _exit_busy_inc(_bu)          # v1.8.1: spread the wave
+                    try:
+                        etok = _exit_token(_bu)
+                        if etok:
+                            # v1.7.5: the token must come from THIS exit's IP
+                            headers["Authorization"] = "Bearer " + etok
+                        _to = min(timeout, 6)
+                        if left is not None:
+                            _to = min(_to, max(0.5, left))
+                        r = requests.request(method, url, headers=headers,
+                                             data=body.encode() if body else None,
+                                             timeout=_to, proxies=px)
+                    finally:
+                        _exit_busy_dec(_bu)
                 else:
                     _POOL_TLS.url = None
                     kw = {"proxies": _PLAT_PROXIES} if _PLAT_PROXIES else {}
@@ -802,16 +875,21 @@ def api_call(method, path, body=None, timeout=10):
                                 rode_pool = True
                                 _EGRESS.pool = True
                                 px = _pool_pick()
-                                etok = _exit_token(getattr(_POOL_TLS, "url", None))
-                                if etok:
-                                    headers["Authorization"] = "Bearer " + etok
-                                _to2 = min(timeout, 6)
-                                if left is not None:
-                                    _to2 = min(_to2, max(0.5, left))
-                                r = requests.request(
-                                    method, url, headers=headers,
-                                    data=body.encode() if body else None,
-                                    timeout=_to2, proxies=px)
+                                _bu = getattr(_POOL_TLS, "url", None)
+                                _exit_busy_inc(_bu)
+                                try:
+                                    etok = _exit_token(_bu)
+                                    if etok:
+                                        headers["Authorization"] = "Bearer " + etok
+                                    _to2 = min(timeout, 6)
+                                    if left is not None:
+                                        _to2 = min(_to2, max(0.5, left))
+                                    r = requests.request(
+                                        method, url, headers=headers,
+                                        data=body.encode() if body else None,
+                                        timeout=_to2, proxies=px)
+                                finally:
+                                    _exit_busy_dec(_bu)
                             else:
                                 r = _sd_fetch(method, url, headers, body)
                 if r.status_code == 401 and fb == "pool":

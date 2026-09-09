@@ -1868,6 +1868,126 @@ def test_dubs_transient_vs_definitive():
     with mock.patch.object(addon, "api_call", return_value={"dubs": []}):
         assert addon.subject_dubs("7") == []
 
+# ------------------------------------------------ v1.8.1 pool speed fixes
+def test_pool_pick_rides_the_fastest_idle_exit():
+    """v1.8.1: no more random among top-3 — the best-scored exit with
+    <2 requests in flight is taken; a busy best yields to the next."""
+    saved_urls, saved_fp = list(addon._PROXY_URLS), list(addon._FREE_POOL[0])
+    try:
+        _pool_state_reset()
+        addon._PROXY_URLS = []
+        addon._FREE_POOL[0] = ["http://fast:1", "http://mid:1", "http://slow:1"]
+        addon._POOL_STATS.clear()
+        addon._POOL_STATS["http://fast:1"] = {"ok": 10, "fail": 0, "lat": 300}
+        addon._POOL_STATS["http://mid:1"] = {"ok": 10, "fail": 0, "lat": 800}
+        addon._POOL_STATS["http://slow:1"] = {"ok": 10, "fail": 0, "lat": 2000}
+        addon._EXIT_BUSY.clear()
+        assert addon._pool_pick()["http"] == "http://fast:1"
+        # (pick itself does not mark busy — api_call does; simulate it)
+        addon._exit_busy_inc("http://fast:1")
+        assert addon._pool_pick()["http"] == "http://fast:1"   # cap is 2
+        addon._exit_busy_inc("http://fast:1")                  # now 2 busy
+        assert addon._pool_pick()["http"] == "http://mid:1"    # spread!
+        # sticky that is busy yields to the ranked list too
+        addon._POOL_STICKY[0], addon._POOL_STICKY[1] = "http://fast:1", \
+            time.time() + 60
+        assert addon._pool_pick()["http"] == "http://mid:1"
+        addon._exit_busy_dec("http://fast:1")
+        assert addon._pool_pick()["http"] == "http://fast:1"
+    finally:
+        _pool_state_reset()
+        addon._EXIT_BUSY.clear()
+        addon._PROXY_URLS = saved_urls
+        addon._FREE_POOL[0] = saved_fp
+
+
+def test_exit_token_bootstrap_is_single_flight():
+    """v1.8.1: parallel callers of _exit_token on the SAME tokenless exit
+    must share ONE bootstrap round-trip (a dubs+play wave used to fire
+    one 6s bootstrap per thread through the same free proxy)."""
+    import threading as _th
+    calls = {"n": 0}
+    calls_lock = _th.Lock()
+    saved = addon._EXIT_TOKENS.get("http://x:1")
+    addon._EXIT_TOKENS.pop("http://x:1", None)
+
+    def fake_boot(u, timeout=6):
+        with calls_lock:
+            calls["n"] += 1
+        time.sleep(0.4)                 # simulate the 6s round-trip
+        addon._EXIT_TOKENS[u] = ("TOK-" + u, time.time())
+        return "TOK-" + u
+
+    orig = addon._bootstrap_via_exit
+    addon._bootstrap_via_exit = fake_boot
+    try:
+        results = []
+
+        def worker():
+            results.append(addon._exit_token("http://x:1"))
+
+        ts = [_th.Thread(target=worker) for _ in range(5)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        assert calls["n"] == 1, calls          # ONE bootstrap, not five
+        assert all(r == "TOK-http://x:1" for r in results), results
+    finally:
+        addon._bootstrap_via_exit = orig
+        if saved:
+            addon._EXIT_TOKENS["http://x:1"] = saved
+        else:
+            addon._EXIT_TOKENS.pop("http://x:1", None)
+
+
+def test_pool_refresh_merges_never_shrinks():
+    """v1.8.1: a refresh whose fresh sample found few exits must not
+    throw away known-healthy members (prod was seen at 8/4-healthy)."""
+    import types
+    saved_fp, saved_ts0 = list(addon._FREE_POOL[0]), addon._FREE_POOL_TS[0]
+    saved_stats = dict(addon._POOL_STATS)
+    saved_tok = dict(addon._EXIT_TOKENS)
+    try:
+        _pool_state_reset()
+        # current pool: 20 trained, healthy members
+        addon._FREE_POOL[0] = [f"http://old{i}:1" for i in range(20)]
+        for u in addon._FREE_POOL[0]:
+            addon._POOL_STATS[u] = {"ok": 5, "fail": 0, "lat": 700}
+        addon._EXIT_TOKENS["http://old0:1"] = ("tok0", time.time())
+
+        def fake_get(url, timeout=20):
+            return types.SimpleNamespace(text="\n".join(
+                f"http://new{i}:1" for i in range(10)) + "\n")
+
+        def fake_probe(u, timeout=4):
+            return ("good", 300) if u.endswith("new0:1") else ("dead", None)
+
+        orig_get, orig_probe = addon.requests.get, addon._platform_probe
+        orig_pool = list(addon._FREE_POOL[0])
+        addon.requests.get = fake_get
+        addon._platform_probe = fake_probe
+        # force the refresh window open
+        addon._FREE_POOL_TS[0] = time.time() - 999
+        try:
+            addon._free_pool_refresh()
+        finally:
+            addon.requests.get, addon._platform_probe = orig_get, orig_probe
+        merged = addon._FREE_POOL[0]
+        assert len(merged) == 20, len(merged)           # never shrinks
+        assert "http://new0:1" in merged                # fast new find added
+        assert "http://old0:1" in merged                # trained kept
+        assert "http://new0:1" == merged[0]             # fastest first
+        assert addon._EXIT_TOKENS.get("http://old0:1") == ("tok0",
+                                                           addon._EXIT_TOKENS["http://old0:1"][1])  # token survived
+        # stale entries got pruned
+        assert "http://gone:1" not in addon._EXIT_TOKENS
+    finally:
+        _pool_state_reset()
+        addon._FREE_POOL[0] = saved_fp
+        addon._FREE_POOL_TS[0] = saved_ts0
+        addon._POOL_STATS.clear(); addon._POOL_STATS.update(saved_stats)
+        addon._EXIT_TOKENS.clear(); addon._EXIT_TOKENS.update(saved_tok)
+
+
 def test_pool_pick_prefers_trained_exits():
     # among 5 healthy exits the worst-trained one must never be picked
     # (pick samples only the top-3 by score)
