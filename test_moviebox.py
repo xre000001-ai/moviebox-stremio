@@ -293,84 +293,13 @@ def test_res_label():
     assert addon._res_label([480]) == "480"
     assert addon._res_label([]) == "HD"
 
-def test_signed_url():
-    sess = {"dash": "https://sacdn.hakunaymatata.com/dash/999888_1_1_1080_h265_299",
-            "cf": addon._cf_parts(FAKE_COOKIE)}
-    u = addon._signed(sess["dash"], "init-stream0.m4s", sess["cf"])
-    assert u.startswith(sess["dash"] + "/init-stream0.m4s?")
-    assert "Policy=" in u and "Signature=SIGabc123" in u and "Key-Pair-Id=KP123" in u
 
-def test_hls_master():
-    mpd = addon._parse_mpd(MPD_FIX)
-    sess = {"dash": "https://x", "cf": addon._cf_parts(FAKE_COOKIE), "mpd": mpd}
-    m = addon.hls_master(sess)
-    assert m.startswith("#EXTM3U")
-    assert '#EXT-X-MEDIA:TYPE=AUDIO' in m and 'NAME="HIN"' in m
-    assert m.count("#EXT-X-STREAM-INF") == 3
-    assert 'CODECS="hvc1,mp4a.40.2"' in m      # v1.6.11: hev1 rewritten for player compat
-    assert 'RESOLUTION=1920x1080' in m and 'RESOLUTION=1280x720' in m
-    assert "v0.m3u8" in m and "v2.m3u8" in m and "a0.m3u8" in m
 
-def test_hls_media_counts():
-    mpd = addon._parse_mpd(MPD_FIX)   # dur 3643.6s / 5s = 729 chunks
-    sess = {"dash": "https://sacdn.hakunaymatata.com/dash/999888_1_1_1080_h265_299",
-            "cf": addon._cf_parts(FAKE_COOKIE), "mpd": mpd}
-    with mock.patch.object(addon, "_seg_exists", return_value=True):
-        body = addon.hls_media(sess, "0", "v")
-    assert body.count("#EXTINF") == 729
-    assert body.count("chunk-stream0-") == 729
-    assert "chunk-stream0-00001.m3u8" not in body
-    assert "chunk-stream0-00001.m4s" in body
-    assert "chunk-stream0-00729.m4s" in body
-    assert "chunk-stream0-00730.m4s" not in body
-    assert body.rstrip().endswith("#EXT-X-ENDLIST")
-    assert "#EXT-X-MAP:URI=" in body and "init-stream0.m4s" in body
 
-def test_hls_media_audio_rep():
-    mpd = addon._parse_mpd(MPD_FIX)
-    sess = {"dash": "https://x", "cf": addon._cf_parts(FAKE_COOKIE), "mpd": mpd}
-    with mock.patch.object(addon, "_seg_exists", return_value=True):
-        body = addon.hls_media(sess, "3", "a")
-    assert "init-stream3.m4s" in body and "chunk-stream3-00001.m4s" in body
 
-def test_last_good_seg_complete_one_probe():
-    addon._TAIL_CACHE.clear()
-    calls = []
-    def fake(dash, rep, i, cf):
-        calls.append(i); return True
-    with mock.patch.object(addon, "_seg_exists", side_effect=fake):
-        assert addon._last_good_seg("https://d", "0", 729, {}) == 729
-    assert calls == [729]  # single probe, complete file
-    addon._TAIL_CACHE.clear()
 
-def test_last_good_seg_heuristic_83_percent():
-    # the known pattern: ~83.25% of listed segments exist (MPD duration 1.2x)
-    addon._TAIL_CACHE.clear()
-    def fake(dash, rep, i, cf):
-        return i <= 676
-    with mock.patch.object(addon, "_seg_exists", side_effect=fake):
-        got = addon._last_good_seg("https://d2", "0", 812, {})
-    assert got == 676
-    addon._TAIL_CACHE.clear()
 
-def test_last_good_seg_binary_search():
-    addon._TAIL_CACHE.clear()
-    def fake(dash, rep, i, cf):
-        return i <= 400   # not near the 83.25% point -> binary search path
-    with mock.patch.object(addon, "_seg_exists", side_effect=fake):
-        got = addon._last_good_seg("https://d3", "0", 812, {})
-    assert got == 400
-    addon._TAIL_CACHE.clear()
 
-def test_hls_media_trims_to_existing_segments():
-    mpd = addon._parse_mpd(MPD_FIX)   # 729 segments listed
-    sess = {"dash": "https://trunc", "cf": addon._cf_parts(FAKE_COOKIE), "mpd": mpd}
-    with mock.patch.object(addon, "_seg_exists", side_effect=lambda d, r, i, cf: i <= 600):
-        body = addon.hls_media(sess, "0", "v")
-    assert body.count("#EXTINF") == 600
-    assert "chunk-stream0-00600.m4s" in body
-    assert "chunk-stream0-00601.m4s" not in body
-    assert body.rstrip().endswith("#EXT-X-ENDLIST")
 
 def test_cache_put_get():
     store = {}
@@ -578,11 +507,16 @@ def test_build_streams_series_happy_path():
     assert "HEVC" in s0["description"] and "863.7 MB" in s0["description"]
     assert "▣ S01E01" in s0["description"] and "▣ MovieBox" in s0["description"]
     assert "NO SUB" in s0["description"]          # captions mocked empty
-    assert "DASH" not in s0["description"]
-    # lazy HLS: url carries sid/se/ep (stateless), not a session token
-    assert re.match(r"^/hls/\d+/1/1/master\.m3u8$", s0["url"]), s0["url"]
+    # v1.9.0 strict zero: DIRECT platform CDN url + Cookie via proxyHeaders
+    assert s0["url"].startswith("https://sacdn.hakunaymatata.com/dash/")
+    assert s0["url"].endswith("/index.mpd"), s0["url"]
+    bh = s0["behaviorHints"]
+    assert bh["notWebReady"] is True
+    ck = bh["proxyHeaders"]["request"]["Cookie"]
+    assert "CloudFront-Policy=" in ck and "CloudFront-Signature=" in ck
+    assert bh["proxyHeaders"]["request"]["User-Agent"].startswith("ExoPlayerLib")
     assert s0["bingeGroup"].startswith("mbx|Squid Game")
-    # MPD is NOT fetched at card time (deferred to first /hls request)
+    # MPD is NOT fetched at card time (the player fetches it directly)
     assert g.call_count == 0
 
 def test_build_streams_movie_no_dubs():
@@ -606,8 +540,9 @@ def test_build_streams_movie_no_dubs():
     assert res["streams"][0]["description"].count("\n") == 2
     assert "▣ 2010 ▣ MovieBox" in res["streams"][0]["description"]
     assert "S01E01" not in res["streams"][0]["description"]
-    assert re.match(r"^/hls/\d+/0/0/master\.m3u8$", res["streams"][0]["url"])
-    assert g.call_count == 0  # MPD deferred to first /hls request
+    assert res["streams"][0]["url"].endswith("/index.mpd")
+    assert res["streams"][0]["url"].startswith("https://sacdn.hakunaymatata.com/")
+    assert g.call_count == 0  # player fetches the MPD itself
 
 def test_build_streams_result_cached():
     addon._MPD_CACHE.clear()
@@ -643,49 +578,6 @@ def test_cached_play_dedupes():
     assert a == b and calls["n"] == 1
     addon._PLAY_CACHE.clear()
 
-def test_lazy_hls_route_master_and_variant():
-    addon._PLAY_CACHE.clear(); addon._MPD_CACHE.clear(); addon._TAIL_CACHE.clear()
-    with mock.patch.object(addon, "play_info", return_value=PLAY_INFO_FIX), \
-         mock.patch.object(addon, "fetch_captions", return_value=[]), \
-         mock.patch.object(addon, "_seg_exists", return_value=True), \
-         mock.patch.object(addon.requests, "get") as g:
-        r = mock.Mock(status_code=200, content=b"<MPD" + b"x" * 50)
-        r.text = MPD_FIX
-        g.return_value = r
-        c1 = _http_get("/hls/3089349649006742360/1/1/master.m3u8")
-        c2 = _http_get("/hls/3089349649006742360/1/1/v0.m3u8")
-    assert c1["code"] == 200
-    m = c1["body"].decode()
-    assert "#EXT-X-STREAM-INF" in m and "v0.m3u8" in m
-    assert "#EXT-X-MEDIA:TYPE=SUBTITLES" not in m   # captions mocked empty
-    assert c2["code"] == 200
-    v = c2["body"].decode()
-    assert "#EXTINF" in v and "chunk-stream0-00001.m4s" in v
-    addon._PLAY_CACHE.clear(); addon._MPD_CACHE.clear()
-    # master WITH captions: subtitle renditions + SUBTITLES group on variants
-    caps = [{"lan": "en", "url": "https://c/e.srt"}, {"lan": "in_id", "url": "https://c/i.srt"}]
-    with mock.patch.object(addon, "play_info", return_value=PLAY_INFO_FIX), \
-         mock.patch.object(addon, "fetch_captions", return_value=caps), \
-         mock.patch.object(addon, "_seg_exists", return_value=True), \
-         mock.patch.object(addon.requests, "get") as g:
-        r = mock.Mock(status_code=200, content=b"<MPD" + b"x" * 50)
-        r.text = MPD_FIX
-        g.return_value = r
-        c3 = _http_get("/hls/3089349649006742360/1/1/master.m3u8")
-        c4 = _http_get("/hls/3089349649006742360/1/1/sub-en.m3u8")
-    assert c3["code"] == 200
-    m3 = c3["body"].decode()
-    assert ('#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",'
-            'DEFAULT=NO,AUTOSELECT=YES,LANGUAGE="en",URI="sub-en.m3u8"') in m3
-    assert 'LANGUAGE="id",URI="sub-in_id.m3u8"' in m3      # in_id -> id
-    assert 'SUBTITLES="subs"' in m3                        # variants join the group
-    assert c4["code"] == 200
-    m4 = c4["body"].decode()
-    assert m4.startswith("#EXTM3U") and "#EXT-X-ENDLIST" in m4
-    assert "/sub/3089349649006742360/1/1/en.vtt" in m4      # single VTT segment
-    assert "#EXTINF:%.3f," % 3643 in m4                     # play-info duration
-    assert "#EXT-X-TARGETDURATION:3643" in m4
-    addon._PLAY_CACHE.clear(); addon._MPD_CACHE.clear()
 
 def test_sub_playlist_404_on_unknown_lan():
     caps = [{"lan": "en", "url": "https://c/e.srt"}]
@@ -695,12 +587,6 @@ def test_sub_playlist_404_on_unknown_lan():
     assert c["code"] == 404
     addon._PLAY_CACHE.clear()
 
-def test_lazy_hls_route_404_when_no_stream():
-    addon._PLAY_CACHE.clear()
-    with mock.patch.object(addon, "play_info", return_value=None):
-        c = _http_get("/hls/3089349649006742360/1/1/master.m3u8")
-    assert c["code"] == 404
-    addon._PLAY_CACHE.clear()
 
 def test_stream_route_accepts_encoded_colons():
     # many Stremio clients send series ids percent-encoded: tt...%3A1%3A1
@@ -918,20 +804,6 @@ def test_http_not_found():
     c = _http_get("/nope")
     assert c["code"] == 404
 
-def test_srt_to_vtt():
-    srt = "1\n00:00:01,000 --> 00:00:02,500\nHello\n\n2\n00:00:03,000 --> 00:00:04,000\nWorld\r\n"
-    vtt = addon._srt_to_vtt(srt)
-    assert vtt.startswith("WEBVTT\n")
-    assert "00:00:01.000 --> 00:00:02.500" in vtt
-    assert "00:00:03.000 --> 00:00:04.000" in vtt
-    lines = [l for l in vtt.split("\n") if l.strip()]
-    assert not any(l.strip() == "1" for l in lines)   # cue numbers dropped
-    assert "Hello" in vtt and "World" in vtt
-
-def test_vtt_has_timestamp_map():
-    vtt = addon._srt_to_vtt("1\n00:00:01,000 --> 00:00:02,000\nHi\n\n")
-    assert vtt.splitlines()[1] == "X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0"
-    assert "00:00:01.000 --> 00:00:02.000" in vtt
 
 
 def test_fetch_captions_mobile_and_cache():
@@ -987,34 +859,17 @@ def test_resolve_entry_attaches_subtitles():
         cards = addon._resolve_entry(("111", "Hindi"), 1, 5, "series", "Our Sticky Love", "2026")
     assert isinstance(cards, list) and len(cards) == 1
     assert cards[0]["name"] == "𖤍 Our Sticky Love (Hindi)"
-    assert cards[0]["url"].startswith("/hls/111/1/5/master.m3u8")
-    assert "/dash/" not in cards[0]["url"]
+    assert cards[0]["url"].startswith("https://sacdn.hakunaymatata.com/dash/999888")  # from the cookie policy
+    assert cards[0]["url"].endswith("/index.mpd")
+    assert cards[0]["behaviorHints"]["proxyHeaders"]["request"]["Cookie"]
     for card in cards:
         assert card.get("subtitles")
         langs = [s["lang"] for s in card["subtitles"]]
         assert "eng" in langs and "ben" in langs
-        assert card["subtitles"][0]["url"].startswith("/sub/111/1/5/")
-        assert card["subtitles"][0]["url"].endswith(".vtt")
+        assert card["subtitles"][0]["url"].startswith("https://")   # direct
         assert "▣ 2 SUB · en, bn" in card["description"]
 
 
-def test_sub_route_serves_vtt():
-    addon._PLAY_CACHE.clear(); addon._SUB_CACHE.clear(); addon._VTT_CACHE.clear()
-    pi = {"streams": [{"id": "42", "signCookie": FAKE_COOKIE, "url": "", "resolutions": "480",
-                       "size": "1", "duration": 1, "codecName": "hevc", "format": "MP4", "idType": ""}]}
-    caps = [{"lan": "en", "url": "https://cacdn/x.srt?Policy=1"}]
-    class RS:
-        status_code = 200
-        text = "1\n00:00:01,000 --> 00:00:02,000\nHi\n\n"
-    with mock.patch.object(addon, "play_info", return_value=pi), \
-         mock.patch.object(addon, "fetch_captions", return_value=caps), \
-         mock.patch.object(addon.requests, "get", return_value=RS()):
-        c = _http_get("/sub/3089349649006742360/1/1/en.vtt")
-    assert c["code"] == 200
-    body = c["body"].decode()
-    assert body.startswith("WEBVTT")
-    assert "00:00:01.000 --> 00:00:02.000" in body
-    addon._PLAY_CACHE.clear(); addon._SUB_CACHE.clear(); addon._VTT_CACHE.clear()
 
 def test_sub_route_404_unknown_lang():
     addon._PLAY_CACHE.clear(); addon._SUB_CACHE.clear()
@@ -1064,72 +919,9 @@ def test_parse_mpd_timeline():
     assert abs(tl["audio"][1] - 240640 / 48000) < 1e-6
     assert abs(info["seg_dur"] - sum(tl["video"]) / 3) < 1e-6
 
-def test_hls_media_real_durations():
-    info = addon._parse_mpd(MPD_TL)
-    sess = {"dash": "https://sacdn.hakunaymatata.com/dash/777_1_1_1080_h265_3",
-            "cf": addon._cf_parts(FAKE_COOKIE), "mpd": info}
-    with mock.patch.object(addon, "_seg_exists", return_value=True):
-        body = addon.hls_media(sess, "0", "v")
-    ext = [l for l in body.splitlines() if l.startswith("#EXTINF")]
-    assert len(ext) == 3
-    assert "5.923" in ext[0]                          # 142142/24000
-    assert "#EXT-X-TARGETDURATION:6" in body
-    # trimmed to 2 existing segments -> first 2 real durations kept
-    addon._TAIL_CACHE.clear()
-    with mock.patch.object(addon, "_seg_exists", side_effect=lambda d, r, i, cf: i <= 2):
-        body2 = addon.hls_media(sess, "0", "v")
-    ext2 = [l for l in body2.splitlines() if l.startswith("#EXTINF")]
-    assert len(ext2) == 2 and "5.923" in ext2[1]      # second kept entry = 142142/24000
-    assert body2.rstrip().endswith("#EXT-X-ENDLIST")
-    # full 3 segments -> last entry uses the real 5.880s duration
-    assert "5.880" in ext[2] and "5.923" in ext[0]
 
-def test_trim_timeline_body():
-    body = ('<SegmentTemplate timescale="24000">'
-            '<SegmentTimeline><S t="0" d="142142" /><S d="142142" /><S d="141120" /></SegmentTimeline>'
-            '</SegmentTemplate>')
-    out = addon._trim_timeline_body(body, 2)
-    assert out.count("<S ") == 2
-    assert 'd="141120"' not in out
-    assert 't="0"' in out
-    out5 = addon._trim_timeline_body(body, 5)          # keep > available: unchanged
-    assert out5.count("<S ") == 3
 
-def test_dash_manifest_signs_and_trims():
-    addon._PLAY_CACHE.clear(); addon._MPD_RAW_CACHE.clear(); addon._TAIL_CACHE.clear()
-    pi = {"streams": [{"id": "42", "signCookie": FAKE_COOKIE, "url": "", "resolutions": "480",
-                       "size": "1", "duration": 12, "codecName": "hevc", "format": "MP4", "idType": ""}]}
-    with mock.patch.object(addon, "play_info", return_value=pi), \
-         mock.patch.object(addon, "get_mpd_raw", return_value=MPD_TL), \
-         mock.patch.object(addon, "_seg_exists", side_effect=lambda d, r, i, cf: i <= 2):
-        xml = addon.dash_manifest("3642928735944335256", 1, 5)
-    assert xml and xml.startswith("<?xml")
-    # segment templates rewritten to absolute signed URLs
-    assert 'initialization="https://sacdn.hakunaymatata.com/dash/999888_1_1_1080_h265_299/init-stream$RepresentationID$.m4s?Policy=' in xml
-    assert 'media="https://sacdn.hakunaymatata.com/dash/999888_1_1_1080_h265_299/chunk-stream$RepresentationID$-$Number%05d$.m4s?Policy=' in xml
-    assert "Key-Pair-Id=" in xml
-    import xml.etree.ElementTree as ET
-    ET.fromstring(xml)   # rewritten MPD must be well-formed XML ('&' escaped)
-    # both timelines trimmed to 2 segments
-    assert xml.count("<S ") == 4
-    assert 'd="141120"' not in xml
-    # presentation duration = min(video 2 segs, audio 2 segs)
-    assert 'mediaPresentationDuration="PT11.767S"' in xml or \
-           'mediaPresentationDuration="PT10.004S"' in xml or "mediaPresentationDuration" in xml
-    addon._PLAY_CACHE.clear(); addon._MPD_RAW_CACHE.clear(); addon._TAIL_CACHE.clear()
 
-def test_dash_route_serves_mpd():
-    addon._PLAY_CACHE.clear(); addon._MPD_RAW_CACHE.clear(); addon._TAIL_CACHE.clear()
-    pi = {"streams": [{"id": "42", "signCookie": FAKE_COOKIE, "url": "", "resolutions": "480",
-                       "size": "1", "duration": 12, "codecName": "hevc", "format": "MP4", "idType": ""}]}
-    with mock.patch.object(addon, "play_info", return_value=pi), \
-         mock.patch.object(addon, "get_mpd_raw", return_value=MPD_TL), \
-         mock.patch.object(addon, "_seg_exists", return_value=True):
-        c = _http_get("/dash/3089349649006742360/1/1/manifest.mpd")
-    assert c["code"] == 200
-    body = c["body"].decode()
-    assert body.startswith("<?xml") and "<MPD" in body and "Policy=" in body
-    addon._PLAY_CACHE.clear(); addon._MPD_RAW_CACHE.clear(); addon._TAIL_CACHE.clear()
 
 def test_fetch_captions_retry_and_fallback():
     addon._SUB_CACHE.clear()
@@ -1168,7 +960,7 @@ def test_cross_dub_subtitle_rescue():
     orig, hindi = res["streams"]
     assert len(orig.get("subtitles") or []) == 2  # its own captions
     assert len(hindi.get("subtitles") or []) == 2 # thin (1-cap) dub rescued by the sibling
-    assert hindi["subtitles"][0]["url"].startswith("/sub/6391474290696802080/")
+    assert hindi["subtitles"][0]["url"].startswith("https://c/")   # direct CDN (v1.9.0)
     assert "▣ 2 SUB" in hindi["description"]
     assert "NO SUB" not in hindi["description"]
     addon._STREAM_CACHE.clear(); addon._STREAM_STALE.clear()
@@ -1197,7 +989,7 @@ def test_captions_fetched_once_per_title():
     for s in res["streams"]:                              # every card shares it
         assert len(s.get("subtitles") or []) == 9
         assert "▣ 9 SUB" in s["description"]
-        assert s["subtitles"][0]["url"].startswith("/sub/6391474290696802080/")
+        assert s["subtitles"][0]["url"].startswith("https://c/")   # direct CDN (v1.9.0)
     addon._STREAM_CACHE.clear(); addon._STREAM_STALE.clear()
 
 def test_stream_stale_while_revalidate():
@@ -1819,15 +1611,6 @@ def test_pool_free_first_precedence():
         addon._PROXY_URLS = saved_urls
         addon._FREE_POOL[0] = saved_fp
 
-def test_master_codecs_hvc1():
-    sess = {"mpd": {"video": [{"id": "0", "height": 480, "width": 854,
-                               "bw": 350000, "codecs": "hev1.1.6.L93.B0"}],
-                    "audio": [{"lang": "hin", "bw": 64000, "codecs": "mp4a.40.2"}]}}
-    m = addon.hls_master(sess, ("en",))
-    assert "hvc1.1.6.L93.B0" in m
-    assert "hev1" not in m
-    assert 'CODECS="hvc1.1.6.L93.B0,mp4a.40.2"' in m
-    assert 'URI="a0.m3u8"' in m and "sub-en.m3u8" in m
 
 def test_reqlog_records_served_requests():
     saved = list(addon._REQLOG)
@@ -2769,5 +2552,47 @@ def test_v178_pool_pick_prefers_token_exits():
 
 
 
+def test_strict_zero_routes_gone():
+    """v1.9.0 user directive: STRICTLY zero bandwidth — the /hls, /dash
+    and /sub serving routes must not exist (nothing but JSON leaves)."""
+    for path in ("/hls/1883954740090864536/0/0/master.m3u8",
+                 "/hls/1883954740090864536/0/0/v0.m3u8",
+                 "/dash/1883954740090864536/0/0/manifest.mpd",
+                 "/sub/1883954740090864536/0/0/en.vtt"):
+        r = _http_get(path)
+        assert r["code"] == 404, (path, r)
+
+def test_direct_subs_shape():
+    caps = [{"lan": "en", "url": "https://cacdn.x/subtitle/abc"},
+            {"lan": "bn", "url": "https://cacdn.x/subtitle/def"},
+            {"lan": "", "url": "https://cacdn.x/subtitle/nn"},   # dropped
+            {"lan": "fr"}]                                        # dropped
+    subs = addon._direct_subs(caps)
+    assert [s["url"] for s in subs] == ["https://cacdn.x/subtitle/abc",
+                                        "https://cacdn.x/subtitle/def"]
+    assert subs[0]["lang"] == "eng" and subs[0]["id"] == "mbx-en"
+
+
 if __name__ == "__main__":
     main()
+
+
+def test_strict_zero_routes_gone():
+    """v1.9.0 user directive: STRICTLY zero bandwidth — the /hls, /dash
+    and /sub serving routes must not exist (nothing but JSON leaves)."""
+    for path in ("/hls/1883954740090864536/0/0/master.m3u8",
+                 "/hls/1883954740090864536/0/0/v0.m3u8",
+                 "/dash/1883954740090864536/0/0/manifest.mpd",
+                 "/sub/1883954740090864536/0/0/en.vtt"):
+        r = _http_get(path)
+        assert r["code"] == 404, (path, r)
+
+def test_direct_subs_shape():
+    caps = [{"lan": "en", "url": "https://cacdn.x/subtitle/abc"},
+            {"lan": "bn", "url": "https://cacdn.x/subtitle/def"},
+            {"lan": "", "url": "https://cacdn.x/subtitle/nn"},   # dropped
+            {"lan": "fr"}]                                        # dropped
+    subs = addon._direct_subs(caps)
+    assert [s["url"] for s in subs] == ["https://cacdn.x/subtitle/abc",
+                                        "https://cacdn.x/subtitle/def"]
+    assert subs[0]["lang"] == "eng" and subs[0]["id"] == "mbx-en"

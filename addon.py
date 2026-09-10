@@ -1,13 +1,13 @@
 """
 MovieBox — a Stremio addon for a wefeed-based streaming platform.
 
-ZERO-MEDIA-BYTES RULE
-    This server (Render free tier) only ever emits SMALL TEXT: addon JSON,
-    HLS playlists (.m3u8), DASH manifests (.mpd) and WebVTT subtitles —
-    every response is KB-scale and gzip-compressed when the client allows.
-    Video/audio segments are NEVER proxied: players fetch them straight
-    from the platform's CloudFront CDN with per-URL signed queries that
-    this addon derives from the platform's own CloudFront cookies.
+STRICT ZERO-BANDWIDTH RULE (v1.9.0, user directive)
+    NOTHING but tiny JSON is served from here — no playlists, no
+    manifests, no subtitles, no media. Cards point DIRECTLY at the
+    platform's CDN: the DASH MPD carries a CloudFront signed COOKIE via
+    proxyHeaders (the cookie is not IP-bound — verified cross-IP), and
+    subtitles use the caption CDN's open direct URLs. The old
+    synthesized /hls, /dash and /sub routes were removed.
 
 SECTIONS
     1. config            constants, branding, hosts
@@ -17,7 +17,7 @@ SECTIONS
     5. catalogs          scraped pools -> catalog & search metas
     6. cdn / dash        CloudFront cookie parsing, MPD parsing, trimming,
                          rewritten DASH manifests (signed absolute URLs)
-    7. hls               stateless playlists built from the MPD timeline
+    7. cards             strict-zero direct-CDN stream cards
     8. subtitles         mobile caption endpoint + web fallback, SRT->VTT
     9. stream cards      per-dub card building, caching, pre-warming
    10. landing page      install / usage html
@@ -50,7 +50,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION = "1.8.1"
+VERSION = "1.9.0"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -1472,11 +1472,7 @@ def _dash_base(policy_value):
     except Exception:
         return None
 
-def _signed(base, fname, cf):
-    return "%s/%s?%s" % (base, fname, urlencode(
-        {"Policy": cf["CloudFront-Policy"],
-         "Signature": cf["CloudFront-Signature"],
-         "Key-Pair-Id": cf["CloudFront-Key-Pair-Id"]}))
+
 
 def _parse_mpd(xml_text):
     """-> {video:[{id,height,bandwidth}], audio:[{id,lang,bandwidth}], dur, seg_dur}"""
@@ -1557,25 +1553,8 @@ def get_mpd_info(dash_base, cookie):
         return None
     return None
 
-_MPD_RAW_CACHE = {}   # dash_base -> raw MPD xml (30 min)
 
-def get_mpd_raw(dash_base, cookie):
-    hit, val = _cache_get(_MPD_RAW_CACHE, dash_base)
-    if hit:
-        return val
-    try:
-        r = requests.get(dash_base + "/index.mpd",
-                         headers={"Cookie": cookie, "User-Agent": "ExoPlayerLib/2.18.7"},
-                         timeout=15)
-        if (r.status_code == 200 and b"<MPD" in r.content[:600]
-                and len(r.content) < 1_500_000):        # egress guard: text only
-            _cache_put(_MPD_RAW_CACHE, dash_base, r.text, 30 * 60)
-            return r.text
-    except requests.RequestException:
-        pass
-    return None
 
-_S_ENTRY = re.compile(r"<S\s+([^>]*?)/?>")
 
 def _trim_timeline_body(body, keep):
     """Trim an AdaptationSet's SegmentTimeline to its first `keep` segments."""
@@ -1606,181 +1585,7 @@ def _trim_timeline_body(body, keep):
         count += take
     return body[:m.start(1)] + "\n" + "\n".join(out) + "\n" + body[m.end(1):]
 
-def dash_manifest(sid, se, ep):
-    """Stateless rewritten DASH MPD for native players (Stremio/Nuvio):
-    the platform's own manifest with (a) segment URLs made absolute and
-    query-signed with the CloudFront cookie (players can't send Cookie
-    headers), and (b) each AdaptationSet's SegmentTimeline trimmed to the
-    segments that actually exist on the CDN. Text-only: a few KB."""
-    pi = _cached_play(sid, se or None, ep or None)
-    pl = (pi.get("streams") or [None])[0] if pi else None
-    ck = (pl or {}).get("signCookie") or ""
-    if not ck:
-        return None
-    cf = _cf_parts(ck)
-    dash = _dash_base(cf.get("CloudFront-Policy")) if cf else None
-    if not dash:
-        return None
-    xml = get_mpd_raw(dash, ck)
-    if not xml:
-        return None
-    info = _parse_mpd(xml)
-    qs = urlencode({"Policy": cf["CloudFront-Policy"],
-                    "Signature": cf["CloudFront-Signature"],
-                    "Key-Pair-Id": cf["CloudFront-Key-Pair-Id"]})
-    qs = qs.replace("&", "&amp;")   # XML attribute: raw & must be &amp;
-    xml = xml.replace('initialization="init-stream$RepresentationID$.m4s"',
-                      'initialization="%s/init-stream$RepresentationID$.m4s?%s"' % (dash, qs))
-    xml = xml.replace('media="chunk-stream$RepresentationID$-$Number%05d$.m4s"',
-                      'media="%s/chunk-stream$RepresentationID$-$Number%%05d$.m4s?%s"' % (dash, qs))
-    out, pos, kind_durs = [], 0, {}
-    for m in re.finditer(r"(<AdaptationSet\b[^>]*>)(.*?)(</AdaptationSet>)", xml, re.S):
-        head, body = m.group(1), m.group(2)
-        kind = "audio" if 'contentType="audio"' in head or 'lang="' in head else "video"
-        tl = (info.get("tl") or {}).get(kind)
-        reps = info.get(kind) or []
-        if tl and reps:
-            last = min(_last_good_seg(dash, r["id"], len(tl), cf) for r in reps)
-            body = _trim_timeline_body(body, last)
-            kind_durs[kind] = sum(tl[:last])
-        out.append(xml[pos:m.start()])
-        out.append(head + body + m.group(3))
-        pos = m.end()
-    out.append(xml[pos:])
-    xml = "".join(out)
-    if kind_durs:
-        total = min(kind_durs.values())
-        xml = re.sub(r'mediaPresentationDuration="[^"]+"',
-                     'mediaPresentationDuration="PT%.3fS"' % total, xml, count=1)
-        xml = re.sub(r'maxSegmentDuration="[^"]+"', 'maxSegmentDuration="PT6.5S"', xml, count=1)
-    return xml
 
-
-# --------------------------------------------------------------------------
-# 7. hls — stateless playlists from the MPD timeline
-# --------------------------------------------------------------------------
-def hls_master(sess, subs=()):
-    """Master playlist. `subs` = raw language codes — emitted as a proper
-    EXT-X-MEDIA TYPE=SUBTITLES group so manifest-driven players (Nuvio,
-    tvOS, ExoPlayer) see the subtitle tracks inside the HLS itself."""
-    mpd = sess["mpd"]
-    lines = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-INDEPENDENT-SEGMENTS"]
-    auds = mpd["audio"]
-    if auds:
-        for i, a in enumerate(auds):
-            lines.append("#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"%s\","
-                         "DEFAULT=%s,AUTOSELECT=YES,LANGUAGE=\"%s\",URI=\"a%d.m3u8\""
-                         % (a["lang"].upper(), "YES" if i == 0 else "NO", a["lang"], i))
-    subs = list(dict.fromkeys(s for s in subs if s))
-    if subs:
-        for lan in subs:
-            lg, nm = _lang_hls(lan)
-            lines.append("#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"%s\","
-                         "DEFAULT=NO,AUTOSELECT=YES,LANGUAGE=\"%s\",URI=\"sub-%s.m3u8\""
-                         % (nm, lg, lan))
-    for v in mpd["video"]:
-        # hev1 -> hvc1: identical HEVC bitstream tag, but hvc1 is what
-        # Safari/iOS/AVPlayer and strict hls.js builds accept; players that
-        # don't care ignore the difference.
-        vcodecs = v["codecs"].replace("hev1", "hvc1")
-        codecs = vcodecs + ("," + ",".join(a["codecs"] for a in auds) if auds else "")
-        res = "%dx%d" % (v["width"], v["height"]) if v.get("width") else str(v["height"])
-        extra = ("AUDIO=\"aud\"" if auds else "") + (",SUBTITLES=\"subs\"" if subs else "")
-        lines.append("#EXT-X-STREAM-INF:BANDWIDTH=%d,RESOLUTION=%s,CODECS=\"%s\"%s"
-                     % (v["bw"], res, codecs, ("," + extra) if extra else ""))
-        lines.append("v%s.m3u8" % v["id"])
-    return "\n".join(lines) + "\n"
-
-def hls_sub_playlist(sid, se, ep, lan):
-    """Single-segment subtitle media playlist wrapping the WebVTT — the
-    HLS-spec way to attach subs (players resolve /sub/... against our host)."""
-    pi = _cached_play(sid, se or None, ep or None)
-    pl = (pi.get("streams") or [None])[0] if pi else None
-    if not pl or not pl.get("id"):
-        return None
-    caps = fetch_captions(sid, pl["id"])
-    if not any(c.get("lan") == lan for c in caps):
-        return None
-    try:
-        dur = float(pl.get("duration") or 3600)
-    except (TypeError, ValueError):
-        dur = 3600.0
-    lines = ["#EXTM3U", "#EXT-X-VERSION:3",
-             "#EXT-X-TARGETDURATION:%d" % max(1, math.ceil(dur)),
-             "#EXT-X-MEDIA-SEQUENCE:0",
-             "#EXTINF:%.3f," % dur,
-             "/sub/%s/%d/%d/%s.vtt" % (sid, se, ep, lan),
-             "#EXT-X-ENDLIST"]
-    return "\n".join(lines) + "\n"
-
-_TAIL_CACHE = {}   # (dash, rep) -> last segment index that exists on the CDN
-
-def _seg_exists(dash, rep, i, cf):
-    try:
-        r = requests.get(_signed(dash, "chunk-stream%s-%05d.m4s" % (rep, i), cf),
-                         headers={"Range": "bytes=0-1"}, timeout=8)
-        return r.status_code in (200, 206)
-    except Exception:
-        return False
-
-def _last_good_seg(dash, rep, n, cf):
-    """Some platform uploads have an MPD duration inflated ~1.2x — the
-    playlist lists segments that don't exist on the CDN, so players die
-    ~83% into the episode with a load error. Probe the tail once (cheap:
-    heuristic point first, then binary search) and trim the playlist to
-    what actually exists, ending it cleanly with ENDLIST."""
-    key = (dash, rep)
-    hit, val = _cache_get(_TAIL_CACHE, key)
-    if hit:
-        return val
-    last = n
-    if n > 1 and not _seg_exists(dash, rep, n, cf):
-        # common pattern: exactly ~83.25% of the listed count exists
-        k = max(1, int(n * 0.8325))
-        if _seg_exists(dash, rep, k, cf) and not _seg_exists(dash, rep, k + 1, cf):
-            last = k
-        else:
-            lo, hi = 1, n - 1
-            while lo < hi:
-                mid = (lo + hi + 1) // 2
-                if _seg_exists(dash, rep, mid, cf):
-                    lo = mid
-                else:
-                    hi = mid - 1
-            last = lo
-        if last < 2:      # probe looked broken — serve the full list
-            last = n
-    _cache_put(_TAIL_CACHE, key, last, 1800)
-    return last
-
-def hls_media(sess, rep_id, kind):
-    mpd = sess["mpd"]
-    tl = (mpd.get("tl") or {}).get("video" if kind == "v" else "audio")
-    if tl:
-        durs, n = tl, len(tl)
-        tgt = int(math.ceil(max(durs)))
-    else:
-        seg = mpd["seg_dur"] or 5.0
-        durs, n = None, max(1, int(math.ceil((mpd["dur"] or 0) / seg)))
-        tgt = int(math.ceil(seg))
-    n = _last_good_seg(sess["dash"], rep_id, n, sess["cf"])
-    use = durs[:n] if durs else None
-    if use:
-        tgt = int(math.ceil(max(use)))
-    lines = ["#EXTM3U", "#EXT-X-VERSION:7",
-             "#EXT-X-TARGETDURATION:%d" % tgt,
-             "#EXT-X-PLAYLIST-TYPE:VOD",
-             "#EXT-X-MAP:URI=\"%s\"" % _signed(sess["dash"], "init-stream%s.m4s" % rep_id, sess["cf"])]
-    for i in range(1, n + 1):
-        d = use[i - 1] if use else (mpd["seg_dur"] or 5.0)
-        lines.append("#EXTINF:%.3f," % d)
-        lines.append(_signed(sess["dash"], "chunk-stream%s-%05d.m4s" % (rep_id, i), sess["cf"]))
-    lines.append("#EXT-X-ENDLIST")
-    return "\n".join(lines) + "\n"
-
-# --------------------------------------------------------------------------
-# stream handler
-# --------------------------------------------------------------------------
 
 def _res_label(heights):
     hs = sorted(set(heights), reverse=True)
@@ -1878,9 +1683,7 @@ _LANG_NAME = {"ar": "Arabic", "bn": "Bangla", "en": "English", "es": "Spanish",
               "ja": "Japanese", "th": "Thai", "vi": "Vietnamese", "tr": "Turkish",
               "de": "German", "it": "Italian"}
 
-def _lang_hls(code):
-    """(LANGUAGE attr, display NAME) for HLS subtitle renditions."""
-    return ({"in_id": "id"}.get(code, code), _LANG_NAME.get(code, code))
+
 
 def _web_jwt():
     """Anonymous web JWT via the site's search-suggest (x-user response
@@ -1909,6 +1712,16 @@ def _web_jwt():
     except Exception:
         pass
     return _WEB_JWT
+
+def _direct_subs(caps):
+    """v1.9.0 strict zero: the platform's caption CDN (cacdn…) serves
+    the raw SRT files to ANY ip with no cookie (verified 2026-09-10) —
+    subtitle objects point straight at them instead of our /sub route.
+    Players (mpv/ExoPlayer) sniff SRT fine even without an extension."""
+    return [{"url": c["url"], "lang": _LANG3.get(c.get("lan"), c.get("lan")),
+             "id": "mbx-%s" % c.get("lan")}
+            for c in (caps or []) if c.get("lan") and c.get("url")]
+
 
 def fetch_captions(sid, stream_id):
     """Subtitle tracks for one stream. Primary: the platform's own mobile
@@ -1974,53 +1787,12 @@ def _web_captions(sid, stream_id):
             return []
     return []
 
-def _srt_to_vtt(srt):
-    """Minimal SRT -> WebVTT conversion (comma -> dot milliseconds, drop
-    standalone cue numbers, WEBVTT header). Stremio's web player wants VTT."""
-    s = (srt or "").replace("\r\n", "\n").replace("\r", "\n")
-    lines = s.split("\n")
-    out, i, n = ["WEBVTT", "X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0", ""], 0, len(lines)
-    while i < n:
-        if lines[i].strip().isdigit() and i + 1 < n and "-->" in lines[i + 1]:
-            i += 1
-            continue
-        out.append(lines[i])
-        i += 1
-    body = "\n".join(out).strip() + "\n"
-    return re.sub(r"(\d{2}:\d{2}:\d{2}),(\d{3})", r"\1.\2", body)
 
-def _lazy_sub(sid, se, ep, lan):
-    """Stateless VTT subtitle for one (sid, se, ep, lan) — mirrors _lazy_hls."""
-    key = (str(sid), se, ep, lan)
-    hit, val = _cache_get(_VTT_CACHE, key)
-    if hit:
-        return val
-    pi = _cached_play(sid, se or None, ep or None)
-    pl = (pi.get("streams") or [None])[0] if pi else None
-    if not pl or not pl.get("id"):
-        return None
-    caps = fetch_captions(sid, pl["id"])
-    c = next((x for x in caps if x.get("lan") == lan), None)
-    if not c or not c.get("url"):
-        return None
-    try:
-        r = requests.get(c["url"], headers={"User-Agent": _WEB_UA}, timeout=10)
-        if r.status_code != 200 or not r.text.strip() or len(r.text) > 2_500_000:
-            return None                                          # egress guard
-        vtt = _srt_to_vtt(r.text)
-    except requests.RequestException:
-        return None
-    if len(_VTT_CACHE) > 240:
-        _VTT_CACHE.clear()
-    _cache_put(_VTT_CACHE, key, vtt, 6 * 3600)
-    return vtt
 
-# --------------------------------------------------------------------------
-# 9. stream cards — per-dub cards, caching, pre-warm
-# --------------------------------------------------------------------------
 _CODEC_LABEL = {"hevc": "HEVC", "h265": "HEVC", "h264": "H.264", "avc": "H.264",
                 "av1": "AV1"}
 _SUB_DISP = {"in_id": "id"}          # nicer code shown in the card sub line
+
 
 def _fmt_size(n):
     """Bytes -> human readable; blank for junk values."""
@@ -2084,9 +1856,9 @@ def _res_from_pi(pi, pl):
     return _res_label(heights) if heights else "MULTI"
 
 def _resolve_entry(pair, se, ep, ctype, title, year, caps=None):
-    """Stream card for one dub entry. Only play-info is fetched here (cached);
-    the MPD + HLS playlists are resolved lazily on first /hls request — this
-    keeps card building fast enough for Stremio's ~20s timeout."""
+    """Stream card for one dub entry. Only play-info is fetched here
+    (cached); the card points DIRECTLY at the platform's DASH MPD with
+    the signCookie via proxyHeaders (v1.9.0 strict zero-bandwidth)."""
     sid, label = pair
     pi = _cached_play(sid, se if ctype == "series" else None,
                       ep if ctype == "series" else None)
@@ -2121,55 +1893,35 @@ def _resolve_entry(pair, se, ep, ctype, title, year, caps=None):
             caps = fetch_captions(sid, pl.get("id")) or []
         except Exception:
             caps = []
-    subs = [{"url": "/sub/%s/%d/%d/%s.vtt" % (sid, use_se, use_ep, c.get("lan")),
-             "lang": _LANG3.get(c.get("lan"), c.get("lan")),
-             "id": "mbx-%s" % c.get("lan")}
-            for c in (caps or []) if c.get("lan")]
+    subs = _direct_subs(caps)
+    cf2 = _cf_parts(pl["signCookie"])
+    dash = _dash_base(cf2["CloudFront-Policy"])
     card = {
         "name": "𖤍 %s (%s)" % (title, label),
         "description": l1 + "\n" + l2 + "\n" + _sub_line(subs),
-        "url": "/hls/%s/%d/%d/master.m3u8" % (sid, use_se, use_ep),
-        "behaviorHints": {"notWebReady": False, "isBingeable": True},
+        # v1.9.0 STRICT zero-bandwidth (user directive): the platform has
+        # no upstream HLS — the source is a DASH MPD behind a CloudFront
+        # signed COOKIE. The cookie is NOT IP-bound (verified: MPD +
+        # segments 200/206 from other IPs with the Cookie header), so the
+        # card points DIRECTLY at {dash}/index.mpd and Stremio forwards
+        # the Cookie+UA on every manifest/segment request. Zero bytes
+        # through Render; the old synthesized /hls + /sub routes are gone.
+        "url": "%s/index.mpd" % dash,
+        "behaviorHints": {"notWebReady": True, "isBingeable": True,
+                          "proxyHeaders": {"request": {
+                              "Cookie": pl["signCookie"],
+                              "User-Agent": "ExoPlayerLib/2.18.7"}}},
         "bingeGroup": "mbx|%s:%s:%s|%s|%s" % (title, se if ctype == "series" else "",
                                               ep if ctype == "series" else "", label, res),
         "subtitles": subs,
     }
     return [card]
 
-def _lazy_hls(sid, se, ep, file):
-    """Stateless HLS: derive playlists from (sid, se, ep) via cached
-    play-info + cached MPD. No session store — survives restarts and keeps
-    signing cookies fresh for long playback sessions."""
-    pi = _cached_play(sid, se or None, ep or None)
-    pl = (pi.get("streams") or [None])[0] if pi else None
-    ck = (pl or {}).get("signCookie") or ""
-    if not ck:
-        return None
-    cf = _cf_parts(ck)
-    pol = (cf or {}).get("CloudFront-Policy")
-    dash = _dash_base(pol) if pol else None
-    if not dash:
-        return None
-    mpd = get_mpd_info(dash, ck)
-    if not mpd:
-        return None
-    sess = {"dash": dash, "cf": cf, "mpd": mpd}
-    if file == "master":
-        subs = []
-        try:
-            subs = [c.get("lan") for c in fetch_captions(sid, pl.get("id"))
-                    if c.get("lan")]
-        except Exception:
-            pass
-        return hls_master(sess, subs)
-    kind, idx = file[0], int(file[1:])
-    reps = mpd["audio"] if kind == "a" else mpd["video"]
-    if idx >= len(reps):
-        return None
-    return hls_media(sess, reps[idx]["id"], kind)
+
 
 _ALT_CACHE = {}          # (ctype, tmdb_id) -> alternative titles (24h)
 _JUNK_RE = re.compile(r"\b(review|trailer|teaser|recap|explained|full movie|cam)\b", re.I)
+
 
 def _alt_titles(ctype, tmdb_id):
     """Latin-script alternative titles from TMDB (localised-name rescue:
@@ -2472,14 +2224,11 @@ def _build_streams_inner(ctype, imdb, se, ep, key, _prewarm_next):
         cap_sid, caps = cap_fut.result()   # bounded by _PLAY_WAIT caps
     _ph("resolve", _t)
     streams = [c for r in results if r for c in r]
-    # attach the shared subtitle set to every card (URLs carry the SOURCE
-    # sid, so they resolve fine on the /sub/ route)
+    # attach the shared subtitle set to every card (direct cacdn URLs,
+    # no cookie needed — v1.9.0 strict zero)
     if caps and cap_sid:
         use_se, use_ep = (se, ep) if ctype == "series" else (0, 0)
-        shared = [{"url": "/sub/%s/%d/%d/%s.vtt" % (cap_sid, use_se, use_ep, c.get("lan")),
-                   "lang": _LANG3.get(c.get("lan"), c.get("lan")),
-                   "id": "mbx-%s" % c.get("lan")}
-                  for c in caps if c.get("lan")]
+        shared = _direct_subs(caps)
         if shared:
             for s in streams:
                 s["subtitles"] = shared
@@ -2636,8 +2385,9 @@ _LANDING_HTML = """<!doctype html>
     <p>Every title shows one card per language track. Hindi, Original, English,
     Tamil, Telugu, Bengali, Spanish, Portuguese&hellip; whatever the platform hosts.</p></div>
   <div class="card"><h3>⚡ CDN-Direct, Zero Proxy</h3>
-    <p>This server only serves tiny text (JSON + m3u8). All video segments stream
-    <span class="b">straight from the CDN to your player</span> &mdash; fast and private.</p></div>
+    <p><span class="b">Strictly zero bandwidth</span>: this server serves
+    nothing but tiny JSON. Manifests, subtitles and all media flow
+    <span class="b">straight from the CDN to your player</span>.</p></div>
   <div class="card"><h3>📅 Always Fresh</h3>
     <p>Stream lists are cached and replay in ~0.3s; slow builds answer
     honestly and finish in the background for the retry.</p></div>
@@ -2971,48 +2721,14 @@ class Handler(BaseHTTPRequestHandler):
             if not oid.startswith("tt"):
                 return self._send(200, json.dumps({"streams": []}))
             res = build_streams(ctype, oid, se, ep)
-            for s in res.get("streams", []):
-                if s.get("url", "").startswith("/hls/") or s.get("url", "").startswith("/dash/"):
-                    s["url"] = self._host_base() + s["url"]
-                for sub in s.get("subtitles") or []:
-                    if sub.get("url", "").startswith("/sub/"):
-                        sub["url"] = self._host_base() + sub["url"]
+            # v1.9.0: stream/subtitle urls are already ABSOLUTE platform
+            # CDN urls (strict zero) — no host-base rewriting needed
             return self._send(200, json.dumps(res))
 
-        m = re.match(r"^/dash/(\d{5,25})/(\d{1,3})/(\d{1,5})/manifest\.mpd$", path)
-        if m:
-            body = dash_manifest(m.group(1), int(m.group(2)), int(m.group(3)))
-            if body is None:
-                return self._send(404, "no stream for this entry", "application/dash+xml")
-            return self._send(200, body, "application/dash+xml; charset=utf-8")
-
-        m = re.match(r"^/sub/(\d{5,25})/(\d{1,3})/(\d{1,5})/([a-z0-9_]+)\.vtt$", path)
-        if m:
-            sid, use_se, use_ep, lan = m.group(1), int(m.group(2)), int(m.group(3)), m.group(4)
-            body = _lazy_sub(sid, use_se, use_ep, lan)
-            if body is None:
-                return self._send(404, "WEBVTT\n\n# no subtitle for this entry\n",
-                                  "text/vtt; charset=utf-8")
-            return self._send(200, body, "text/vtt; charset=utf-8")
-
-        m = re.match(r"^/hls/(\d{5,25})/(\d{1,3})/(\d{1,5})/sub-([a-z0-9_]+)\.m3u8$", path)
-        if m:
-            body = hls_sub_playlist(m.group(1), int(m.group(2)), int(m.group(3)),
-                                    m.group(4))
-            if body is None:
-                return self._send(404, "#EXTM3U\n#error no subtitle for this entry\n",
-                                  "application/vnd.apple.mpegurl")
-            return self._send(200, body, "application/vnd.apple.mpegurl")
-
-        m = re.match(r"^/hls/(\d{5,25})/(\d{1,3})/(\d{1,5})/(master|v\d+|a\d+)\.m3u8$", path)
-        if m:
-            sid, use_se, use_ep, file = m.group(1), int(m.group(2)), int(m.group(3)), m.group(4)
-            body = _lazy_hls(sid, use_se, use_ep, file)
-            if body is None:
-                return self._send(404, "#EXTM3U\n#error no stream for this entry\n",
-                                  "application/vnd.apple.mpegurl")
-            return self._send(200, body, "application/vnd.apple.mpegurl")
-
+        # v1.9.0 STRICT zero-bandwidth: the /hls, /dash and /sub routes
+        # were REMOVED — cards now point directly at the platform CDN
+        # (DASH MPD via proxyHeaders Cookie, captions via cacdn direct
+        # URLs). Nothing but tiny JSON is served from here.
         return self._send(404, json.dumps({"error": "not found"}))
 
 # --------------------------------------------------------------------------
