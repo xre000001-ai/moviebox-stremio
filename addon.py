@@ -50,7 +50,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION   = "1.9.1"
+VERSION   = "1.9.2"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -1858,8 +1858,12 @@ def _pretty_label(nm):
 #   GET  /subject/play?subjectId&se&ep&detailPath  -> per-resolution MP4s
 # Dub variants exist as their own web subjects ("Title [Hindi]").
 # --------------------------------------------------------------------------
-WEB_MP4_ON = os.environ.get("MOVIEBOX_WEB_MP4", "1").strip().lower() \
-    not in ("0", "false", "off")
+# v1.9.2: DEFAULT OFF — the user confirmed the HEVC DASH cards play on
+# their device, while the web MP4 CDN (bcdnxw) also refused their player
+# (and every server-side probe), so those cards were unverifiable phantoms.
+# Set MOVIEBOX_WEB_MP4=1 to re-enable the per-resolution web cards.
+WEB_MP4_ON = os.environ.get("MOVIEBOX_WEB_MP4", "0").strip().lower() \
+    in ("1", "true", "on")
 _WEB_SITE = "https://netnaija.film"
 _WEB_MP4_TTL = 40 * 60              # signed URLs live ~17h; 40min freshness
 _WEB_MP4_NEG = 10 * 60
