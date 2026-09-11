@@ -511,17 +511,17 @@ def test_build_streams_series_happy_path():
     assert "HEVC" in s0["description"] and "863.7 MB" in s0["description"]
     assert "▣ S01E01" in s0["description"] and "▣ MovieBox" in s0["description"]
     assert "NO SUB" in s0["description"]          # captions mocked empty
-    # v1.9.0 strict zero: DIRECT platform CDN url + Cookie via proxyHeaders
-    assert s0["url"].startswith("https://sacdn.hakunaymatata.com/dash/")
-    assert s0["url"].endswith("/index.mpd"), s0["url"]
-    bh = s0["behaviorHints"]
-    assert bh["notWebReady"] is True
-    ck = bh["proxyHeaders"]["request"]["Cookie"]
-    assert "CloudFront-Policy=" in ck and "CloudFront-Signature=" in ck
-    assert bh["proxyHeaders"]["request"]["User-Agent"].startswith("ExoPlayerLib")
+    # v1.9.4 quality-menu HLS card: relative /hls/... master url (the
+    # /stream route absolutizes it against the request Host). No
+    # proxyHeaders — variant playlists carry self-signed CloudFront
+    # segment URLs, so the player needs no headers at all.
+    assert s0["url"].startswith("/hls/") and s0["url"].endswith("/master.m3u8")
+    assert s0["behaviorHints"]["notWebReady"] is False
+    assert "proxyHeaders" not in s0["behaviorHints"]
     assert s0["bingeGroup"].startswith("mbx|Squid Game")
-    # MPD is NOT fetched at card time (the player fetches it directly)
-    assert g.call_count == 0
+    # the MPD IS fetched at card time now — once per (sid,se,ep): the
+    # no-phantom verification doubles as the variant-list source
+    assert g.call_count >= 1
 
 def test_build_streams_movie_no_dubs():
     addon._MPD_CACHE.clear()
@@ -544,9 +544,9 @@ def test_build_streams_movie_no_dubs():
     assert res["streams"][0]["description"].count("\n") == 2
     assert "▣ 2010 ▣ MovieBox" in res["streams"][0]["description"]
     assert "S01E01" not in res["streams"][0]["description"]
-    assert res["streams"][0]["url"].endswith("/index.mpd")
-    assert res["streams"][0]["url"].startswith("https://sacdn.hakunaymatata.com/")
-    assert g.call_count == 0  # player fetches the MPD itself
+    # v1.9.4: movies get the quality-menu HLS card too (movies use se=0/ep=0)
+    assert res["streams"][0]["url"] == "/hls/%s/0/0/master.m3u8" % SUBJ_INCEPTION["subjectId"]
+    assert g.call_count >= 1      # MPD verified at card time (no phantoms)
 
 def test_build_streams_result_cached():
     addon._MPD_CACHE.clear()
@@ -2571,14 +2571,27 @@ def test_v178_pool_pick_prefers_token_exits():
 
 
 def test_strict_zero_routes_gone():
-    """v1.9.0 user directive: STRICTLY zero bandwidth — the /hls, /dash
-    and /sub serving routes must not exist (nothing but JSON leaves)."""
-    for path in ("/hls/1883954740090864536/0/0/master.m3u8",
-                 "/hls/1883954740090864536/0/0/v0.m3u8",
-                 "/dash/1883954740090864536/0/0/manifest.mpd",
-                 "/sub/1883954740090864536/0/0/en.vtt"):
-        r = _http_get(path)
-        assert r["code"] == 404, (path, r)
+    """v1.9.4 serving policy: /hls master+variant PLAYLIST TEXT routes exist
+    by design (user directive: bring the quality menu back — segments in
+    them are absolute self-signed CloudFront URLs, so media bytes still
+    never pass through this server). Everything else must stay gone:
+    /dash manifests, /sub subtitle relay, /seg, media MIME types."""
+    src = open("addon.py").read()
+    for gone in ("def dash_manifest", "def _lazy_sub", "def _srt_to_vtt",
+                 "_trim_timeline_body", "_VTT_CACHE",
+                 '"/dash/', '"/sub/', '"/seg/'):
+        assert gone not in src, gone
+    # the /hls route ONLY ever matches playlist filenames — no segments
+    assert '(master|v\\d+|a\\d+)\\.m3u8' in src   # playlist filenames only
+    # hermetic route check: unknown sid -> honest 404 text (no network use
+    # here: _cached_play is mocked empty)
+    with mock.patch.object(addon, "_cached_play", return_value=None):
+        for path in ("/hls/1883954740090864536/0/0/master.m3u8",
+                     "/hls/1883954740090864536/0/0/v0.m3u8",
+                     "/dash/1883954740090864536/0/0/manifest.mpd",
+                     "/sub/1883954740090864536/0/0/en.vtt"):
+            r = _http_get(path)
+            assert r["code"] == 404, (path, r)
 
 def test_direct_subs_shape():
     caps = [{"lan": "en", "url": "https://cacdn.x/subtitle/abc"},
@@ -2596,14 +2609,27 @@ if __name__ == "__main__":
 
 
 def test_strict_zero_routes_gone():
-    """v1.9.0 user directive: STRICTLY zero bandwidth — the /hls, /dash
-    and /sub serving routes must not exist (nothing but JSON leaves)."""
-    for path in ("/hls/1883954740090864536/0/0/master.m3u8",
-                 "/hls/1883954740090864536/0/0/v0.m3u8",
-                 "/dash/1883954740090864536/0/0/manifest.mpd",
-                 "/sub/1883954740090864536/0/0/en.vtt"):
-        r = _http_get(path)
-        assert r["code"] == 404, (path, r)
+    """v1.9.4 serving policy: /hls master+variant PLAYLIST TEXT routes exist
+    by design (user directive: bring the quality menu back — segments in
+    them are absolute self-signed CloudFront URLs, so media bytes still
+    never pass through this server). Everything else must stay gone:
+    /dash manifests, /sub subtitle relay, /seg, media MIME types."""
+    src = open("addon.py").read()
+    for gone in ("def dash_manifest", "def _lazy_sub", "def _srt_to_vtt",
+                 "_trim_timeline_body", "_VTT_CACHE",
+                 '"/dash/', '"/sub/', '"/seg/'):
+        assert gone not in src, gone
+    # the /hls route ONLY ever matches playlist filenames — no segments
+    assert '(master|v\\d+|a\\d+)\\.m3u8' in src   # playlist filenames only
+    # hermetic route check: unknown sid -> honest 404 text (no network use
+    # here: _cached_play is mocked empty)
+    with mock.patch.object(addon, "_cached_play", return_value=None):
+        for path in ("/hls/1883954740090864536/0/0/master.m3u8",
+                     "/hls/1883954740090864536/0/0/v0.m3u8",
+                     "/dash/1883954740090864536/0/0/manifest.mpd",
+                     "/sub/1883954740090864536/0/0/en.vtt"):
+            r = _http_get(path)
+            assert r["code"] == 404, (path, r)
 
 def test_direct_subs_shape():
     caps = [{"lan": "en", "url": "https://cacdn.x/subtitle/abc"},
@@ -2720,11 +2746,111 @@ def test_stream_stale_sweeps_expired():
     addon._STREAM_STALE.clear()
 
 def test_no_media_routes_remain():
-    """Strict zero: none of the pre-v1.9.0 media-serving routes may exist."""
+    """Strict zero: none of the pre-v1.9.0 media-serving routes may exist
+    (v1.9.4 deliberately restored ONLY the /hls playlist-text routes)."""
     import re as _re
     src = open("addon.py").read()
-    for gone in ("def _lazy_hls", "def hls_master", "def hls_media",
-                 "def dash_manifest", "_trim_timeline_body", "_VTT_CACHE"):
+    for gone in ("def dash_manifest", "def _lazy_sub", "def _srt_to_vtt",
+                 "_trim_timeline_body", "_VTT_CACHE"):
         assert gone not in src, gone
-    # every stream card url must be a DIRECT absolute http(s) url
-    assert '"url": "%s/index.mpd"' in src or '"url": dash' in src or True
+    assert "def hls_master" in src and "def hls_media" in src   # v1.9.4: back
+
+
+# --- v1.9.4: quality-menu HLS layer ------------------------------------------
+
+MPDINFO_FIX = {
+    "video": [{"id": "0", "height": 1080, "width": 1920, "bw": 1600000, "codecs": "hev1"},
+              {"id": "1", "height": 720, "width": 1280, "bw": 800000, "codecs": "hev1"}],
+    "audio": [{"id": "3", "lang": "hin", "bw": 128000, "codecs": "mp4a.40.2"}],
+    "dur": 1440.0, "seg_dur": 5.0,
+    "tl": {"video": [5.0, 5.0, 5.0, 5.0], "audio": [5.0, 5.0, 5.0, 5.0]},
+}
+CF_FIX = {"CloudFront-Policy": "POL", "CloudFront-Signature": "SIG",
+          "CloudFront-Key-Pair-Id": "KP"}
+SESS_FIX = {"dash": "https://sacdn.hakunaymatata.com/dash/999888",
+            "cf": CF_FIX, "mpd": MPDINFO_FIX}
+
+def test_v194_hls_master_shape():
+    m = addon.hls_master(SESS_FIX)
+    assert m.startswith("#EXTM3U")
+    assert '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud"' in m and 'URI="a0.m3u8"' in m
+    assert "\nv0.m3u8\n" in m and "\nv1.m3u8\n" in m
+    assert 'RESOLUTION=1920x1080' in m and 'RESOLUTION=1280x720' in m
+    assert "hvc1" in m and "hev1" not in m.split("#EXT-X-STREAM-INF")[1]  # hev1->hvc1
+    assert "#EXT-X-STREAM-INF" in m
+
+def test_v194_hls_media_signed_direct_segments():
+    with mock.patch.object(addon, "_last_good_seg", side_effect=lambda d, r, n, c: n):
+        p = addon.hls_media(SESS_FIX, "0", "v")
+    assert p.startswith("#EXTM3U") and "#EXT-X-ENDLIST" in p
+    assert '#EXT-X-MAP:URI="https://sacdn.hakunaymatata.com/dash/999888/init-stream0.m4s?' in p
+    assert "Policy=POL" in p and "Signature=SIG" in p and "Key-Pair-Id=KP" in p
+    segs = [l for l in p.splitlines() if l.startswith("https://")]
+    assert len(segs) == 4                        # tl trimmed to 4 segments
+    assert "chunk-stream0-00001.m4s?" in segs[0] and "chunk-stream0-00004.m4s?" in segs[-1]
+    assert p.count("#EXTINF:5.000,") == 4        # real timeline durations
+    assert "bytes" not in p                      # urls are absolute direct — no relay path
+
+def test_v194_hls_media_no_timeline_fallback():
+    sess = dict(SESS_FIX, mpd=dict(MPDINFO_FIX, tl={}))
+    with mock.patch.object(addon, "_last_good_seg", side_effect=lambda d, r, n, c: n):
+        p = addon.hls_media(sess, "3", "a")
+    assert "#EXT-X-ENDLIST" in p
+    # dur 1440s / seg 5s -> 288 segments
+    assert len([l for l in p.splitlines() if l.startswith("https://")]) == 288
+
+def test_v194_lazy_hls_route_serves_playlists():
+    addon._MPD_CACHE.clear()
+    pi = {"streams": [{"id": "42", "signCookie": FAKE_COOKIE}]}
+    dash = addon._dash_base(CF_FIX and addon._cf_parts(FAKE_COOKIE)["CloudFront-Policy"])
+    addon._MPD_CACHE[dash] = (MPDINFO_FIX, time.time() + 600)
+    try:
+        with mock.patch.object(addon, "_cached_play", return_value=pi), \
+             mock.patch.object(addon, "_last_good_seg",
+                               side_effect=lambda d, r, n, c: n):
+            r = _http_get("/hls/11111/1/5/master.m3u8")
+            assert r["code"] == 200
+            assert r["headers"]["Content-Type"] == "application/vnd.apple.mpegurl"
+            body = r["body"].decode()
+            assert body.startswith("#EXTM3U") and "\nv0.m3u8\n" in body
+            r2 = _http_get("/hls/11111/1/5/v0.m3u8")
+            assert r2["code"] == 200 and "chunk-stream0-00001.m4s" in r2["body"].decode()
+            r3 = _http_get("/hls/11111/1/5/a0.m3u8")
+            assert r3["code"] == 200 and "init-stream3.m4s" in r3["body"].decode()
+            # unknown rep -> honest 404
+            assert _http_get("/hls/11111/1/5/v9.m3u8")["code"] == 404
+    finally:
+        addon._MPD_CACHE.clear()
+
+def test_v194_kill_switch_direct_mpd_fallback():
+    """MOVIEBOX_HLS=0 (or MPD unparsable) -> the v1.9.0-1.9.3 direct-MPD
+    card: DASH manifest + signCookie via proxyHeaders."""
+    pi = {"streams": [{"id": "42", "signCookie": FAKE_COOKIE,
+                       "resolutions": "1080,720,480", "size": "1", "duration": 1,
+                       "codecName": "hevc", "format": "MP4", "idType": ""}]}
+    with mock.patch.object(addon, "_cached_play", return_value=pi), \
+         mock.patch.object(addon, "fetch_captions", return_value=[]), \
+         mock.patch.object(addon, "get_mpd_info", return_value=None):
+        cards = addon._resolve_entry(("111", "Original"), 1, 5, "series", "X", "2020")
+    assert cards and cards[0]["url"].startswith("https://sacdn.hakunaymatata.com/dash/")
+    assert cards[0]["url"].endswith("/index.mpd")
+    assert cards[0]["behaviorHints"]["proxyHeaders"]["request"]["Cookie"] == FAKE_COOKIE
+    assert cards[0]["behaviorHints"]["notWebReady"] is True
+    # and the explicit kill switch:
+    with mock.patch.object(addon, "HLS_ON", False), \
+         mock.patch.object(addon, "_cached_play", return_value=pi), \
+         mock.patch.object(addon, "fetch_captions", return_value=[]):
+        cards2 = addon._resolve_entry(("111", "Original"), 1, 5, "series", "X", "2020")
+    assert cards2[0]["url"].endswith("/index.mpd")
+
+def test_v194_stream_route_absolutizes_hls_urls():
+    """the /stream route must rewrite relative /hls/ card urls against the
+    request Host (the player needs an absolute master url)."""
+    with mock.patch.object(addon, "build_streams",
+                           return_value={"streams": [
+                               {"name": "x", "url": "/hls/11111/1/5/master.m3u8",
+                                "behaviorHints": {}}]}):
+        r = _http_get("/stream/series/tt1:1:5.json")
+    assert r["code"] == 200
+    body = json.loads(r["body"])
+    assert body["streams"][0]["url"] == "https://127.0.0.1:7000/hls/11111/1/5/master.m3u8"

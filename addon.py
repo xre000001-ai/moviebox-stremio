@@ -50,7 +50,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION   = "1.9.3"
+VERSION   = "1.9.4"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -1964,6 +1964,142 @@ def _res_from_pi(pi, pl):
         heights = []
     return _res_label(heights) if heights else "MULTI"
 
+
+# --------------------------------------------------------------------------
+# v1.9.4: HLS quality-menu layer (restored from the v1.4-v1.8.1 design,
+# user directive: 'quality switch korte partam, ekhon parchi na').
+# Direct DASH MPD cards lock desktop players (mpv) to ONE representation —
+# no quality menu. Serving ONLY the master + variant PLAYLISTS from here
+# (tiny text, gzip) brings the 240p-1080p Stremio quality menu back, while
+# every segment stays a self-signed ABSOLUTE CloudFront URL (query params,
+# no cookie/headers needed — verified cookie-less 206 on 2026-09-11) so
+# media bytes still NEVER touch this server (multimovies-v2.2.0-class
+# 'tiny playlist relay', user-approved; zero VIDEO bytes through Render).
+# Kill switch: MOVIEBOX_HLS=0 -> direct MPD cards (v1.9.0-1.9.3 behaviour).
+# --------------------------------------------------------------------------
+HLS_ON = os.environ.get("MOVIEBOX_HLS", "1") != "0"
+
+def _signed_url(base, fname, cf):
+    """CloudFront signed URL from the play-info cookie parts (self-contained
+    query signature — no Cookie header required by the player)."""
+    return "%s/%s?%s" % (base, fname, urlencode(
+        {"Policy": cf["CloudFront-Policy"],
+         "Signature": cf["CloudFront-Signature"],
+         "Key-Pair-Id": cf["CloudFront-Key-Pair-Id"]}))
+
+def hls_master(sess):
+    """Master playlist: one variant per video representation + audio group."""
+    mpd = sess["mpd"]
+    lines = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-INDEPENDENT-SEGMENTS"]
+    auds = mpd["audio"]
+    for i, a in enumerate(auds):
+        lines.append('#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="%s",'
+                     'DEFAULT=%s,AUTOSELECT=YES,LANGUAGE="%s",URI="a%d.m3u8"'
+                     % (a["lang"].upper(), "YES" if i == 0 else "NO", a["lang"], i))
+    for v in mpd["video"]:
+        vcodecs = v["codecs"].replace("hev1", "hvc1")   # hvc1: Safari-friendly
+        codecs = vcodecs + ("," + ",".join(a["codecs"] for a in auds) if auds else "")
+        res = "%dx%d" % (v["width"], v["height"]) if v.get("width") else str(v["height"])
+        extra = ',AUDIO="aud"' if auds else ""
+        lines.append('#EXT-X-STREAM-INF:BANDWIDTH=%d,RESOLUTION=%s,CODECS="%s"%s'
+                     % (v["bw"], res, codecs, extra))
+        lines.append("v%s.m3u8" % v["id"])
+    return "\n".join(lines) + "\n"
+
+_TAIL_CACHE = {}   # (dash, rep) -> last segment index that exists on the CDN
+
+def _seg_exists(dash, rep, i, cf):
+    try:
+        r = requests.get(_signed_url(dash, "chunk-stream%s-%05d.m4s" % (rep, i), cf),
+                         headers={"Range": "bytes=0-1"}, timeout=8)
+        return r.status_code in (200, 206)
+    except Exception:
+        return False
+
+def _last_good_seg(dash, rep, n, cf):
+    """Some platform uploads have an MPD duration inflated ~1.2x — the
+    playlist would list segments that don't exist and players die ~83% in.
+    Probe the tail once (2-byte ranges, cached 30min) and trim to reality."""
+    key = (dash, rep)
+    hit, val = _cache_get(_TAIL_CACHE, key)
+    if hit:
+        return val
+    last = n
+    if n > 1 and not _seg_exists(dash, rep, n, cf):
+        k = max(1, int(n * 0.8325))
+        if _seg_exists(dash, rep, k, cf) and not _seg_exists(dash, rep, k + 1, cf):
+            last = k
+        else:
+            lo, hi = 1, n - 1
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if _seg_exists(dash, rep, mid, cf):
+                    lo = mid
+                else:
+                    hi = mid - 1
+            last = lo
+        if last < 2:      # probe looked broken — serve the full list
+            last = n
+    _cache_put(_TAIL_CACHE, key, last, 1800)
+    return last
+
+def hls_media(sess, rep_id, kind):
+    """Media playlist for one representation: init map + signed direct
+    segment URLs (absolute CloudFront — zero media bytes through Render)."""
+    mpd = sess["mpd"]
+    tl = (mpd.get("tl") or {}).get("video" if kind == "v" else "audio")
+    if tl:
+        durs, n = tl, len(tl)
+        tgt = int(math.ceil(max(durs)))
+    else:
+        seg = mpd["seg_dur"] or 5.0
+        durs, n = None, max(1, int(math.ceil((mpd["dur"] or 0) / seg)))
+        tgt = int(math.ceil(seg))
+    n = _last_good_seg(sess["dash"], rep_id, n, sess["cf"])
+    use = durs[:n] if durs else None
+    if use:
+        tgt = int(math.ceil(max(use)))
+    lines = ["#EXTM3U", "#EXT-X-VERSION:7",
+             "#EXT-X-TARGETDURATION:%d" % tgt,
+             "#EXT-X-PLAYLIST-TYPE:VOD",
+             '#EXT-X-MAP:URI="%s"' % _signed_url(sess["dash"],
+                                                 "init-stream%s.m4s" % rep_id,
+                                                 sess["cf"])]
+    for i in range(1, n + 1):
+        d = use[i - 1] if use else (mpd["seg_dur"] or 5.0)
+        lines.append("#EXTINF:%.3f," % d)
+        lines.append(_signed_url(sess["dash"],
+                                 "chunk-stream%s-%05d.m4s" % (rep_id, i), sess["cf"]))
+    lines.append("#EXT-X-ENDLIST")
+    return "\n".join(lines) + "\n"
+
+def _lazy_hls(sid, se, ep, file):
+    """Stateless HLS: playlists derived from (sid, se, ep) via cached
+    play-info + cached MPD. No session store — survives restarts and keeps
+    signatures fresh for long playback sessions."""
+    pi = _cached_play(sid, se or None, ep or None)
+    pl = (pi.get("streams") or [None])[0] if pi else None
+    ck = (pl or {}).get("signCookie") or ""
+    if not ck:
+        return None
+    cf = _cf_parts(ck)
+    pol = (cf or {}).get("CloudFront-Policy")
+    dash = _dash_base(pol) if pol else None
+    if not dash:
+        return None
+    mpd = get_mpd_info(dash, ck)
+    if not mpd:
+        return None
+    sess = {"dash": dash, "cf": cf, "mpd": mpd}
+    if file == "master":
+        return hls_master(sess)
+    kind, idx = file[0], int(file[1:])
+    reps = mpd["audio"] if kind == "a" else mpd["video"]
+    if idx >= len(reps):
+        return None
+    return hls_media(sess, reps[idx]["id"], kind)
+
+
 def _resolve_entry(pair, se, ep, ctype, title, year, caps=None, web_langs=None):
     """Stream cards for one dub entry. Only play-info is fetched here
     (cached); the DASH card points DIRECTLY at the platform's MPD with
@@ -2012,20 +2148,30 @@ def _resolve_entry(pair, se, ep, ctype, title, year, caps=None, web_langs=None):
     subs = _direct_subs(caps)
     cf2 = _cf_parts(pl["signCookie"])
     dash = _dash_base(cf2["CloudFront-Policy"])
+    # v1.9.4 quality-menu layer: when the MPD parses (one cached text
+    # fetch — also the no-phantom verification), the card points at OUR
+    # master.m3u8 listing every representation, so Stremio shows the
+    # 240p-1080p quality menu again (user: 'quality switch korte partam
+    # ekhon parchi na'). Segments inside the variant playlists are
+    # self-signed ABSOLUTE CloudFront URLs — media bytes still never
+    # touch this server, only tiny playlist text does.
+    hls_url = None
+    if HLS_ON:
+        mpd_info = get_mpd_info(dash, pl["signCookie"])
+        if mpd_info and mpd_info.get("video"):
+            hls_url = "/hls/%s/%d/%d/master.m3u8" % (sid, use_se, use_ep)
     card = {
         "name": "𖤍 %s (%s)" % (title, label),
         "description": l1 + "\n" + l2 + "\n" + _sub_line(subs),
-        # v1.9.0 STRICT zero-bandwidth (user directive): the platform's
-        # mobile source is a DASH MPD behind a CloudFront signed COOKIE.
-        # The cookie is NOT IP-bound (verified: MPD + segments 200/206
-        # from other IPs with the Cookie header), so the card points
-        # DIRECTLY at {dash}/index.mpd and Stremio forwards the Cookie+UA
-        # on every manifest/segment request. Zero bytes through Render.
-        "url": "%s/index.mpd" % dash,
-        "behaviorHints": {"notWebReady": True, "isBingeable": True,
-                          "proxyHeaders": {"request": {
+        "url": hls_url or ("%s/index.mpd" % dash),
+        "behaviorHints": {"notWebReady": not bool(hls_url),
+                          "isBingeable": True,
+                          **({} if hls_url else {"proxyHeaders": {"request": {
                               "Cookie": pl["signCookie"],
-                              "User-Agent": "ExoPlayerLib/2.18.7"}}},
+                              "User-Agent": "ExoPlayerLib/2.18.7"}}})},
+        # (hls_url=None -> the v1.9.0-1.9.3 direct-MPD fallback card:
+        #  DASH manifest + signCookie via proxyHeaders, cookie NOT
+        #  IP-bound — MPD + segments 200/206 from other IPs verified.)
         "bingeGroup": "mbx|%s:%s:%s|%s|%s" % (title, se if ctype == "series" else "",
                                               ep if ctype == "series" else "", label, res),
         "subtitles": subs,
@@ -2657,6 +2803,13 @@ class Handler(BaseHTTPRequestHandler):
             pass
         return base
 
+    def _host_base(self):
+        """Public base of THIS server, as the requesting client sees it."""
+        host = self.headers.get("Host") or ""
+        if host:
+            return "https://" + host
+        return PUBLIC_URL or _KEEPALIVE_URL or "http://localhost:%d" % PORT
+
     def do_GET(self):
         self._t0 = time.time()
         try:
@@ -2883,9 +3036,26 @@ class Handler(BaseHTTPRequestHandler):
             if not oid.startswith("tt"):
                 return self._send(200, json.dumps({"streams": []}))
             res = build_streams(ctype, oid, se, ep)
-            # v1.9.0: stream/subtitle urls are already ABSOLUTE platform
-            # CDN urls (strict zero) — no host-base rewriting needed
+            # v1.9.4: HLS cards carry a relative /hls/... url — absolutize
+            # against the request Host so the player can reach the master
+            base = self._host_base()
+            for s in res.get("streams") or []:
+                if s.get("url", "").startswith("/hls/"):
+                    s["url"] = base + s["url"]
             return self._send(200, json.dumps(res))
+
+        # v1.9.4: quality-menu HLS layer — ONLY master/variant playlist
+        # TEXT is served from here (gzip; stateless rebuild from cached
+        # play-info/MPD keeps signatures fresh). Segments in the variant
+        # playlists are absolute self-signed CloudFront URLs — zero media
+        # bytes pass through this server.
+        m = re.match(r"^/hls/(\d{5,25})/(\d{1,3})/(\d{1,5})/(master|v\d+|a\d+)\.m3u8$", path)
+        if m:
+            body = _lazy_hls(m.group(1), int(m.group(2)), int(m.group(3)), m.group(4))
+            if body is None:
+                return self._send(404, "#EXTM3U\n#error no stream for this entry\n",
+                                  "application/vnd.apple.mpegurl")
+            return self._send(200, body, "application/vnd.apple.mpegurl")
 
         # v1.9.0 STRICT zero-bandwidth: the /hls, /dash and /sub routes
         # were REMOVED — cards now point directly at the platform CDN
