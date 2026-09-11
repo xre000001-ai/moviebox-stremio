@@ -50,7 +50,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION = "1.9.0"
+VERSION   = "1.9.1"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -1846,6 +1846,122 @@ def _pretty_label(nm):
     nm = (nm or "").strip()
     return _LABEL_PRETTY.get(nm.lower(), nm) or "Dub"
 
+# --------------------------------------------------------------------------
+# 5b. v1.9.1 web multi-quality direct MP4s — the site's own per-resolution
+# streams (360/480/720/1080), minted from the platform's WEB play API and
+# served as DIRECT cards (sign embedded in the URL, ~17h validity, zero
+# bytes through Render). Flow (reverse-engineered from the site player):
+#   POST /wefeed-h5api-bff/subject/search-suggest  -> JWT (x-user header)
+#   POST /wefeed-h5api-bff/subject/search          -> items (detailPath!)
+#   GET  /videoPlayPage/{detailPath}               -> warm (REQUIRED: without
+#        this visit + Referer, play silently returns hasResource=false)
+#   GET  /subject/play?subjectId&se&ep&detailPath  -> per-resolution MP4s
+# Dub variants exist as their own web subjects ("Title [Hindi]").
+# --------------------------------------------------------------------------
+WEB_MP4_ON = os.environ.get("MOVIEBOX_WEB_MP4", "1").strip().lower() \
+    not in ("0", "false", "off")
+_WEB_SITE = "https://netnaija.film"
+_WEB_MP4_TTL = 40 * 60              # signed URLs live ~17h; 40min freshness
+_WEB_MP4_NEG = 10 * 60
+_WEB_LANG_CACHE = {}                # (ctype, norm_title) -> (ts, {lang:(sid,dp)})
+_WEB_MP4_CACHE = {}                 # (sid, se, ep) -> (ts, streams|None)
+_WEB_MP4_LOCK = threading.Lock()
+
+def _web_norm_t(t):
+    return re.sub(r"[^a-z0-9]", "", (t or "").lower())
+
+def _web_hdrs(referer=None):
+    h = {"Accept": "application/json",
+         "X-Client-Info": json.dumps({"timezone": "Asia/Dhaka"}),
+         "User-Agent": _WEB_UA, "Origin": _WEB_SITE, "X-Source": ""}
+    if referer:
+        h["Referer"] = referer
+    return h
+
+def _web_lang_map(title, ctype):
+    """One web search for the title -> {lang: (sid, detailPath)} for exact
+    matches ('' = original). Cached; empty dict on miss/absence."""
+    key = (ctype, _web_norm_t(title))
+    hit, val = _cache_get(_WEB_LANG_CACHE, key)
+    if hit:
+        return val or {}
+    langs = {}
+    try:
+        jwt = _web_jwt()
+        if jwt:
+            r = requests.post(
+                _WEB_SITE + "/wefeed-h5api-bff/subject/search",
+                json={"keyword": title, "page": 1, "perPage": 20,
+                      "subjectType": 1 if ctype == "movie" else 2,
+                      "tabId": "All"},
+                headers={"Accept": "application/json",
+                         "Content-Type": "application/json",
+                         "X-Client-Info": json.dumps({"timezone": "Asia/Dhaka"}),
+                         "X-Request-Lang": "en", "User-Agent": _WEB_UA,
+                         "Origin": _WEB_SITE, "Referer": _WEB_SITE + "/",
+                         "X-Source": "h5",
+                         "Authorization": "Bearer %s" % jwt},
+                timeout=5)
+            items = (((r.json() or {}).get("data") or {}).get("items")) or []
+            for it in items:
+                raw = (it.get("title") or "").strip()
+                sid, dp = it.get("subjectId"), it.get("detailPath")
+                if not sid or not dp:
+                    continue
+                bare = re.sub(r"\s*\[[^\]]*\]", "", raw).strip()
+                if _web_norm_t(bare) != _web_norm_t(title):
+                    continue
+                m = re.search(r"\[([^\]]+)\]", raw)
+                lang = (m.group(1).strip() if m else "").lower()
+                langs.setdefault(lang, (str(sid), dp))
+    except Exception:
+        pass
+    _cache_put(_WEB_LANG_CACHE, key, langs or None,
+               _WEB_MP4_TTL if langs else _WEB_MP4_NEG)
+    return langs
+
+def _web_mp4_streams(sid, dp, se, ep):
+    """Signed per-resolution MP4s for one web (dub) subject.
+    Returns [(res_int, url, size_bytes, codec, duration)] desc, or []."""
+    if not WEB_MP4_ON:
+        return []
+    key = (sid, se, ep)
+    hit, val = _cache_get(_WEB_MP4_CACHE, key)
+    if hit:
+        return val or []
+    out = []
+    try:
+        if _ddl_left() is not None and _ddl_left() < 2.5:
+            return []                      # too late in the budget — skip
+        s = requests.Session()
+        s.get(_WEB_SITE + "/videoPlayPage/" + dp,
+              headers={"User-Agent": _WEB_UA, "Accept": "text/html"},
+              timeout=4)
+        r = s.get(_WEB_SITE + "/wefeed-h5api-bff/subject/play"
+                  "?subjectId=%s&se=%s&ep=%s&detailPath=%s" % (sid, se, ep, dp),
+                  headers=_web_hdrs(_WEB_SITE + "/videoPlayPage/" + dp),
+                  timeout=5)
+        d = (r.json() or {}).get("data") or {}
+        if d.get("hasResource") or d.get("streams"):
+            for st in d.get("streams") or []:
+                u = str(st.get("url") or "")
+                if not u.startswith("http") or ".mp4" not in u.lower():
+                    continue
+                try:
+                    res = int(re.findall(r"\d{3,4}", str(st.get("resolutions")))[0])
+                except Exception:
+                    continue
+                out.append((res, u, int(st.get("size") or 0),
+                            str(st.get("codecName") or ""),
+                            int(st.get("duration") or 0)))
+            out.sort(key=lambda x: -x[0])
+    except Exception:
+        out = []
+    _cache_put(_WEB_MP4_CACHE, key, out or None,
+               _WEB_MP4_TTL if out else _WEB_MP4_NEG)
+    return out
+
+
 def _res_from_pi(pi, pl):
     """Resolution label from play-info (no MPD fetch needed at card time)."""
     raw = pi.get("displayResolutions") or (pl or {}).get("resolutions") or ""
@@ -1855,23 +1971,30 @@ def _res_from_pi(pi, pl):
         heights = []
     return _res_label(heights) if heights else "MULTI"
 
-def _resolve_entry(pair, se, ep, ctype, title, year, caps=None):
-    """Stream card for one dub entry. Only play-info is fetched here
-    (cached); the card points DIRECTLY at the platform's DASH MPD with
-    the signCookie via proxyHeaders (v1.9.0 strict zero-bandwidth)."""
+def _resolve_entry(pair, se, ep, ctype, title, year, caps=None, web_langs=None):
+    """Stream cards for one dub entry. Only play-info is fetched here
+    (cached); the DASH card points DIRECTLY at the platform's MPD with
+    the signCookie via proxyHeaders (v1.9.0 strict zero-bandwidth).
+    v1.9.1: ALSO mints the site's per-resolution direct MP4s from the
+    WEB play API (signed URLs, no cookies) — one card per quality,
+    ahead of the DASH card."""
     sid, label = pair
     pi = _cached_play(sid, se if ctype == "series" else None,
                       ep if ctype == "series" else None)
     if not pi:
-        return None
+        # web MP4s can still exist even when the mobile play-info is
+        # transiently sick — try them before giving up on this dub
+        web_cards = _web_cards_for(title, label, ctype, se, ep, sid, web_langs)
+        return web_cards or None
     pl = (pi.get("streams") or [None])[0]
+    web_cards = _web_cards_for(title, label, ctype, se, ep, sid, web_langs)
     if not pl or not pl.get("signCookie"):
-        return None
+        return web_cards or None
     cf = _cf_parts(pl["signCookie"])
     if not cf or "CloudFront-Policy" not in cf:
-        return None
+        return web_cards or None
     if not _dash_base(cf["CloudFront-Policy"]):
-        return None
+        return web_cards or None
     res = _res_from_pi(pi, pl)
     use_se, use_ep = (se, ep) if ctype == "series" else (0, 0)
     # --- card layout: bold name line + multi-line description ---
@@ -1899,13 +2022,12 @@ def _resolve_entry(pair, se, ep, ctype, title, year, caps=None):
     card = {
         "name": "𖤍 %s (%s)" % (title, label),
         "description": l1 + "\n" + l2 + "\n" + _sub_line(subs),
-        # v1.9.0 STRICT zero-bandwidth (user directive): the platform has
-        # no upstream HLS — the source is a DASH MPD behind a CloudFront
-        # signed COOKIE. The cookie is NOT IP-bound (verified: MPD +
-        # segments 200/206 from other IPs with the Cookie header), so the
-        # card points DIRECTLY at {dash}/index.mpd and Stremio forwards
-        # the Cookie+UA on every manifest/segment request. Zero bytes
-        # through Render; the old synthesized /hls + /sub routes are gone.
+        # v1.9.0 STRICT zero-bandwidth (user directive): the platform's
+        # mobile source is a DASH MPD behind a CloudFront signed COOKIE.
+        # The cookie is NOT IP-bound (verified: MPD + segments 200/206
+        # from other IPs with the Cookie header), so the card points
+        # DIRECTLY at {dash}/index.mpd and Stremio forwards the Cookie+UA
+        # on every manifest/segment request. Zero bytes through Render.
         "url": "%s/index.mpd" % dash,
         "behaviorHints": {"notWebReady": True, "isBingeable": True,
                           "proxyHeaders": {"request": {
@@ -1915,7 +2037,50 @@ def _resolve_entry(pair, se, ep, ctype, title, year, caps=None):
                                               ep if ctype == "series" else "", label, res),
         "subtitles": subs,
     }
-    return [card]
+    return web_cards + [card]
+
+
+def _web_cards_for(title, label, ctype, se, ep, mob_sid, web_langs):
+    """v1.9.1: per-resolution DIRECT MP4 cards from the platform's WEB
+    play API (the site player's own multi-quality sources). One card per
+    resolution; sign embedded in the URL (~17h), no cookies, plays in
+    Stremio Web too. Returns [] when the web catalog lacks this dub."""
+    if not WEB_MP4_ON or web_langs is None:
+        return []
+    lang = "" if (label or "").lower() in ("", "original", "default") \
+        else (label or "").lower()
+    ent = web_langs.get(lang)
+    if not ent:
+        # never guess: a web card labeled (Hindi) must be the HINDI dub's
+        # own web subject — mapping it to the original audio would mislabel
+        return []
+    wsid, wdp = ent
+    use_se, use_ep = (se, ep) if ctype == "series" else (0, 0)
+    st = _web_mp4_streams(wsid, wdp, use_se, use_ep)
+    if not st:
+        return []
+    if ctype == "series":
+        l2 = "▣ S%02dE%02d ▣ %s" % (se, ep, BRAND)
+    else:
+        l2 = "▣ MULTI ▣ %s" % BRAND
+    cards = []
+    for res_i, url, size, codec, dur in st:
+        l1 = "▣ %dp" % res_i
+        cl = _CODEC_LABEL.get((codec or "").lower())
+        for part in (cl, _fmt_size(size), _fmt_dur(dur)):
+            if part:
+                l1 += " ▣ " + part
+        cards.append({
+            "name": "𖤍 %s (%s)" % (title, label),
+            "description": l1 + "\n" + l2 + "\n▣ WEB ▣ direct",
+            # signed DIRECT URL — zero bytes through Render, no headers
+            "url": url,
+            "behaviorHints": {"notWebReady": False, "isBingeable": True},
+            "bingeGroup": "mbxw|%s:%s:%s|%s|%dp" % (
+                title, se if ctype == "series" else "",
+                ep if ctype == "series" else "", label, res_i),
+        })
+    return cards
 
 
 
@@ -2214,12 +2379,16 @@ def _build_streams_inner(ctype, imdb, se, ep, key, _prewarm_next):
         return src_sid, caps
 
     # resolve every dub in parallel (play-info only — no per-dub caption
-    # round trips any more), while the shared captions are fetched once
+    # round trips any more), while the shared captions are fetched once.
+    # v1.9.1: ONE web search for the title maps dubs to the site's web
+    # subjects, so each dub can mint its per-resolution direct MP4s.
     _t = time.time()
+    web_langs = _web_lang_map(title, ctype) if WEB_MP4_ON else None
     with ThreadPoolExecutor(max_workers=8) as ex:
         cap_fut = ex.submit(_ddl_inherit(_title_caps))
         results = list(ex.map(_ddl_inherit(
-            lambda p: _resolve_entry(p, se, ep, ctype, title, year, caps=[])),
+            lambda p: _resolve_entry(p, se, ep, ctype, title, year, caps=[],
+                                     web_langs=web_langs)),
             entries))
         cap_sid, caps = cap_fut.result()   # bounded by _PLAY_WAIT caps
     _ph("resolve", _t)
@@ -2530,7 +2699,7 @@ class Handler(BaseHTTPRequestHandler):
                 "direct_auth_flag_s": round(max(0.0, _DIRECT_AUTH_FLAG[0] - time.time())),
                 "scrape_do": bool(_SCRAPEDO_TOKEN),
                 "scrape_do_credits": _SD_CREDITS[0],
-                "video_proxy": False, "egress": "text-only (json/playlists/manifests/subtitles, gzip)",
+                "video_proxy": False, "web_mp4": WEB_MP4_ON, "egress": "text-only (json/playlists/manifests/subtitles, gzip)",
                 "segment_routing": "cdn-direct (sacdn CloudFront, query-signed)",
             }))
 

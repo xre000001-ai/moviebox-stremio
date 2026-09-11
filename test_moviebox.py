@@ -13,6 +13,10 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import addon
 
+# v1.9.1: web MP4 minting does live calls — disabled for unit tests;
+# the dedicated web tests below re-enable it with everything mocked.
+addon.WEB_MP4_ON = False
+
 PASS = 0
 FAIL = 0
 
@@ -995,7 +999,8 @@ def test_captions_fetched_once_per_title():
 def test_stream_stale_while_revalidate():
     addon._MPD_CACHE.clear(); addon._STREAM_CACHE.clear(); addon._STREAM_STALE.clear()
     addon._PLAY_CACHE.clear(); addon._DUB_CACHE.clear(); addon._SEARCH_CACHE.clear()
-    with mock.patch.object(addon, "_meta_any",
+    with mock.patch.object(addon, "WEB_MP4_ON", False), \
+         mock.patch.object(addon, "_meta_any",
                            return_value={"name": "Inception", "year": "2010"}), \
          mock.patch.object(addon, "search_subjects", return_value=[SUBJ_INCEPTION]), \
          mock.patch.object(addon, "subject_dubs", return_value=[]), \
@@ -2302,7 +2307,8 @@ def test_v176_alt_rescue_parallel():
         time.sleep(0.45)
         return [sub] if kw == "Alt Three" else []
     try:
-        with mock.patch.object(addon, "_meta_any",
+        with mock.patch.object(addon, "WEB_MP4_ON", False), \
+             mock.patch.object(addon, "_meta_any",
                                return_value={"name": "Primary Name",
                                              "year": "2026", "tmdb": "999"}), \
              mock.patch.object(addon, "_alt_titles",
@@ -2353,7 +2359,8 @@ def test_v176_dubs_and_play_share_one_wave():
                                        "size": 1000, "duration": 3600}]}
         return _pmemo[k]
     try:
-        with mock.patch.object(addon, "_meta_any",
+        with mock.patch.object(addon, "WEB_MP4_ON", False), \
+             mock.patch.object(addon, "_meta_any",
                                return_value={"name": "Wave Show",
                                              "year": "2026", "tmdb": ""}), \
              mock.patch.object(addon, "_cached_search", return_value=[sub]), \
@@ -2446,7 +2453,8 @@ def test_v178_stream_wall_passthrough_when_fast():
     """A fast build passes through the wall untouched."""
     def fast_inner(*a, **k):
         return {"streams": [{"name": "quick", "url": "u"}]}
-    with mock.patch.object(addon, "_build_streams_inner",
+    with mock.patch.object(addon, "WEB_MP4_ON", False), \
+         mock.patch.object(addon, "_build_streams_inner",
                            side_effect=fast_inner):
         r = addon.build_streams("movie", "tt17800002", 1, 1)
     assert r.get("streams") and r["streams"][0]["name"] == "quick", r
@@ -2596,3 +2604,75 @@ def test_direct_subs_shape():
     assert [s["url"] for s in subs] == ["https://cacdn.x/subtitle/abc",
                                         "https://cacdn.x/subtitle/def"]
     assert subs[0]["lang"] == "eng" and subs[0]["id"] == "mbx-en"
+
+
+# --------------------------------------------------------------------------
+# v1.9.1 — web per-resolution direct MP4 cards
+# --------------------------------------------------------------------------
+def test_web_lang_map_matching():
+    items = [
+        {"title": "Our Sticky Love", "subjectId": "111", "detailPath": "osl"},
+        {"title": "Our Sticky Love [English]", "subjectId": "222", "detailPath": "osl-en"},
+        {"title": "Our Sticky Love [Hindi]", "subjectId": "333", "detailPath": "osl-hi"},
+        {"title": "Our Sticky Love: Another Thing", "subjectId": "444", "detailPath": "x"},
+        {"title": "Totally Different", "subjectId": "555", "detailPath": "y"},
+    ]
+    class R:
+        status_code = 200
+        def json(self):
+            return {"data": {"items": items}}
+    with mock.patch.object(addon, "_web_jwt", return_value="tok"), \
+         mock.patch.object(addon.requests, "post", return_value=R()):
+        addon._WEB_LANG_CACHE.clear()
+        m = addon._web_lang_map("Our Sticky Love", "series")
+    assert m.get("") == ("111", "osl")
+    assert m.get("english") == ("222", "osl-en")
+    assert m.get("hindi") == ("333", "osl-hi")
+    assert len(m) == 3
+
+def test_web_cards_for_resolutions():
+    st = [(1080, "https://bcdnx/hi.mp4?sign=1", 877930434, "h264", 4059),
+          (480, "https://bcdnx/md.mp4?sign=2", 279436151, "h264", 4059),
+          (360, "https://bcdnx/lo.mp4?sign=3", 190165666, "h264", 4059)]
+    with mock.patch.object(addon, "WEB_MP4_ON", True), \
+         mock.patch.object(addon, "_web_mp4_streams", return_value=st):
+        cards = addon._web_cards_for("Our Sticky Love", "Hindi", "series",
+                                     1, 5, "mob", {"hindi": ("333", "osl-hi")})
+    assert len(cards) == 3
+    assert cards[0]["url"].endswith("sign=1")
+    assert "1080p" in cards[0]["description"]
+    assert cards[0]["behaviorHints"]["notWebReady"] is False
+    assert "proxyHeaders" not in cards[0]["behaviorHints"]
+    assert cards[0]["bingeGroup"].startswith("mbxw|")
+    # original label -> "" key
+    with mock.patch.object(addon, "WEB_MP4_ON", True), \
+         mock.patch.object(addon, "_web_mp4_streams", return_value=st):
+        cards2 = addon._web_cards_for("T", "Original", "movie", 0, 0, "m", {"": ("1", "d")})
+    assert len(cards2) == 3
+    # unknown dub and empty map -> no cards (NEVER fall back to the
+    # original audio — a (Hindi) card must play Hindi audio)
+    assert addon._web_cards_for("T", "Tamil", "movie", 0, 0, "m", {"": ("1", "d")}) == []
+    assert addon._web_cards_for("T", "Hindi", "movie", 0, 0, "m", {}) == []
+
+def test_web_cards_disabled_by_env_flag():
+    with mock.patch.object(addon, "WEB_MP4_ON", False), \
+         mock.patch.object(addon, "_web_mp4_streams",
+                           return_value=[(480, "u", 1, "h264", 100)]) as ws:
+        c = addon._web_cards_for("T", "Original", "movie", 0, 0, "m", {"": ("1", "d")})
+    assert c == [] and not ws.called
+
+def test_web_cards_ahead_of_dash_in_resolve():
+    addon._MPD_CACHE.clear(); addon._PLAY_CACHE.clear(); addon._WEB_LANG_CACHE.clear(); addon._WEB_MP4_CACHE.clear()
+    pi = {"streams": [{"signCookie": FAKE_COOKIE, "url": "https://macdn/x.mp4",
+                       "resolutions": "1080,720,480", "size": "1462281731",
+                       "duration": 4059, "codecName": "hevc", "id": "1"}]}
+    st = [(720, "https://bcdnx/720.mp4?sign=x", 856000000, "h264", 9000)]
+    web_langs = {"": ("9048868765454191080", "dune-WLVlz3JUrMa")}
+    with mock.patch.object(addon, "WEB_MP4_ON", True), \
+         mock.patch.object(addon, "_cached_play", return_value=pi), \
+         mock.patch.object(addon, "_web_mp4_streams", return_value=st):
+        out = addon._resolve_entry(("123", "Original"), 0, 0, "movie",
+                                   "Dune", "2021", caps=[], web_langs=web_langs)
+    assert out and len(out) == 2
+    assert out[0]["url"].startswith("https://bcdnx/")       # web card first
+    assert out[1]["url"].endswith("/index.mpd")             # dash fallback
