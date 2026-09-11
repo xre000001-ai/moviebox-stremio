@@ -15,10 +15,10 @@ SECTIONS
     3. platform api      token bootstrap + signed mobile api_call + search
     4. metadata          cinemeta / imdb / tmdb title matching
     5. catalogs          scraped pools -> catalog & search metas
-    6. cdn / dash        CloudFront cookie parsing, MPD parsing, trimming,
-                         rewritten DASH manifests (signed absolute URLs)
+    6. cdn / dash        CloudFront cookie parsing, MPD parsing (quality
+                         labels + prewarm verification)
     7. cards             strict-zero direct-CDN stream cards
-    8. subtitles         mobile caption endpoint + web fallback, SRT->VTT
+    8. subtitles         mobile caption endpoint + web fallback (direct URLs)
     9. stream cards      per-dub card building, caching, pre-warming
    10. landing page      install / usage html
    11. http server       routes, gzip, CORS, cache headers
@@ -50,7 +50,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION   = "1.9.2"
+VERSION   = "1.9.3"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -600,6 +600,14 @@ START = time.time()
 # 2. utilities — TTL caches
 # --------------------------------------------------------------------------
 def _cache_put(store, key, val, ttl):
+    # v1.9.3: expired entries used to be evicted only when their OWN key
+    # was read again — a long-lived instance accumulated every title it
+    # ever served (slow memory leak on the 512MB Render dyno). Opportunistic
+    # sweep once a store reaches the cap keeps them bounded.
+    if len(store) >= _CACHE_SWEEP_AT:
+        now = time.time()
+        for k in [k for k, ent in store.items() if ent[1] < now]:
+            store.pop(k, None)
     store[key] = (val, time.time() + ttl)
 
 def _cache_get(store, key):
@@ -611,6 +619,8 @@ def _cache_get(store, key):
         store.pop(key, None)
         return False, None
     return True, val
+
+_CACHE_SWEEP_AT = 512      # v1.9.3: prune expired entries when a store grows to this
 
 # --------------------------------------------------------------------------
 # platform crypto (oneroom request signing)
@@ -1556,37 +1566,6 @@ def get_mpd_info(dash_base, cookie):
 
 
 
-def _trim_timeline_body(body, keep):
-    """Trim an AdaptationSet's SegmentTimeline to its first `keep` segments."""
-    m = re.search(r"<SegmentTimeline>(.*?)</SegmentTimeline>", body, re.S)
-    if not m:
-        return body
-    out, count = [], 0
-    for e in _S_ENTRY.findall(m.group(1)):
-        if count >= keep:
-            break
-        dm = re.search(r'd="(\d+)"', e)
-        if not dm:
-            continue
-        d = int(dm.group(1))
-        rm = re.search(r'r="(\d+)"', e)
-        rep = (int(rm.group(1)) + 1) if rm else 1
-        tm = re.search(r't="(\d+)"', e)
-        take = min(rep, keep - count)
-        if take <= 0:
-            break
-        parts = []
-        if tm:
-            parts.append('t="%s"' % tm.group(1))
-        parts.append('d="%d"' % d)
-        if take > 1:
-            parts.append('r="%d"' % (take - 1))
-        out.append("<S %s />" % " ".join(parts))
-        count += take
-    return body[:m.start(1)] + "\n" + "\n".join(out) + "\n" + body[m.end(1):]
-
-
-
 def _res_label(heights):
     hs = sorted(set(heights), reverse=True)
     if not hs:
@@ -1598,6 +1577,17 @@ _STREAM_CACHE_TTL = 10800  # 3h: a prewarmed next-episode outlives the current o
 _STREAM_STALE = {}        # key -> (expiry, streams): served instantly while a
                           # background rebuild refreshes the fresh cache
 _STREAM_STALE_TTL = 24 * 3600
+_STALE_SWEEP_AT = 256     # v1.9.3: prune expired stale entries at this size
+
+def _stale_put(key, streams):
+    """v1.9.3: _STREAM_STALE was never pruned (entries survived forever,
+    each holding a full card list) — sweep expired ones on write."""
+    if len(_STREAM_STALE) >= _STALE_SWEEP_AT:
+        now = time.time()
+        for k in [k for k, ent in _STREAM_STALE.items() if ent[0] < now]:
+            _STREAM_STALE.pop(k, None)
+    _STREAM_STALE[key] = (time.time() + _STREAM_STALE_TTL, streams)
+
 _STREAM_REFRESHING = set()
 _REFRESH_LOCK = threading.Lock()
 _PLAY_CACHE = {}         # (sid, se, ep) -> play-info payload (10 min)
@@ -1669,7 +1659,6 @@ _WEB_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 _WEB_JWT = None
 _WEB_JWT_TS = 0.0
 _SUB_CACHE = {}   # (sid, stream_id) -> captions list (1h)
-_VTT_CACHE = {}   # (sid, se, ep, lan) -> vtt body (6h)
 _LANG3 = {"ar": "ara", "en": "eng", "es": "spa", "fil": "fil", "fr": "fra",
           "in_id": "ind", "id": "ind", "ms": "msa", "pt": "por", "ru": "rus",
           "bn": "ben", "hi": "hin", "ur": "urd", "pa": "pan", "zh": "zho",
@@ -2408,7 +2397,7 @@ def _build_streams_inner(ctype, imdb, se, ep, key, _prewarm_next):
                 s["description"] = s["description"].rsplit("\n", 1)[0] + "\n" + _sub_line(shared)
     if streams:
         _cache_put(_STREAM_CACHE, key, streams, _STREAM_CACHE_TTL)
-        _STREAM_STALE[key] = (time.time() + _STREAM_STALE_TTL, streams)
+        _stale_put(key, streams)   # v1.9.3: sweeps expired entries on write
         if _prewarm_next and ctype == "series":
             # background-warm the next episode so binge navigation is instant
             threading.Thread(target=_safe_build, daemon=True,
@@ -2627,8 +2616,8 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def _send(self, code, body, ctype="application/json", extra=None):
-        """Text-only responses; gzip when the client allows (keeps Render's
-        free-plan egress tiny: playlists/subs/manifests shrink ~5-10x)."""
+        """JSON-only responses; gzip when the client allows (keeps Render's
+        free-plan egress tiny: stream lists shrink ~5-10x)."""
         if isinstance(body, str):
             body = body.encode()
         self._log_req(code, len(body))

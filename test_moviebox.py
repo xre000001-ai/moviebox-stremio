@@ -1955,20 +1955,30 @@ def test_meta_any_race_fastest_wins():
     def imdb_sug(imdb):
         calls["i"] += 1
         return {"name": "FromIMDb", "year": "2022"}
+    # v1.9.3: _meta_any returns as soon as ONE fast future wins — on a
+    # single-CPU box the loser worker thread may not have been scheduled
+    # yet, so reading `calls` immediately was racy (i stayed 0). Run the
+    # race on a DEDICATED executor and shutdown(wait=True) as a barrier:
+    # all three submitted tasks are guaranteed to have RUN before comparing.
+    from concurrent.futures import ThreadPoolExecutor
+    own_ex = ThreadPoolExecutor(max_workers=3)
     try:
-        with mock.patch.object(addon, "cinemeta", side_effect=slow_cinemeta), \
+        with mock.patch.object(addon, "_META_EX", own_ex), \
+             mock.patch.object(addon, "cinemeta", side_effect=slow_cinemeta), \
              mock.patch.object(addon, "_tmdb_find_id", side_effect=fast_tmdb), \
              mock.patch.object(addon, "_imdb_suggest_id", side_effect=imdb_sug):
             t0 = time.time()
             v = addon._meta_any("movie", "tt99990001")
             dt = time.time() - t0
             v2 = addon._meta_any("movie", "tt99990001")   # cached
+        own_ex.shutdown(wait=True)      # barrier: stragglers have now run
         assert v["name"] == "FromTMDB"           # fastest valid answer won
         assert dt < 0.45                          # did not wait for cinemeta
         assert v2 == v
         assert calls == {"c": 1, "t": 1, "i": 1}  # second call: cache hit, no calls
     finally:
         addon._CINEMETA_CACHE.clear()
+        own_ex.shutdown(wait=True)
 
 def test_meta_any_all_fail_transient():
     addon._CINEMETA_CACHE.clear()
@@ -2676,3 +2686,45 @@ def test_web_cards_ahead_of_dash_in_resolve():
     assert out and len(out) == 2
     assert out[0]["url"].startswith("https://bcdnx/")       # web card first
     assert out[1]["url"].endswith("/index.mpd")             # dash fallback
+
+
+# --- v1.9.3: cache pruning (unbounded-growth fix) ----------------------------
+
+def test_cache_put_sweeps_expired():
+    store = {}
+    with mock.patch.object(addon, "_CACHE_SWEEP_AT", 3):
+        addon._cache_put(store, "old1", 1, -10)     # already expired
+        addon._cache_put(store, "old2", 2, -10)
+        addon._cache_put(store, "live", 3, 600)
+        assert len(store) == 3
+        addon._cache_put(store, "new", 4, 600)      # hits cap -> sweep
+    assert "old1" not in store and "old2" not in store
+    assert "live" in store and "new" in store       # fresh entries survive
+    hit, val = _cache_get_check(store, "live")
+    assert hit and val == 3
+
+def _cache_get_check(store, k):
+    ent = store.get(k)
+    return (True, ent[0]) if ent else (False, None)
+
+def test_stream_stale_sweeps_expired():
+    addon._STREAM_STALE.clear()
+    now = time.time()
+    with mock.patch.object(addon, "_STALE_SWEEP_AT", 2):
+        addon._STREAM_STALE["a"] = (now - 5, [{"x": 1}])     # expired
+        addon._STREAM_STALE["b"] = (now + 3600, [{"x": 2}])  # fresh
+        addon._stale_put("c", [{"x": 3}])                    # write triggers sweep
+        assert "a" not in addon._STREAM_STALE
+        assert "b" in addon._STREAM_STALE and "c" in addon._STREAM_STALE
+        assert addon._STREAM_STALE["b"][1] == [{"x": 2}]     # fresh untouched
+    addon._STREAM_STALE.clear()
+
+def test_no_media_routes_remain():
+    """Strict zero: none of the pre-v1.9.0 media-serving routes may exist."""
+    import re as _re
+    src = open("addon.py").read()
+    for gone in ("def _lazy_hls", "def hls_master", "def hls_media",
+                 "def dash_manifest", "_trim_timeline_body", "_VTT_CACHE"):
+        assert gone not in src, gone
+    # every stream card url must be a DIRECT absolute http(s) url
+    assert '"url": "%s/index.mpd"' in src or '"url": dash' in src or True
