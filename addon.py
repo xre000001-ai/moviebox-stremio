@@ -50,7 +50,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION   = "1.9.4"
+VERSION   = "1.9.5"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -1554,7 +1554,7 @@ def get_mpd_info(dash_base, cookie):
         if r.status_code == 200 and b"<MPD" in r.content[:600]:
             info = _parse_mpd(r.text)
             if info["video"]:
-                _cache_put(_MPD_CACHE, dash_base, info, 30 * 60)
+                _cache_put(_MPD_CACHE, dash_base, info, 60 * 60)
                 return info
         if r.status_code in (400, 403, 404):
             _cache_put(_MPD_CACHE, dash_base, None, 15 * 60)
@@ -1702,14 +1702,23 @@ def _web_jwt():
         pass
     return _WEB_JWT
 
+# v1.9.5 (user directive: 'shudhu eng, Hindi sub dorkar, baki dorkar nei'):
+# keep ONLY these caption languages on cards. Full set stays in the caption
+# cache, so the filter is adjustable via env without extra fetches.
+_SUB_LANGS = tuple(x.strip() for x in
+                   os.environ.get("MOVIEBOX_SUBS", "en,hi").split(",") if x.strip())
+
 def _direct_subs(caps):
     """v1.9.0 strict zero: the platform's caption CDN (cacdn…) serves
     the raw SRT files to ANY ip with no cookie (verified 2026-09-10) —
     subtitle objects point straight at them instead of our /sub route.
-    Players (mpv/ExoPlayer) sniff SRT fine even without an extension."""
+    Players (mpv/ExoPlayer) sniff SRT fine even without an extension.
+    v1.9.5: filtered to _SUB_LANGS (default en+hi only)."""
     return [{"url": c["url"], "lang": _LANG3.get(c.get("lan"), c.get("lan")),
              "id": "mbx-%s" % c.get("lan")}
-            for c in (caps or []) if c.get("lan") and c.get("url")]
+            for c in (caps or [])
+            if c.get("lan") and c.get("url")
+            and (not _SUB_LANGS or c.get("lan") in _SUB_LANGS)]
 
 
 def fetch_captions(sid, stream_id):
@@ -2067,7 +2076,7 @@ def hls_media(sess, rep_id, kind):
                                                  sess["cf"])]
     for i in range(1, n + 1):
         d = use[i - 1] if use else (mpd["seg_dur"] or 5.0)
-        lines.append("#EXTINF:%.3f," % d)
+        lines.append("#EXTINF:%.1f," % d)
         lines.append(_signed_url(sess["dash"],
                                  "chunk-stream%s-%05d.m4s" % (rep_id, i), sess["cf"]))
     lines.append("#EXT-X-ENDLIST")
@@ -2785,8 +2794,12 @@ class Handler(BaseHTTPRequestHandler):
             cache = "public, max-age=3600"          # subs are immutable
         elif ctype == "application/json":
             cache = "no-store"                      # fresh stream results
+        elif "mpegurl" in ctype:
+            # v1.9.5: VOD playlists are immutable for the signature's life
+            # (hours) and rebuilt statelessly on miss — cacheable for 30min
+            cache = "public, max-age=1800"
         else:
-            cache = "public, max-age=300"           # playlists / manifests
+            cache = "public, max-age=300"           # landing / misc
         self.send_header("Cache-Control", cache)
         for k, v in (extra or {}).items():
             self.send_header(k, v)

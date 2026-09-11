@@ -857,7 +857,8 @@ def test_resolve_entry_attaches_subtitles():
                        "url": "https://macdn.aoneroom.com/other/notice.mp4",
                        "resolutions": "1080,720,480", "size": "1", "duration": 1,
                        "codecName": "hevc", "format": "MP4", "idType": ""}]}
-    caps = [{"lan": "en", "url": "https://c/s.srt?P=1"}, {"lan": "bn", "url": "https://c/b.srt?P=1"}]
+    caps = [{"lan": "en", "url": "https://c/s.srt?P=1"}, {"lan": "hi", "url": "https://c/h.srt?P=1"},
+            {"lan": "ar", "url": "https://c/a.srt?P=1"}]   # v1.9.5: ar dropped
     with mock.patch.object(addon, "_cached_play", return_value=pi), \
          mock.patch.object(addon, "fetch_captions", return_value=caps):
         cards = addon._resolve_entry(("111", "Hindi"), 1, 5, "series", "Our Sticky Love", "2026")
@@ -869,9 +870,9 @@ def test_resolve_entry_attaches_subtitles():
     for card in cards:
         assert card.get("subtitles")
         langs = [s["lang"] for s in card["subtitles"]]
-        assert "eng" in langs and "ben" in langs
+        assert "eng" in langs and "hin" in langs and "ara" not in langs
         assert card["subtitles"][0]["url"].startswith("https://")   # direct
-        assert "▣ 2 SUB · en, bn" in card["description"]
+        assert "▣ 2 SUB · en, hi" in card["description"]
 
 
 
@@ -947,7 +948,7 @@ def test_fetch_captions_retry_and_fallback():
 def test_cross_dub_subtitle_rescue():
     addon._MPD_CACHE.clear(); addon._STREAM_CACHE.clear(); addon._STREAM_STALE.clear(); addon._PLAY_CACHE.clear()
     addon._DUB_CACHE.clear(); addon._SEARCH_CACHE.clear()
-    caps = [{"lan": "en", "url": "https://c/e.srt"}, {"lan": "bn", "url": "https://c/b.srt"}]
+    caps = [{"lan": "en", "url": "https://c/e.srt"}, {"lan": "hi", "url": "https://c/h.srt"}]
     def caps_by_sid(sid, stream_id):
         return caps if sid == "6391474290696802080" else [{"lan": "ar", "url": "https://c/a.srt"}]
     dubs = [{"subjectId": "973041525783496480", "lanName": "Hindi dub"}]
@@ -973,7 +974,8 @@ def test_captions_fetched_once_per_title():
     addon._MPD_CACHE.clear(); addon._STREAM_CACHE.clear(); addon._STREAM_STALE.clear(); addon._PLAY_CACHE.clear()
     addon._DUB_CACHE.clear(); addon._SEARCH_CACHE.clear()
     calls = {"caps": 0}
-    nine = [{"lan": "en%d" % i, "url": "https://c/%d.srt" % i} for i in range(9)]
+    nine = [{"lan": "en", "url": "https://c/e.srt"}, {"lan": "hi", "url": "https://c/h.srt"}]
+    nine += [{"lan": "x%d" % i, "url": "https://c/%d.srt" % i} for i in range(7)]  # filtered
     def counting_caps(sid, stream_id):
         calls["caps"] += 1
         return nine
@@ -991,8 +993,8 @@ def test_captions_fetched_once_per_title():
     assert len(res["streams"]) == 3                       # 3 dubs
     assert calls["caps"] == 1                             # ONE caption fetch, not 3
     for s in res["streams"]:                              # every card shares it
-        assert len(s.get("subtitles") or []) == 9
-        assert "▣ 9 SUB" in s["description"]
+        assert len(s.get("subtitles") or []) == 2   # v1.9.5: en+hi only
+        assert "▣ 2 SUB" in s["description"]
         assert s["subtitles"][0]["url"].startswith("https://c/")   # direct CDN (v1.9.0)
     addon._STREAM_CACHE.clear(); addon._STREAM_STALE.clear()
 
@@ -2594,14 +2596,27 @@ def test_strict_zero_routes_gone():
             assert r["code"] == 404, (path, r)
 
 def test_direct_subs_shape():
+    """v1.9.5 (user directive): ONLY en+hi subtitle tracks on cards —
+    everything else (arabic, portuguese, ...) is dropped."""
     caps = [{"lan": "en", "url": "https://cacdn.x/subtitle/abc"},
-            {"lan": "bn", "url": "https://cacdn.x/subtitle/def"},
-            {"lan": "", "url": "https://cacdn.x/subtitle/nn"},   # dropped
-            {"lan": "fr"}]                                        # dropped
+            {"lan": "hi", "url": "https://cacdn.x/subtitle/hin"},
+            {"lan": "ara", "url": "https://cacdn.x/subtitle/ara"},  # dropped
+            {"lan": "por", "url": "https://cacdn.x/subtitle/por"},  # dropped
+            {"lan": "", "url": "https://cacdn.x/subtitle/nn"},      # dropped
+            {"lan": "fr"}]                                          # dropped
     subs = addon._direct_subs(caps)
     assert [s["url"] for s in subs] == ["https://cacdn.x/subtitle/abc",
-                                        "https://cacdn.x/subtitle/def"]
+                                        "https://cacdn.x/subtitle/hin"]
     assert subs[0]["lang"] == "eng" and subs[0]["id"] == "mbx-en"
+    assert subs[1]["lang"] == "hin"
+
+def test_direct_subs_filter_env_override():
+    """MOVIEBOX_SUBS is adjustable — empty value = keep everything."""
+    caps = [{"lan": "en", "url": "u1"}, {"lan": "fr", "url": "u2"}]
+    with mock.patch.object(addon, "_SUB_LANGS", ()):
+        assert len(addon._direct_subs(caps)) == 2
+    with mock.patch.object(addon, "_SUB_LANGS", ("fr",)):
+        assert [s["url"] for s in addon._direct_subs(caps)] == ["u2"]
 
 
 if __name__ == "__main__":
@@ -2631,15 +2646,6 @@ def test_strict_zero_routes_gone():
             r = _http_get(path)
             assert r["code"] == 404, (path, r)
 
-def test_direct_subs_shape():
-    caps = [{"lan": "en", "url": "https://cacdn.x/subtitle/abc"},
-            {"lan": "bn", "url": "https://cacdn.x/subtitle/def"},
-            {"lan": "", "url": "https://cacdn.x/subtitle/nn"},   # dropped
-            {"lan": "fr"}]                                        # dropped
-    subs = addon._direct_subs(caps)
-    assert [s["url"] for s in subs] == ["https://cacdn.x/subtitle/abc",
-                                        "https://cacdn.x/subtitle/def"]
-    assert subs[0]["lang"] == "eng" and subs[0]["id"] == "mbx-en"
 
 
 # --------------------------------------------------------------------------
@@ -2788,7 +2794,7 @@ def test_v194_hls_media_signed_direct_segments():
     segs = [l for l in p.splitlines() if l.startswith("https://")]
     assert len(segs) == 4                        # tl trimmed to 4 segments
     assert "chunk-stream0-00001.m4s?" in segs[0] and "chunk-stream0-00004.m4s?" in segs[-1]
-    assert p.count("#EXTINF:5.000,") == 4        # real timeline durations
+    assert p.count("#EXTINF:5.0,") == 4        # real timeline durations
     assert "bytes" not in p                      # urls are absolute direct — no relay path
 
 def test_v194_hls_media_no_timeline_fallback():
@@ -2854,3 +2860,25 @@ def test_v194_stream_route_absolutizes_hls_urls():
     assert r["code"] == 200
     body = json.loads(r["body"])
     assert body["streams"][0]["url"] == "https://127.0.0.1:7000/hls/11111/1/5/master.m3u8"
+
+
+# --- v1.9.5: efficiency pass ---------------------------------------------------
+
+def test_v195_extinf_precision():
+    with mock.patch.object(addon, "_last_good_seg", side_effect=lambda d, r, n, c: n):
+        p = addon.hls_media(SESS_FIX, "0", "v")
+    assert "#EXTINF:5.0," in p and "#EXTINF:5.000," not in p
+
+def test_v195_playlist_cache_header():
+    addon._MPD_CACHE.clear()
+    pi = {"streams": [{"id": "42", "signCookie": FAKE_COOKIE}]}
+    dash = addon._dash_base(addon._cf_parts(FAKE_COOKIE)["CloudFront-Policy"])
+    addon._MPD_CACHE[dash] = (MPDINFO_FIX, time.time() + 600)
+    try:
+        with mock.patch.object(addon, "_cached_play", return_value=pi), \
+             mock.patch.object(addon, "_last_good_seg",
+                               side_effect=lambda d, r, n, c: n):
+            r = _http_get("/hls/11111/1/5/master.m3u8")
+        assert r["headers"]["Cache-Control"] == "public, max-age=1800"
+    finally:
+        addon._MPD_CACHE.clear()
