@@ -870,9 +870,9 @@ def test_resolve_entry_attaches_subtitles():
     for card in cards:
         assert card.get("subtitles")
         langs = [s["lang"] for s in card["subtitles"]]
-        assert "eng" in langs and "hin" in langs and "ara" not in langs
+        assert "eng" in langs and "hin" in langs and "ara" in langs  # v1.9.6 all
         assert card["subtitles"][0]["url"].startswith("https://")   # direct
-        assert "▣ 2 SUB · en, hi" in card["description"]
+        assert "▣ 3 SUB · en, hi, ar" in card["description"]
 
 
 
@@ -993,8 +993,8 @@ def test_captions_fetched_once_per_title():
     assert len(res["streams"]) == 3                       # 3 dubs
     assert calls["caps"] == 1                             # ONE caption fetch, not 3
     for s in res["streams"]:                              # every card shares it
-        assert len(s.get("subtitles") or []) == 2   # v1.9.5: en+hi only
-        assert "▣ 2 SUB" in s["description"]
+        assert len(s.get("subtitles") or []) == 9   # v1.9.6: ALL langs back
+        assert "▣ 9 SUB" in s["description"]
         assert s["subtitles"][0]["url"].startswith("https://c/")   # direct CDN (v1.9.0)
     addon._STREAM_CACHE.clear(); addon._STREAM_STALE.clear()
 
@@ -2596,25 +2596,27 @@ def test_strict_zero_routes_gone():
             assert r["code"] == 404, (path, r)
 
 def test_direct_subs_shape():
-    """v1.9.5 (user directive): ONLY en+hi subtitle tracks on cards —
-    everything else (arabic, portuguese, ...) is dropped."""
+    """v1.9.6: sub filter REVERTED (user rule — it saved no meaningful
+    Render bandwidth) — ALL languages back by default; only malformed
+    entries (no lan / no url) are dropped."""
     caps = [{"lan": "en", "url": "https://cacdn.x/subtitle/abc"},
             {"lan": "hi", "url": "https://cacdn.x/subtitle/hin"},
-            {"lan": "ara", "url": "https://cacdn.x/subtitle/ara"},  # dropped
-            {"lan": "por", "url": "https://cacdn.x/subtitle/por"},  # dropped
-            {"lan": "", "url": "https://cacdn.x/subtitle/nn"},      # dropped
-            {"lan": "fr"}]                                          # dropped
+            {"lan": "ara", "url": "https://cacdn.x/subtitle/ara"},
+            {"lan": "por", "url": "https://cacdn.x/subtitle/por"},
+            {"lan": "", "url": "https://cacdn.x/subtitle/nn"},   # dropped
+            {"lan": "fr"}]                                       # dropped
     subs = addon._direct_subs(caps)
     assert [s["url"] for s in subs] == ["https://cacdn.x/subtitle/abc",
-                                        "https://cacdn.x/subtitle/hin"]
+                                        "https://cacdn.x/subtitle/hin",
+                                        "https://cacdn.x/subtitle/ara",
+                                        "https://cacdn.x/subtitle/por"]
     assert subs[0]["lang"] == "eng" and subs[0]["id"] == "mbx-en"
-    assert subs[1]["lang"] == "hin"
+    assert subs[1]["lang"] == "hin" and subs[2]["lang"] == "ara"
 
 def test_direct_subs_filter_env_override():
-    """MOVIEBOX_SUBS is adjustable — empty value = keep everything."""
+    """MOVIEBOX_SUBS still available: explicit list filters, default () = all."""
     caps = [{"lan": "en", "url": "u1"}, {"lan": "fr", "url": "u2"}]
-    with mock.patch.object(addon, "_SUB_LANGS", ()):
-        assert len(addon._direct_subs(caps)) == 2
+    assert len(addon._direct_subs(caps)) == 2          # v1.9.6 default: all
     with mock.patch.object(addon, "_SUB_LANGS", ("fr",)):
         assert [s["url"] for s in addon._direct_subs(caps)] == ["u2"]
 

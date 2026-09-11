@@ -50,7 +50,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION   = "1.9.5"
+VERSION   = "1.9.6"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -1702,18 +1702,21 @@ def _web_jwt():
         pass
     return _WEB_JWT
 
-# v1.9.5 (user directive: 'shudhu eng, Hindi sub dorkar, baki dorkar nei'):
-# keep ONLY these caption languages on cards. Full set stays in the caption
-# cache, so the filter is adjustable via env without extra fetches.
+# v1.9.6 (user rule: "sub badh dile render bandwidth na kome tahole sub
+# back ano" — measured: the filter saved only ~111B per /stream resolve
+# (1.2% of a playback session) because SRT bytes NEVER pass through
+# Render (direct cacdn URLs since v1.9.0). ALL languages are back.
+# MOVIEBOX_SUBS="en,hi" re-enables the filter if ever wanted; default "" = all.
 _SUB_LANGS = tuple(x.strip() for x in
-                   os.environ.get("MOVIEBOX_SUBS", "en,hi").split(",") if x.strip())
+                   os.environ.get("MOVIEBOX_SUBS", "").split(",") if x.strip())
 
 def _direct_subs(caps):
     """v1.9.0 strict zero: the platform's caption CDN (cacdn…) serves
     the raw SRT files to ANY ip with no cookie (verified 2026-09-10) —
     subtitle objects point straight at them instead of our /sub route.
     Players (mpv/ExoPlayer) sniff SRT fine even without an extension.
-    v1.9.5: filtered to _SUB_LANGS (default en+hi only)."""
+    v1.9.6: _SUB_LANGS defaults to () = ALL languages (sub filter
+    reverted — it saved no meaningful Render bandwidth)."""
     return [{"url": c["url"], "lang": _LANG3.get(c.get("lan"), c.get("lan")),
              "id": "mbx-%s" % c.get("lan")}
             for c in (caps or [])
