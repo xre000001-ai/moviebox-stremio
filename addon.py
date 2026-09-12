@@ -50,7 +50,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION   = "1.9.9"
+VERSION   = "1.9.10"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -1717,7 +1717,9 @@ def _direct_subs(caps):
     Players (mpv/ExoPlayer) sniff SRT fine even without an extension.
     v1.9.6: _SUB_LANGS defaults to () = ALL languages (sub filter
     reverted — it saved no meaningful Render bandwidth)."""
-    return [{"url": c["url"], "lang": _LANG3.get(c.get("lan"), c.get("lan")),
+    # v1.9.10: lang stays ISO-639-1 ('ar','en') — Stremio players don't
+    # match 3-letter codes ('ara' broke sub selection for many clients).
+    return [{"url": c["url"], "lang": c.get("lan"),
              "id": "mbx-%s" % c.get("lan")}
             for c in (caps or [])
             if c.get("lan") and c.get("url")

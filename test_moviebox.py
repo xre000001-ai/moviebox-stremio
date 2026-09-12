@@ -870,7 +870,7 @@ def test_resolve_entry_attaches_subtitles():
     for card in cards:
         assert card.get("subtitles")
         langs = [s["lang"] for s in card["subtitles"]]
-        assert "eng" in langs and "hin" in langs and "ara" in langs  # v1.9.6 all
+        assert "en" in langs and "hi" in langs and "ar" in langs  # v1.9.10 ISO-639-1
         assert card["subtitles"][0]["url"].startswith("https://")   # direct
         assert "⟡ 3 SUB · en, hi, ar" in card["description"]  # v1.9.7 ⟡
 
@@ -2610,8 +2610,8 @@ def test_direct_subs_shape():
                                         "https://cacdn.x/subtitle/hin",
                                         "https://cacdn.x/subtitle/ara",
                                         "https://cacdn.x/subtitle/por"]
-    assert subs[0]["lang"] == "eng" and subs[0]["id"] == "mbx-en"
-    assert subs[1]["lang"] == "hin" and subs[2]["lang"] == "ara"
+    assert subs[0]["lang"] == "en" and subs[0]["id"] == "mbx-en"   # v1.9.10 ISO-639-1
+    assert subs[1]["lang"] == "hi" and subs[2]["lang"] == "ar"
 
 def test_direct_subs_filter_env_override():
     """MOVIEBOX_SUBS still available: explicit list filters, default () = all."""
