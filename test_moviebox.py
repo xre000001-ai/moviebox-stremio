@@ -504,7 +504,7 @@ def test_build_streams_series_happy_path():
     assert len(res["streams"]) >= 2
     s0 = res["streams"][0]
     # multi-line card: bold "title (dub)" name + 3 description lines
-    assert "Squid Game (" in s0["name"]      # v1.9.7 ♧/✹ format
+    assert "Squid Game" in s0["name"]         # v1.9.9 no dub bracket
     assert s0["description"].count("\n") == 4    # v1.9.8 5-line card
     assert "1080p" in s0["name"]                # v1.9.7 ♧ MAX quality
     assert "–" not in s0["description"].split("\n")[0]   # no more 480p–1080p range
@@ -540,7 +540,7 @@ def test_build_streams_movie_no_dubs():
         g.return_value = r
         res = addon.build_streams("movie", "tt1375666", 1, 1)
     assert len(res["streams"]) == 1
-    assert "(Original)" in res["streams"][0]["name"]
+    assert "(Original)" not in res["streams"][0]["name"]   # v1.9.9 no bracket
     assert res["streams"][0]["description"].count("\n") == 4  # v1.9.8
     assert "◴ 2010" in res["streams"][0]["description"]   # v1.9.7 ◴ year
     assert "S01E01" not in res["streams"][0]["description"]
@@ -863,7 +863,7 @@ def test_resolve_entry_attaches_subtitles():
          mock.patch.object(addon, "fetch_captions", return_value=caps):
         cards = addon._resolve_entry(("111", "Hindi"), 1, 5, "series", "Our Sticky Love", "2026")
     assert isinstance(cards, list) and len(cards) == 1
-    assert cards[0]["name"].endswith("Our Sticky Love (Hindi)")  # v1.9.7
+    assert cards[0]["name"].endswith("Our Sticky Love")     # v1.9.9 no bracket
     assert cards[0]["url"].startswith("https://sacdn.hakunaymatata.com/dash/999888")  # from the cookie policy
     assert cards[0]["url"].endswith("/index.mpd")
     assert cards[0]["behaviorHints"]["proxyHeaders"]["request"]["Cookie"]

@@ -50,7 +50,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION   = "1.9.8"
+VERSION   = "1.9.9"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -2187,7 +2187,7 @@ def _resolve_entry(pair, se, ep, ctype, title, year, caps=None, web_langs=None):
     # --- v1.9.7: unified stream-card format (user spec) ---
     ran = _res_range(pi, pl)
     codec = _CODEC_LABEL.get(str(pl.get("codecName") or "").lower())
-    card_name = "♧ %s  ✹ %s (%s)" % (_ql_label(ran), title, label)
+    card_name = "♧ %s  ✹ %s" % (_ql_label(ran), title)   # v1.9.9: no dub bracket
     # line 3: subtitle tracks. build_streams passes the title-wide caption
     # set (fetched once, concurrently); a standalone call fetches its own.
     if caps is None:
@@ -2254,7 +2254,7 @@ def _web_cards_for(title, label, ctype, se, ep, mob_sid, web_langs):
     for res_i, url, size, codec, dur in st:
         cl = _CODEC_LABEL.get((codec or "").lower())
         cards.append({
-            "name": "♧ %dp  ✹ %s (%s)" % (res_i, title, label),
+            "name": "♧ %dp  ✹ %s" % (res_i, title),   # v1.9.9: no dub bracket
             "description": _fmt_card_desc(
                 "%dp" % res_i, cl, _fmt_size(size), _fmt_dur(dur),
                 ctype, se, ep, year, label, [], via="Netnaija WEB"),
