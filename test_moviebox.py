@@ -504,12 +504,12 @@ def test_build_streams_series_happy_path():
     assert len(res["streams"]) >= 2
     s0 = res["streams"][0]
     # multi-line card: bold "title (dub)" name + 3 description lines
-    assert s0["name"].startswith("𖤍 Squid Game (")
-    assert s0["description"].count("\n") == 2
-    assert "1080p" in s0["description"]           # v1.8.0: MAX quality only
+    assert "Squid Game (" in s0["name"]      # v1.9.7 ♧/✹ format
+    assert s0["description"].count("\n") == 3    # v1.9.7 4-line card
+    assert "1080p" in s0["name"]                # v1.9.7 ♧ MAX quality
     assert "–" not in s0["description"].split("\n")[0]   # no more 480p–1080p range
     assert "HEVC" in s0["description"] and "863.7 MB" in s0["description"]
-    assert "▣ S01E01" in s0["description"] and "▣ MovieBox" in s0["description"]
+    assert "◫ S01 E01" in s0["description"] and "⌗ MOVIEBOX" in s0["description"]
     assert "NO SUB" in s0["description"]          # captions mocked empty
     # v1.9.4 quality-menu HLS card: relative /hls/... master url (the
     # /stream route absolutizes it against the request Host). No
@@ -541,8 +541,8 @@ def test_build_streams_movie_no_dubs():
         res = addon.build_streams("movie", "tt1375666", 1, 1)
     assert len(res["streams"]) == 1
     assert "(Original)" in res["streams"][0]["name"]
-    assert res["streams"][0]["description"].count("\n") == 2
-    assert "▣ 2010 ▣ MovieBox" in res["streams"][0]["description"]
+    assert res["streams"][0]["description"].count("\n") == 3  # v1.9.7
+    assert "◴ 2010" in res["streams"][0]["description"]   # v1.9.7 ◴ year
     assert "S01E01" not in res["streams"][0]["description"]
     # v1.9.4: movies get the quality-menu HLS card too (movies use se=0/ep=0)
     assert res["streams"][0]["url"] == "/hls/%s/0/0/master.m3u8" % SUBJ_INCEPTION["subjectId"]
@@ -863,7 +863,7 @@ def test_resolve_entry_attaches_subtitles():
          mock.patch.object(addon, "fetch_captions", return_value=caps):
         cards = addon._resolve_entry(("111", "Hindi"), 1, 5, "series", "Our Sticky Love", "2026")
     assert isinstance(cards, list) and len(cards) == 1
-    assert cards[0]["name"] == "𖤍 Our Sticky Love (Hindi)"
+    assert cards[0]["name"].endswith("Our Sticky Love (Hindi)")  # v1.9.7
     assert cards[0]["url"].startswith("https://sacdn.hakunaymatata.com/dash/999888")  # from the cookie policy
     assert cards[0]["url"].endswith("/index.mpd")
     assert cards[0]["behaviorHints"]["proxyHeaders"]["request"]["Cookie"]
@@ -872,7 +872,7 @@ def test_resolve_entry_attaches_subtitles():
         langs = [s["lang"] for s in card["subtitles"]]
         assert "eng" in langs and "hin" in langs and "ara" in langs  # v1.9.6 all
         assert card["subtitles"][0]["url"].startswith("https://")   # direct
-        assert "▣ 3 SUB · en, hi, ar" in card["description"]
+        assert "⟡ 3 SUB · en, hi, ar" in card["description"]  # v1.9.7 ⟡
 
 
 
@@ -966,7 +966,7 @@ def test_cross_dub_subtitle_rescue():
     assert len(orig.get("subtitles") or []) == 2  # its own captions
     assert len(hindi.get("subtitles") or []) == 2 # thin (1-cap) dub rescued by the sibling
     assert hindi["subtitles"][0]["url"].startswith("https://c/")   # direct CDN (v1.9.0)
-    assert "▣ 2 SUB" in hindi["description"]
+    assert "⟡ 2 SUB" in hindi["description"]   # v1.9.7 ⟡ tag
     assert "NO SUB" not in hindi["description"]
     addon._STREAM_CACHE.clear(); addon._STREAM_STALE.clear()
 
@@ -994,7 +994,7 @@ def test_captions_fetched_once_per_title():
     assert calls["caps"] == 1                             # ONE caption fetch, not 3
     for s in res["streams"]:                              # every card shares it
         assert len(s.get("subtitles") or []) == 9   # v1.9.6: ALL langs back
-        assert "▣ 9 SUB" in s["description"]
+        assert "⟡ 9 SUB" in s["description"]       # v1.9.7 ⟡ tag
         assert s["subtitles"][0]["url"].startswith("https://c/")   # direct CDN (v1.9.0)
     addon._STREAM_CACHE.clear(); addon._STREAM_STALE.clear()
 

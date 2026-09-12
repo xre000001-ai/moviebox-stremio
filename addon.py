@@ -50,7 +50,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION   = "1.9.6"
+VERSION   = "1.9.7"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -1832,6 +1832,50 @@ def _res_range(pi, pl):
         return "MULTI"
     return "%dp" % heights[-1]
 
+_CARD_GROUP = "MOVIEBOX"
+
+def _ql_label(qtxt):
+    """'1080p'/'480p' -> 'FHD 1080p'-style label (user card spec)."""
+    m = re.search(r"(2160|1440|1080|960|720|576|480|360)", qtxt or "")
+    if not m:
+        return "HLS"
+    h = int(m.group(1))
+    if h >= 2160:
+        return "UHD 2160p"
+    if h >= 1080:
+        return "FHD 1080p"
+    return ("HD %dp" if h >= 720 else "SD %dp") % h
+
+def _fmt_card_desc(ql_txt, codec, size, dur, ctype, se, ep, year,
+                   label, subs, via="Netnaija · MovieBox"):
+    """v1.9.7 unified stream-card format (user spec):
+
+        ♧ FHD 1080p  ✹ Title (Dub)
+        ◫ S01 E05 ◇ 863.7 MB ▧ HEVC ◷ 58m
+        ◈ WEB-DL ♫ Hindi
+        ⌗ MOVIEBOX
+        ⌬ Netnaija · MovieBox  ◴ 2026 ⟡ 16 SUB · ar, bn, en +13
+    """
+    t1 = ["◫ S%02d E%02d" % (se, ep) if ctype == "series" else "◫ MOVIE"]
+    if size:
+        t1.append("◇ %s" % size)
+    if codec:
+        t1.append("▧ %s" % codec)
+    if dur:
+        t1.append("◷ %s" % dur)
+    t4 = ["⌬ %s" % via]
+    if year:
+        y = str(year)[:4]
+        if y.isdigit():
+            t4.append("◴ %s" % y)
+    sl = _sub_line(subs)
+    if sl:
+        t4.append("⟡ " + sl[2:])               # strip the old ▣ prefix
+    return "\n".join([" ".join(t1),
+                      "◈ WEB-DL ♫ %s" % (label or "multi-audio"),
+                      "⌗ %s" % _CARD_GROUP,
+                      "  ".join(t4)])
+
 def _sub_line(subs):
     """Third card line: subtitle count + languages."""
     if not subs:
@@ -2138,18 +2182,10 @@ def _resolve_entry(pair, se, ep, ctype, title, year, caps=None, web_langs=None):
         return web_cards or None
     res = _res_from_pi(pi, pl)
     use_se, use_ep = (se, ep) if ctype == "series" else (0, 0)
-    # --- card layout: bold name line + multi-line description ---
-    # line 1 (gray): quality / codec / size / runtime
-    l1 = "▣ %s" % _res_range(pi, pl)
+    # --- v1.9.7: unified stream-card format (user spec) ---
+    ran = _res_range(pi, pl)
     codec = _CODEC_LABEL.get(str(pl.get("codecName") or "").lower())
-    for part in (codec, _fmt_size(pl.get("size")), _fmt_dur(pl.get("duration"))):
-        if part:
-            l1 += " ▣ " + part
-    # line 2: episode (series) or year (movie) + brand
-    if ctype == "series":
-        l2 = "▣ S%02dE%02d ▣ %s" % (se, ep, BRAND)
-    else:
-        l2 = ("▣ %s ▣ " % year if year else "▣ ") + BRAND
+    card_name = "♧ %s  ✹ %s (%s)" % (_ql_label(ran), title, label)
     # line 3: subtitle tracks. build_streams passes the title-wide caption
     # set (fetched once, concurrently); a standalone call fetches its own.
     if caps is None:
@@ -2173,8 +2209,10 @@ def _resolve_entry(pair, se, ep, ctype, title, year, caps=None, web_langs=None):
         if mpd_info and mpd_info.get("video"):
             hls_url = "/hls/%s/%d/%d/master.m3u8" % (sid, use_se, use_ep)
     card = {
-        "name": "𖤍 %s (%s)" % (title, label),
-        "description": l1 + "\n" + l2 + "\n" + _sub_line(subs),
+        "name": card_name,
+        "description": _fmt_card_desc(ran, codec, _fmt_size(pl.get("size")),
+                                      _fmt_dur(pl.get("duration")),
+                                      ctype, se, ep, year, label, subs),
         "url": hls_url or ("%s/index.mpd" % dash),
         "behaviorHints": {"notWebReady": not bool(hls_url),
                           "isBingeable": True,
@@ -2210,20 +2248,14 @@ def _web_cards_for(title, label, ctype, se, ep, mob_sid, web_langs):
     st = _web_mp4_streams(wsid, wdp, use_se, use_ep)
     if not st:
         return []
-    if ctype == "series":
-        l2 = "▣ S%02dE%02d ▣ %s" % (se, ep, BRAND)
-    else:
-        l2 = "▣ MULTI ▣ %s" % BRAND
     cards = []
     for res_i, url, size, codec, dur in st:
-        l1 = "▣ %dp" % res_i
         cl = _CODEC_LABEL.get((codec or "").lower())
-        for part in (cl, _fmt_size(size), _fmt_dur(dur)):
-            if part:
-                l1 += " ▣ " + part
         cards.append({
-            "name": "𖤍 %s (%s)" % (title, label),
-            "description": l1 + "\n" + l2 + "\n▣ WEB ▣ direct",
+            "name": "♧ %dp  ✹ %s (%s)" % (res_i, title, label),
+            "description": _fmt_card_desc(
+                "%dp" % res_i, cl, _fmt_size(size), _fmt_dur(dur),
+                ctype, se, ep, year, label, [], via="Netnaija · WEB"),
             # signed DIRECT URL — zero bytes through Render, no headers
             "url": url,
             "behaviorHints": {"notWebReady": False, "isBingeable": True},
@@ -2552,7 +2584,12 @@ def _build_streams_inner(ctype, imdb, se, ep, key, _prewarm_next):
         if shared:
             for s in streams:
                 s["subtitles"] = shared
-                s["description"] = s["description"].rsplit("\n", 1)[0] + "\n" + _sub_line(shared)
+                # v1.9.7: swap the ⟡ sub tag inside the ⌬ line
+                head = s["description"].rsplit("\n", 1)[0]
+                base = s["description"].rsplit("\n", 1)[1]
+                base = re.sub(r"\s*⟡ [^⟡]*$", "", base).rstrip()
+                s["description"] = (head + "\n" + base + "  ⟡ " +
+                                    _sub_line(shared)[2:]).rstrip()
     if streams:
         _cache_put(_STREAM_CACHE, key, streams, _STREAM_CACHE_TTL)
         _stale_put(key, streams)   # v1.9.3: sweeps expired entries on write
