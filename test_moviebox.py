@@ -710,7 +710,7 @@ def test_manifest_shape():
     assert set(addon.MANIFEST["types"]) == {"movie", "series"}
     assert "type" not in addon.MANIFEST           # must be 'types' (Stremio protocol)
     assert addon.MANIFEST["idPrefixes"] == ["tt"]
-    assert addon.MANIFEST["resources"] == ["stream"]
+    assert addon.MANIFEST["resources"] == ["stream", "subtitles"]  # v1.9.11
 
 def test_listing_paths_covered():
     for site in addon.SITES:

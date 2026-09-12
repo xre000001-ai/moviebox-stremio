@@ -50,7 +50,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION   = "1.9.10"
+VERSION   = "1.9.11"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -2692,7 +2692,9 @@ MANIFEST = {
     # (IMDb, Trakt, ...), Torrentio-style. Less platform volume at boot
     # (no six-catalog prewarm) = less IP flagging = faster stream builds.
     "catalogs": [],
-    "resources": ["stream"],
+    # v1.9.11: subtitles declared as a resource (Nuvio-style players
+    # fetch /subtitles/... instead of reading stream-embedded subs).
+    "resources": ["stream", "subtitles"],
 }
 
 # --------------------------------------------------------------------------
@@ -3089,6 +3091,28 @@ class Handler(BaseHTTPRequestHandler):
                 out["search_subjects"] = "EXC " + str(e)[:80]
             out["search_s"] = round(time.time() - t0, 2)
             return self._send(200, json.dumps(out))
+
+        # v1.9.11: subtitles-resource route — reuses the cached card
+        # build, so a cache hit costs nothing extra.
+        m = re.match(r"^/subtitles/([a-z]+)/(tt\d+|[a-z0-9]+)(?::(\d+):(\d+))?\.json$", path)
+        if m:
+            ctype, oid = m.group(1), m.group(2)
+            if ctype not in ("movie", "series"):
+                return self._send(400, json.dumps({"error": "bad type"}))
+            se = int(m.group(3) or 1)
+            ep = int(m.group(4) or 1)
+            res = build_streams(ctype, oid, se, ep) if oid.startswith("tt") \
+                else {"streams": []}
+            subs, seen = [], set()
+            for c in (res.get("streams") or []):
+                for s in (c.get("subtitles") or []):
+                    u = s.get("url")
+                    if u and u not in seen:
+                        seen.add(u)
+                        subs.append({"url": u, "lang": s.get("lang", "en"),
+                                     "id": s.get("id", "mbx-en")})
+            return self._send(200, json.dumps(
+                {"subtitles": subs, "cacheMaxAge": 300}))
 
         m = re.match(r"^/stream/([a-z]+)/(tt\d+|[a-z0-9]+)(?::(\d+):(\d+))?\.json$", path)
         if m:
