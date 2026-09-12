@@ -505,11 +505,11 @@ def test_build_streams_series_happy_path():
     s0 = res["streams"][0]
     # multi-line card: bold "title (dub)" name + 3 description lines
     assert "Squid Game (" in s0["name"]      # v1.9.7 ♧/✹ format
-    assert s0["description"].count("\n") == 3    # v1.9.7 4-line card
+    assert s0["description"].count("\n") == 4    # v1.9.8 5-line card
     assert "1080p" in s0["name"]                # v1.9.7 ♧ MAX quality
     assert "–" not in s0["description"].split("\n")[0]   # no more 480p–1080p range
     assert "HEVC" in s0["description"] and "863.7 MB" in s0["description"]
-    assert "◫ S01 E01" in s0["description"] and "⌗ MOVIEBOX" in s0["description"]
+    assert "◫ S01 E01" in s0["description"] and "⌗ MovieBox" in s0["description"]
     assert "NO SUB" in s0["description"]          # captions mocked empty
     # v1.9.4 quality-menu HLS card: relative /hls/... master url (the
     # /stream route absolutizes it against the request Host). No
@@ -541,7 +541,7 @@ def test_build_streams_movie_no_dubs():
         res = addon.build_streams("movie", "tt1375666", 1, 1)
     assert len(res["streams"]) == 1
     assert "(Original)" in res["streams"][0]["name"]
-    assert res["streams"][0]["description"].count("\n") == 3  # v1.9.7
+    assert res["streams"][0]["description"].count("\n") == 4  # v1.9.8
     assert "◴ 2010" in res["streams"][0]["description"]   # v1.9.7 ◴ year
     assert "S01E01" not in res["streams"][0]["description"]
     # v1.9.4: movies get the quality-menu HLS card too (movies use se=0/ep=0)

@@ -50,7 +50,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION   = "1.9.7"
+VERSION   = "1.9.8"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -1832,7 +1832,7 @@ def _res_range(pi, pl):
         return "MULTI"
     return "%dp" % heights[-1]
 
-_CARD_GROUP = "MOVIEBOX"
+_CARD_GROUP = BRAND   # v1.9.8: ⌗ carries the addon name
 
 def _ql_label(qtxt):
     """'1080p'/'480p' -> 'FHD 1080p'-style label (user card spec)."""
@@ -1847,14 +1847,15 @@ def _ql_label(qtxt):
     return ("HD %dp" if h >= 720 else "SD %dp") % h
 
 def _fmt_card_desc(ql_txt, codec, size, dur, ctype, se, ep, year,
-                   label, subs, via="Netnaija · MovieBox"):
+                   label, subs, via="Netnaija"):
     """v1.9.7 unified stream-card format (user spec):
 
         ♧ FHD 1080p  ✹ Title (Dub)
         ◫ S01 E05 ◇ 863.7 MB ▧ HEVC ◷ 58m
-        ◈ WEB-DL ♫ Hindi
-        ⌗ MOVIEBOX
-        ⌬ Netnaija · MovieBox  ◴ 2026 ⟡ 16 SUB · ar, bn, en +13
+        ◈ WEB-DL
+        ◈ Hindi
+        ⌗ MovieBox
+        ⌬ Netnaija  ◴ 2026 ⟡ 16 SUB · ar, bn, en +13
     """
     t1 = ["◫ S%02d E%02d" % (se, ep) if ctype == "series" else "◫ MOVIE"]
     if size:
@@ -1871,10 +1872,11 @@ def _fmt_card_desc(ql_txt, codec, size, dur, ctype, se, ep, year,
     sl = _sub_line(subs)
     if sl:
         t4.append("⟡ " + sl[2:])               # strip the old ▣ prefix
-    return "\n".join([" ".join(t1),
-                      "◈ WEB-DL ♫ %s" % (label or "multi-audio"),
-                      "⌗ %s" % _CARD_GROUP,
-                      "  ".join(t4)])
+    lines = [" ".join(t1), "◈ WEB-DL"]
+    if label:
+        lines.append("◈ %s" % label)           # audio langs (glass line)
+    lines += ["⌗ %s" % BRAND, "  ".join(t4)]
+    return "\n".join(lines)
 
 def _sub_line(subs):
     """Third card line: subtitle count + languages."""
@@ -2255,7 +2257,7 @@ def _web_cards_for(title, label, ctype, se, ep, mob_sid, web_langs):
             "name": "♧ %dp  ✹ %s (%s)" % (res_i, title, label),
             "description": _fmt_card_desc(
                 "%dp" % res_i, cl, _fmt_size(size), _fmt_dur(dur),
-                ctype, se, ep, year, label, [], via="Netnaija · WEB"),
+                ctype, se, ep, year, label, [], via="Netnaija WEB"),
             # signed DIRECT URL — zero bytes through Render, no headers
             "url": url,
             "behaviorHints": {"notWebReady": False, "isBingeable": True},
