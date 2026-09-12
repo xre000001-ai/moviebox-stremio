@@ -50,7 +50,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION   = "1.9.11"
+VERSION   = "1.9.12"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -587,9 +587,7 @@ LISTING_PATHS = {
     ("moviebox", "series"):    "/tv-series",
     ("moviebox", "animated"):  "/animated-series",
 }
-CATALOG_PAGE_SIZE = 36          # subjects per site page
 CATALOG_PREFETCH = 3            # pages fetched per catalog refresh
-HLS_SESSION_TTL = 6 * 3600      # CloudFront cookies last ~7 days; stay lower
 START = time.time()
 
 # --------------------------------------------------------------------------
@@ -1668,14 +1666,6 @@ _LANG3 = {"ar": "ara", "en": "eng", "es": "spa", "fil": "fil", "fr": "fra",
 # v1.9.10: reverse map (3-letter source -> ISO-639-1) for sub langs
 _LANG1 = {v: k for k, v in _LANG3.items() if len(k) == 2}
 
-_LANG_NAME = {"ar": "Arabic", "bn": "Bangla", "en": "English", "es": "Spanish",
-              "fil": "Filipino", "fr": "French", "in_id": "Indonesian", "id": "Indonesian",
-              "ms": "Malay", "pt": "Portuguese", "ru": "Russian", "hi": "Hindi",
-              "ur": "Urdu", "pa": "Punjabi", "zh": "Chinese", "ko": "Korean",
-              "ja": "Japanese", "th": "Thai", "vi": "Vietnamese", "tr": "Turkish",
-              "de": "German", "it": "Italian"}
-
-
 
 def _web_jwt():
     """Anonymous web JWT via the site's search-suggest (x-user response
@@ -1841,8 +1831,6 @@ def _res_range(pi, pl):
         return "MULTI"
     return "%dp" % heights[-1]
 
-_CARD_GROUP = BRAND   # v1.9.8: ⌗ carries the addon name
-
 def _ql_label(qtxt):
     """'1080p'/'480p' -> 'FHD 1080p'-style label (user card spec)."""
     m = re.search(r"(2160|1440|1080|960|720|576|480|360)", qtxt or "")
@@ -1925,8 +1913,6 @@ _WEB_MP4_TTL = 40 * 60              # signed URLs live ~17h; 40min freshness
 _WEB_MP4_NEG = 10 * 60
 _WEB_LANG_CACHE = {}                # (ctype, norm_title) -> (ts, {lang:(sid,dp)})
 _WEB_MP4_CACHE = {}                 # (sid, se, ep) -> (ts, streams|None)
-_WEB_MP4_LOCK = threading.Lock()
-
 def _web_norm_t(t):
     return re.sub(r"[^a-z0-9]", "", (t or "").lower())
 
