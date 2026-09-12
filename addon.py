@@ -1665,6 +1665,9 @@ _LANG3 = {"ar": "ara", "en": "eng", "es": "spa", "fil": "fil", "fr": "fra",
           "ko": "kor", "ja": "jpn", "th": "tha", "vi": "vie", "tr": "tur",
           "de": "deu", "ita": "ita", "it": "ita"}
 
+# v1.9.10: reverse map (3-letter source -> ISO-639-1) for sub langs
+_LANG1 = {v: k for k, v in _LANG3.items() if len(k) == 2}
+
 _LANG_NAME = {"ar": "Arabic", "bn": "Bangla", "en": "English", "es": "Spanish",
               "fil": "Filipino", "fr": "French", "in_id": "Indonesian", "id": "Indonesian",
               "ms": "Malay", "pt": "Portuguese", "ru": "Russian", "hi": "Hindi",
@@ -1717,10 +1720,14 @@ def _direct_subs(caps):
     Players (mpv/ExoPlayer) sniff SRT fine even without an extension.
     v1.9.6: _SUB_LANGS defaults to () = ALL languages (sub filter
     reverted — it saved no meaningful Render bandwidth)."""
-    # v1.9.10: lang stays ISO-639-1 ('ar','en') — Stremio players don't
-    # match 3-letter codes ('ara' broke sub selection for many clients).
-    return [{"url": c["url"], "lang": c.get("lan"),
-             "id": "mbx-%s" % c.get("lan")}
+    # v1.9.10: lang is normalized to ISO-639-1 ('ar','en') — Stremio
+    # players don't match 3-letter codes ('ara' broke sub selection).
+    # The platform mixes 2-letter ('en') and 3-letter ('ara') sources.
+    def _l1(lan):
+        lan = lan or ""
+        return lan if len(lan) == 2 else _LANG1.get(lan, lan)
+    return [{"url": c["url"], "lang": _l1(c.get("lan")),
+             "id": "mbx-%s" % _l1(c.get("lan"))}
             for c in (caps or [])
             if c.get("lan") and c.get("url")
             and (not _SUB_LANGS or c.get("lan") in _SUB_LANGS)]
