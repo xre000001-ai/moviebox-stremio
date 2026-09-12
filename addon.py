@@ -1724,7 +1724,7 @@ def _direct_subs(caps):
     # players don't match 3-letter codes ('ara' broke sub selection).
     # The platform mixes 2-letter ('en') and 3-letter ('ara') sources.
     def _l1(lan):
-        lan = lan or ""
+        lan = {"in_id": "id"}.get(lan, lan or "")   # Indonesian quirk
         return lan if len(lan) == 2 else _LANG1.get(lan, lan)
     return [{"url": c["url"], "lang": _l1(c.get("lan")),
              "id": "mbx-%s" % _l1(c.get("lan"))}
